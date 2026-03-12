@@ -1,0 +1,11 @@
+# Example Codex MCP config fragment.
+# Keep IDA_MCP_CONNECT_HOST if your environment already pins the correct
+# Windows-reachable address from WSL.
+
+[env]
+IDA_MCP_CONNECT_HOST = "172.27.96.1"
+
+[servers.ida_hybrid_manager]
+command = "/root/ida-hybrid-manager/.venv/bin/python"
+args = ["-m", "ida_hybrid_manager.server", "--transport", "streamable-http"]
+cwd = "/root/ida-hybrid-manager"

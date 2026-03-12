@@ -1,0 +1,1 @@
+"""Hybrid IDA manager package."""
