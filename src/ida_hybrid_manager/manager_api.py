@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,7 +66,16 @@ class ManagerApiServer:
             def log_message(self, format: str, *args) -> None:
                 return
 
-        self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        try:
+            self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        except OSError as exc:
+            # The manager API is only needed for optional plugin-side registration.
+            # Headless manager-owned sessions still work without binding this port.
+            if exc.errno == errno.EADDRINUSE:
+                self._httpd = None
+                self._thread = None
+                return
+            raise
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="ida-hybrid-manager-api", daemon=True)
         self._thread.start()
 

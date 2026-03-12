@@ -5,7 +5,8 @@
 [env]
 IDA_MCP_CONNECT_HOST = "172.27.96.1"
 
-[servers.ida_hybrid_manager]
-command = "/root/ida-hybrid-manager/.venv/bin/python"
-args = ["-m", "ida_hybrid_manager.server", "--transport", "streamable-http"]
-cwd = "/root/ida-hybrid-manager"
+[mcp_servers.ida-hybrid-manager]
+command = "/usr/bin/env"
+args = ["bash", "-lc", "cd /root/ida-hybrid-manager && IDA_MCP_CONNECT_HOST=172.27.96.1 PYTHONPATH=/root/ida-hybrid-manager/src /usr/bin/python3 -m ida_hybrid_manager.server --transport stdio"]
+startup_timeout_sec = 90.0
+tool_timeout_sec = 120.0
