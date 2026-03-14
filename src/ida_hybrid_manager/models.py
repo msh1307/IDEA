@@ -61,6 +61,7 @@ class PendingLaunch:
     engine: str
     port: int | None
     pid: int | None
+    metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=utc_now)
 
     def to_dict(self) -> dict[str, Any]:
@@ -71,5 +72,6 @@ class PendingLaunch:
             "engine": self.engine,
             "port": self.port,
             "pid": self.pid,
+            "metadata": dict(self.metadata),
             "created_at": isoformat(self.created_at),
         }

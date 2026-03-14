@@ -36,6 +36,17 @@ def _serialize_sessions(records) -> list[dict[str, Any]]:
     return [record.to_dict() for record in records]
 
 
+def _tracked_headless_pids() -> set[int]:
+    tracked: set[int] = set()
+    for record in registry.list_sessions(include_dead=False):
+        if record.engine != "headless":
+            continue
+        if record.owner_pid is None:
+            continue
+        tracked.add(record.owner_pid)
+    return tracked
+
+
 def _wait_for_session(pending: PendingLaunch, timeout_sec: float = 90.0):
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
@@ -87,13 +98,16 @@ def _backend_ready(record, timeout_sec: float = 20.0) -> bool:
 
 def _attach_managed_headless(pending: PendingLaunch):
     display_name = pending.binary_path.rsplit("\\", 1)[-1]
+    if pending.port is None:
+        raise ValueError("headless launch did not provide a listener port")
     return registry.register_managed_session(
         engine="headless",
         display_name=display_name,
         binary_path=pending.binary_path,
         idb_path=pending.idb_path,
         owner_pid=pending.pid,
-        endpoint_url=f"http://127.0.0.1:13337/mcp",
+        endpoint_url=f"http://127.0.0.1:{pending.port}/mcp",
+        metadata=pending.metadata,
     )
 
 
@@ -154,6 +168,7 @@ def open_binary(path: str, mode: str = "auto", reuse: bool = True) -> dict[str, 
         if record is None:
             return {"ok": False, "error": f"Timed out waiting for {pending.engine} session", "pending": pending.to_dict()}
     else:
+        launcher.terminate_untracked_idat(_tracked_headless_pids())
         pending = launcher.launch_headless(normalized.windows_path, manager_url())
         record = _attach_managed_headless(pending)
     if not _backend_ready(record):
@@ -177,7 +192,13 @@ def open_binary(path: str, mode: str = "auto", reuse: bool = True) -> dict[str, 
             capabilities = [tool.get("name") for tool in tools_info.get("tools", []) if tool.get("name")]
         except Exception:
             capabilities = []
-        registry.update_managed_session(record.session_id, status="ready", capabilities=capabilities)
+        listener_pid = launcher.lookup_listener_pid(record.endpoint.get("url", ""))
+        registry.update_managed_session(
+            record.session_id,
+            status="ready",
+            capabilities=capabilities,
+            owner_pid=listener_pid or record.owner_pid,
+        )
     return {
         "ok": True,
         "session_id": record.session_id,
@@ -201,8 +222,13 @@ def close_session(session_id: str, save: bool = True) -> dict[str, Any]:
         asyncio.run(call_backend_tool_any(_backend_candidates(record), "save_database", {}))
     if record.owner_pid is not None:
         launcher.terminate_process(record.owner_pid)
+    cleanup = {}
+    staged_dir = str(record.metadata.get("staged_dir") or "")
+    if staged_dir:
+        cleanup["staged_dir"] = staged_dir
+        cleanup["deleted"] = launcher.cleanup_staged_dir(staged_dir)
     registry.unregister(record.session_id, "manager_close")
-    return {"ok": True, "closed_session_id": record.session_id}
+    return {"ok": True, "closed_session_id": record.session_id, "cleanup": cleanup}
 
 
 @mcp.tool(description="List backend tools exposed by the selected or explicit session.")

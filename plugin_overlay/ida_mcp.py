@@ -5,6 +5,7 @@ It loads the actual implementation from the ida_mcp package.
 """
 
 import sys
+import os
 import idaapi
 import ida_idaapi
 import ida_netnode
@@ -57,10 +58,19 @@ class MCP(idaapi.plugin_t):
 
     @staticmethod
     def _config_bool(key: str, default: bool) -> bool:
+        env = os.getenv(f"IDA_MCP_{key.upper()}")
+        if env is not None:
+            return env.strip().lower() not in {"0", "false", "no", "off"}
         return bool(MCP._config_json_get(key, default))
 
     @staticmethod
     def _config_int(key: str, default: int) -> int:
+        env = os.getenv(f"IDA_MCP_{key.upper()}")
+        if env:
+            try:
+                return int(env)
+            except ValueError:
+                return default
         value = MCP._config_json_get(key, default)
         try:
             return int(value)

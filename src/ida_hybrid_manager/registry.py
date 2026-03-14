@@ -125,9 +125,12 @@ class SessionRegistry:
         idb_path: str,
         owner_pid: int | None,
         endpoint_url: str,
+        metadata: dict[str, Any] | None = None,
     ) -> SessionRecord:
         with self._lock:
             candidates = candidate_endpoint_urls(endpoint_url)
+            session_metadata = dict(metadata or {})
+            session_metadata["endpoint_candidates"] = candidates
             record = SessionRecord(
                 session_id=self._make_session_id(engine),
                 engine=engine,
@@ -140,7 +143,7 @@ class SessionRegistry:
                 capabilities=[],
                 endpoint={"transport": "streamable-http", "url": candidates[0]},
                 owner_pid=owner_pid,
-                metadata={"endpoint_candidates": candidates},
+                metadata=session_metadata,
                 closable=engine == "headless",
             )
             self._sessions[record.session_id] = record
@@ -154,6 +157,7 @@ class SessionRegistry:
         status: str | None = None,
         capabilities: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        owner_pid: int | None = None,
     ) -> SessionRecord | None:
         with self._lock:
             record = self._sessions.get(session_id)
@@ -165,6 +169,8 @@ class SessionRegistry:
                 record.capabilities = capabilities
             if metadata:
                 record.metadata.update(metadata)
+            if owner_pid is not None:
+                record.owner_pid = owner_pid
             record.last_seen = utc_now()
             return record
 
