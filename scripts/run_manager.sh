@@ -10,4 +10,4 @@ if [[ ! -x .venv/bin/python ]]; then
 fi
 
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-exec .venv/bin/python -m ida_hybrid_manager.server --transport streamable-http
+exec .venv/bin/python -m ida_hybrid_manager.server --transport daemon

@@ -38,10 +38,24 @@ cd ida-hybrid-manager
 ./scripts/run_manager.sh
 ```
 
-Manager endpoints:
+Daemon endpoint:
 
-- health API: `http://0.0.0.0:18080/healthz`
-- MCP server: `http://0.0.0.0:18081/mcp`
+- health API: `http://127.0.0.1:18080/healthz`
+
+Normal Codex usage:
+
+- Codex does not talk to the daemon directly.
+- Codex still starts the normal MCP entrypoint with `--transport stdio`.
+- That stdio shim checks `127.0.0.1:18080`, reuses the daemon if it exists,
+  or starts it if it does not.
+- Multiple agents can share the same daemon and session registry.
+
+Current behavior:
+
+- `list_alive_sessions` is shared across agents
+- `current_session` is tracked per client
+- headless launches are daemon-owned
+- `write_session_tool_output` writes results into WSL paths
 
 ## 4. Quick smoke test
 
@@ -56,3 +70,4 @@ From WSL:
 - The manager package is meant to be installed from Git like a normal Python project.
 - The plugin overlay is intentionally separate because it patches an existing `ida_mcp` install instead of replacing the whole plugin tree.
 - If your Codex or local MCP config already pins the correct Windows host path, keep using that. The code still keeps fallback probes because WSL networking is inconsistent across systems.
+- The shared daemon uses a fixed port and a lock file at `/tmp/ida-hybrid-manager-daemon.lock`.

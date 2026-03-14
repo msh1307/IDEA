@@ -10,15 +10,23 @@ from .registry import SessionRegistry
 
 
 class ManagerApiServer:
-    def __init__(self, registry: SessionRegistry, host: str = "0.0.0.0", port: int = 18080) -> None:
+    def __init__(
+        self,
+        registry: SessionRegistry,
+        host: str = "0.0.0.0",
+        port: int = 18080,
+        op_dispatcher=None,
+    ) -> None:
         self.registry = registry
         self.host = host
         self.port = port
+        self.op_dispatcher = op_dispatcher
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         registry = self.registry
+        op_dispatcher = self.op_dispatcher
 
         class Handler(BaseHTTPRequestHandler):
             def _json(self, status: int, payload: dict[str, Any]) -> None:
@@ -31,7 +39,7 @@ class ManagerApiServer:
 
             def do_GET(self) -> None:
                 if self.path == "/healthz":
-                    self._json(200, {"ok": True})
+                    self._json(200, {"ok": True, "service": "ida-hybrid-manager", "daemon_api_version": 2})
                     return
                 self._json(404, {"ok": False, "error": "not_found"})
 
@@ -60,6 +68,18 @@ class ManagerApiServer:
                         self._json(404, {"ok": False, "error": "unknown_session"})
                     else:
                         self._json(200, {"ok": True})
+                    return
+                if self.path.startswith("/api/ops/") and op_dispatcher is not None:
+                    op_name = self.path.removeprefix("/api/ops/").strip()
+                    if not op_name:
+                        self._json(404, {"ok": False, "error": "not_found"})
+                        return
+                    try:
+                        result = op_dispatcher(op_name, payload)
+                    except Exception as exc:
+                        self._json(500, {"ok": False, "error": str(exc)})
+                    else:
+                        self._json(200, {"ok": True, "result": result})
                     return
                 self._json(404, {"ok": False, "error": "not_found"})
 

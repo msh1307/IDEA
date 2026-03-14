@@ -1,6 +1,7 @@
 # Example Codex MCP config fragment.
 # Keep IDA_MCP_CONNECT_HOST if your environment already pins the correct
 # Windows-reachable address from WSL.
+# This stdio entrypoint auto-reuses the shared daemon on 127.0.0.1:18080.
 
 [env]
 IDA_MCP_CONNECT_HOST = "172.27.96.1"
