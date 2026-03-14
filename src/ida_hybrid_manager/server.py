@@ -149,7 +149,14 @@ def open_binary(path: str, mode: str = "auto", reuse: bool = True) -> dict[str, 
     normalized = normalize_path(path)
     if reuse:
         preferred_engine = None if mode == "auto" else mode
-        matches = registry.find_candidates(engine=preferred_engine, binary_path=normalized.windows_path)
+        candidate_paths = {normalized.input_path, normalized.windows_path, normalized.wsl_path}
+        matches = []
+        for candidate_path in candidate_paths:
+            if not candidate_path:
+                continue
+            matches = registry.find_candidates(engine=preferred_engine, binary_path=candidate_path)
+            if matches:
+                break
         if matches:
             registry.select_session(matches[0].session_id)
             return {
@@ -162,14 +169,14 @@ def open_binary(path: str, mode: str = "auto", reuse: bool = True) -> dict[str, 
             }
 
     if mode == "gui":
-        pending = launcher.launch_gui(normalized.windows_path)
+        pending = launcher.launch_gui(path)
         registry.register_pending_launch(pending)
         record = _wait_for_session(pending)
         if record is None:
             return {"ok": False, "error": f"Timed out waiting for {pending.engine} session", "pending": pending.to_dict()}
     else:
         launcher.terminate_untracked_idat(_tracked_headless_pids())
-        pending = launcher.launch_headless(normalized.windows_path, manager_url())
+        pending = launcher.launch_headless(path, manager_url())
         record = _attach_managed_headless(pending)
     if not _backend_ready(record):
         if record.closable and record.owner_pid is not None:

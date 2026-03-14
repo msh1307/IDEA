@@ -49,7 +49,7 @@ class IdaLauncher:
                 [
                     "import os",
                     "import sys",
-                    "import time",
+                    "os.environ['IDA_MCP_ENGINE'] = 'headless'",
                     f"os.environ['IDA_MCP_MANAGER_URL'] = {manager_url!r}",
                     "os.environ.setdefault('IDA_MCP_REGISTER_WITH_MANAGER', '0')",
                     f"plugin_root = {self.plugin_root!r}",
@@ -57,10 +57,8 @@ class IdaLauncher:
                     "    sys.path.insert(0, plugin_root)",
                     "from ida_mcp.runtime import IdaMcpRuntime",
                     "runtime = IdaMcpRuntime()",
-                    "if runtime.running:",
-                    "    while True:",
-                    "        time.sleep(3600)",
-                    f"runtime.start('0.0.0.0', {port}, background=False, engine='headless', launch_token={launch_token!r})",
+                    "if not runtime.running:",
+                    f"    runtime.start('0.0.0.0', {port}, background=False, engine='headless', launch_token={launch_token!r})",
                     "",
                 ]
             ),
@@ -143,6 +141,7 @@ class IdaLauncher:
                 # backend endpoint matches the session metadata.
                 "IDA_MCP_AUTO_START": "1",
                 "IDA_MCP_PORT": str(port),
+                "IDA_MCP_ENGINE": "headless",
                 "IDA_MCP_REGISTER_WITH_MANAGER": "0",
             },
         )
