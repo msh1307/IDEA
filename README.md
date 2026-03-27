@@ -27,7 +27,7 @@ Defaults:
 
 Notes:
 
-- The Windows overlay patches an existing `ida_mcp` install. It does not do a fresh plugin install.
+- The Windows installer now installs a self-contained `ida_mcp` plugin bundle.
 - If your plugin directory is non-standard, pass `-PluginRoot` to `install_plugin.ps1`.
 
 ## Run

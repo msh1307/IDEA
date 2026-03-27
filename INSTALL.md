@@ -28,13 +28,12 @@ Default target:
 
 What it does:
 
-- backs up the current `ida_mcp` plugin files
-- overlays the patched files from `plugin_overlay/`
-- leaves unrelated plugin files untouched
+- optionally backs up the current `ida_mcp` plugin files
+- installs the bundled `ida_mcp` loader and package from `plugin_overlay/`
+- replaces any previous `ida_mcp` install in the target directory
 
 Notes:
 
-- This expects an existing `ida_mcp` install in the target plugin directory.
 - If your plugin directory is not `%APPDATA%\Hex-Rays\IDA Pro\plugins`, pass `-PluginRoot`.
 
 ## 3. Run the manager
@@ -76,7 +75,7 @@ From WSL:
 ## Notes
 
 - The manager package is meant to be installed from Git like a normal Python project.
-- The plugin overlay is intentionally separate because it patches an existing `ida_mcp` install instead of replacing the whole plugin tree.
+- The plugin bundle is self-contained and no longer depends on a pre-existing `ida_mcp` install.
 - If your Codex or local MCP config already pins the correct Windows host path, keep using that. The code still keeps fallback probes because WSL networking is inconsistent across systems.
 - The shared daemon uses a fixed port and a lock file at `/tmp/ida-hybrid-manager-daemon.lock`.
 - The default IDA install root used by the launcher is `C:\Program Files\IDA Professional 9.3`. Override with `IDA_INSTALL_ROOT` if needed.
