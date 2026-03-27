@@ -6,23 +6,36 @@ WSL:
 
 ```bash
 git clone <repo-url>
-cd ida-hybrid-manager
+cd IDEA
 ./scripts/install_wsl.sh
 ```
+
+This creates `.venv`, installs the manager in editable mode, and updates the
+Codex MCP config for the current WSL user plus the detected Windows user.
 
 Windows PowerShell:
 
 ```powershell
-cd <repo>\ida-hybrid-manager
+cd <repo>\IDEA
 .\scripts\install_plugin.ps1
 ```
+
+Defaults:
+
+- IDA install root: `C:\Program Files\IDA Professional 9.3`
+- plugin target: `%APPDATA%\Hex-Rays\IDA Pro\plugins`
+
+Notes:
+
+- The Windows overlay patches an existing `ida_mcp` install. It does not do a fresh plugin install.
+- If your plugin directory is non-standard, pass `-PluginRoot` to `install_plugin.ps1`.
 
 ## Run
 
 WSL:
 
 ```bash
-cd ida-hybrid-manager
+cd IDEA
 ./scripts/run_manager.sh
 ```
 
@@ -35,9 +48,14 @@ What runs now:
 ## Test
 
 ```bash
-cd ida-hybrid-manager
+cd IDEA
 ./scripts/smoke_test_headless.sh
 ```
+
+## Restart
+
+- If Codex was already running when `config.toml` changed, restart Codex. MCP servers are not hot-reloaded.
+- If IDA was already open when the overlay changed, restart IDA or reopen the IDB.
 
 Useful tools:
 
@@ -49,10 +67,11 @@ Useful tools:
 
 ## Config example
 
-- [examples/codex-mcp-config.toml](/root/ida-hybrid-manager/examples/codex-mcp-config.toml)
+- [examples/codex-mcp-config.toml](examples/codex-mcp-config.toml)
 
 ## Files
 
-- manager: [src/ida_hybrid_manager](/root/ida-hybrid-manager/src/ida_hybrid_manager)
-- plugin overlay: [plugin_overlay](/root/ida-hybrid-manager/plugin_overlay)
-- install notes: [INSTALL.md](/root/ida-hybrid-manager/INSTALL.md)
+- manager: [src/ida_hybrid_manager](src/ida_hybrid_manager)
+- plugin overlay: [plugin_overlay](plugin_overlay)
+- config installer: [scripts/install_codex_config.py](scripts/install_codex_config.py)
+- install notes: [INSTALL.md](INSTALL.md)

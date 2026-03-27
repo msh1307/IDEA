@@ -9,7 +9,8 @@ if [[ ! -x .venv/bin/python ]]; then
   exit 1
 fi
 
-TARGET="${1:-/mnt/c/Users/msh/Desktop/ssh-binaries/actionengined}"
+WIN_USER="${IDA_WINDOWS_USER:-$(powershell.exe -NoProfile -Command '$env:USERNAME' 2>/dev/null | tr -d '\r' | tail -n 1)}"
+TARGET="${1:-/mnt/c/Users/${WIN_USER}/Desktop/ssh-binaries/actionengined}"
 
 PYTHONPATH="$ROOT/src" .venv/bin/python - <<'PY' "$TARGET"
 import asyncio

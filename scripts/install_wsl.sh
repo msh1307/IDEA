@@ -8,5 +8,6 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e .
+python scripts/install_codex_config.py
 
 echo "Installed ida-hybrid-manager into $ROOT/.venv"

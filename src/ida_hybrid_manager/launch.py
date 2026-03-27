@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -9,13 +10,73 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .models import PendingLaunch
-from .pathing import normalize_path, to_windows_path
+from .pathing import normalize_path, to_windows_path, to_wsl_path
 
 
-IDA_INSTALL = r"C:\Program Files\IDA Professional 9.1"
-PLUGIN_ROOT = r"C:\Users\msh\AppData\Roaming\Hex-Rays\IDA Pro\plugins"
-WINDOWS_TEMP = r"C:\Users\msh\AppData\Local\Temp\ida-hybrid-manager"
-WSL_TEMP = "/mnt/c/Users/msh/AppData/Local/Temp/ida-hybrid-manager"
+DEFAULT_IDA_INSTALL = r"C:\Program Files\IDA Professional 9.3"
+DEFAULT_WINDOWS_USER = "USER"
+
+
+def _powershell_value(command: str) -> str:
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+        encoding="utf-8",
+        errors="ignore",
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _windows_username() -> str:
+    env = os.getenv("IDA_WINDOWS_USER", "").strip()
+    if env:
+        return env
+    return _powershell_value("$env:USERNAME") or DEFAULT_WINDOWS_USER
+
+
+def _windows_roaming_appdata() -> str:
+    env = os.getenv("IDA_WINDOWS_APPDATA", "").strip()
+    if env:
+        return env
+    return _powershell_value('[Environment]::GetFolderPath("ApplicationData")')
+
+
+def _windows_local_appdata() -> str:
+    env = os.getenv("IDA_WINDOWS_LOCALAPPDATA", "").strip()
+    if env:
+        return env
+    return _powershell_value('[Environment]::GetFolderPath("LocalApplicationData")')
+
+
+def _default_plugin_root() -> str:
+    env = os.getenv("IDA_PLUGIN_ROOT", "").strip()
+    if env:
+        return env
+    appdata = _windows_roaming_appdata()
+    if appdata:
+        return rf"{appdata}\Hex-Rays\IDA Pro\plugins"
+    return rf"C:\Users\{_windows_username()}\AppData\Roaming\Hex-Rays\IDA Pro\plugins"
+
+
+def _default_windows_temp() -> str:
+    env = os.getenv("IDA_WINDOWS_TEMP", "").strip()
+    if env:
+        return env
+    local_appdata = _windows_local_appdata()
+    if local_appdata:
+        return rf"{local_appdata}\Temp\ida-hybrid-manager"
+    return rf"C:\Users\{_windows_username()}\AppData\Local\Temp\ida-hybrid-manager"
+
+
+def _default_wsl_temp(windows_temp: str) -> str:
+    env = os.getenv("IDA_WSL_TEMP", "").strip()
+    if env:
+        return env
+    return to_wsl_path(windows_temp)
 
 
 def pick_free_port() -> int:
@@ -26,10 +87,11 @@ def pick_free_port() -> int:
 
 class IdaLauncher:
     def __init__(self) -> None:
-        self.ida_gui = rf"{IDA_INSTALL}\ida.exe"
-        self.ida_headless = rf"{IDA_INSTALL}\idat.exe"
-        self.plugin_root = PLUGIN_ROOT
-        self.wsl_temp = Path(WSL_TEMP)
+        ida_install = os.getenv("IDA_INSTALL_ROOT", DEFAULT_IDA_INSTALL).strip() or DEFAULT_IDA_INSTALL
+        self.ida_gui = rf"{ida_install}\ida.exe"
+        self.ida_headless = rf"{ida_install}\idat.exe"
+        self.plugin_root = _default_plugin_root()
+        self.wsl_temp = Path(_default_wsl_temp(_default_windows_temp()))
         self.wsl_temp.mkdir(parents=True, exist_ok=True)
         self.stage_root = self.wsl_temp / "staged"
         self.stage_root.mkdir(parents=True, exist_ok=True)

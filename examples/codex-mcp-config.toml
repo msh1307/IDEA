@@ -4,10 +4,10 @@
 # This stdio entrypoint auto-reuses the shared daemon on 127.0.0.1:18080.
 
 [env]
-IDA_MCP_CONNECT_HOST = "172.27.96.1"
+IDA_MCP_CONNECT_HOST = "172.31.96.1"
 
 [mcp_servers.ida-hybrid-manager]
 command = "/usr/bin/env"
-args = ["bash", "-lc", "cd /root/ida-hybrid-manager && IDA_MCP_CONNECT_HOST=172.27.96.1 PYTHONPATH=/root/ida-hybrid-manager/src /usr/bin/python3 -m ida_hybrid_manager.server --transport stdio"]
+args = ["bash", "-lc", "cd /root/IDEA && IDA_MCP_CONNECT_HOST=172.31.96.1 ./.venv/bin/python -m ida_hybrid_manager.server --transport stdio"]
 startup_timeout_sec = 90.0
 tool_timeout_sec = 120.0
