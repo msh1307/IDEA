@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
-import shlex
 import subprocess
 from pathlib import Path
 
@@ -63,17 +61,28 @@ def discover_windows_user() -> str:
     return "USER"
 
 
-def render_server_block(repo_root: Path, host: str) -> str:
-    shell_command = (
-        f"cd {shlex.quote(str(repo_root))} && "
-        f"IDA_MCP_CONNECT_HOST={host} ./.venv/bin/python -m ida_hybrid_manager.server --transport stdio"
-    )
-    args = json.dumps(["bash", "-lc", shell_command], ensure_ascii=True)
+def render_wsl_server_block(repo_root: Path, host: str) -> str:
     return "\n".join(
         [
             f"[{SECTION_NAME}]",
-            'command = "/usr/bin/env"',
-            f"args = {args}",
+            f'command = "{repo_root}/.venv/bin/python"',
+            'args = ["-m", "ida_hybrid_manager.server", "--transport", "stdio"]',
+            f'cwd = "{repo_root}"',
+            f'env = {{ IDA_MCP_CONNECT_HOST = "{host}" }}',
+            "startup_timeout_sec = 90.0",
+            "tool_timeout_sec = 120.0",
+            "",
+        ]
+    )
+
+
+def render_windows_server_block(repo_root: Path, host: str) -> str:
+    distro = os.getenv("IDA_WSL_DISTRO", "Ubuntu-24.04").strip() or "Ubuntu-24.04"
+    return "\n".join(
+        [
+            f"[{SECTION_NAME}]",
+            'command = "wsl.exe"',
+            f'args = ["-d", "{distro}", "--cd", "{repo_root}", "env", "IDA_MCP_CONNECT_HOST={host}", "./.venv/bin/python", "-m", "ida_hybrid_manager.server", "--transport", "stdio"]',
             "startup_timeout_sec = 90.0",
             "tool_timeout_sec = 120.0",
             "",
@@ -104,14 +113,12 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     host = discover_windows_host()
     windows_user = discover_windows_user()
-    block = render_server_block(repo_root, host)
-
     targets = [
-        Path.home() / ".codex" / "config.toml",
-        Path(f"/mnt/c/Users/{windows_user}/.codex/config.toml"),
+        (Path.home() / ".codex" / "config.toml", render_wsl_server_block(repo_root, host)),
+        (Path(f"/mnt/c/Users/{windows_user}/.codex/config.toml"), render_windows_server_block(repo_root, host)),
     ]
 
-    for target in targets:
+    for target, block in targets:
         action = upsert_config(target, block)
         print(f"{action}: {target}")
 

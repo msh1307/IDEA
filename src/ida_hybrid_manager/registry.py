@@ -46,6 +46,10 @@ class SessionRegistry:
         session.closable = pending.engine == "headless"
         if pending.pid is not None:
             session.owner_pid = pending.pid
+        if pending.metadata:
+            merged = dict(pending.metadata)
+            merged.update(session.metadata)
+            session.metadata = merged
         self._pending_launches.pop(launch_token, None)
 
     def register_session(self, payload: dict[str, Any]) -> SessionRecord:
@@ -110,6 +114,7 @@ class SessionRegistry:
                 record.endpoint = endpoint
                 record.owner_pid = session_data.get("owner_pid", record.owner_pid)
                 record.metadata = metadata
+            record.metadata.pop("unregister_reason", None)
             record.last_seen = utc_now()
             self._link_pending_launch(record)
             if self._current_session_id is None:
@@ -171,6 +176,7 @@ class SessionRegistry:
                 record.metadata.update(metadata)
             if owner_pid is not None:
                 record.owner_pid = owner_pid
+            record.metadata.pop("unregister_reason", None)
             record.last_seen = utc_now()
             return record
 
@@ -188,6 +194,7 @@ class SessionRegistry:
                     "busy": payload.get("busy", False),
                 }
             )
+            record.metadata.pop("unregister_reason", None)
             return record
 
     def unregister(self, session_id: str, reason: str) -> SessionRecord | None:

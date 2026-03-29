@@ -47,7 +47,6 @@ def candidate_endpoint_urls(url: str) -> list[str]:
             if item:
                 hosts.append(item)
 
-    hosts.append("127.0.0.1")
     gateway = discover_windows_host()
     if gateway:
         hosts.append(gateway)
@@ -55,6 +54,8 @@ def candidate_endpoint_urls(url: str) -> list[str]:
     original_host = parsed.hostname or ""
     if original_host and original_host not in {"0.0.0.0", "::"}:
         hosts.append(original_host)
+
+    hosts.append("127.0.0.1")
 
     urls: list[str] = []
     seen: set[str] = set()

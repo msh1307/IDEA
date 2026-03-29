@@ -7,7 +7,16 @@
 IDA_MCP_CONNECT_HOST = "172.31.96.1"
 
 [mcp_servers.ida-hybrid-manager]
-command = "/usr/bin/env"
-args = ["bash", "-lc", "cd /root/IDEA && IDA_MCP_CONNECT_HOST=172.31.96.1 ./.venv/bin/python -m ida_hybrid_manager.server --transport stdio"]
+command = "/root/IDEA/.venv/bin/python"
+args = ["-m", "ida_hybrid_manager.server", "--transport", "stdio"]
+cwd = "/root/IDEA"
+env = { IDA_MCP_CONNECT_HOST = "172.31.96.1" }
 startup_timeout_sec = 90.0
 tool_timeout_sec = 120.0
+
+# Windows Codex example:
+# [mcp_servers.ida-hybrid-manager]
+# command = "wsl.exe"
+# args = ["-d", "Ubuntu-24.04", "--cd", "/root/IDEA", "env", "IDA_MCP_CONNECT_HOST=172.31.96.1", "./.venv/bin/python", "-m", "ida_hybrid_manager.server", "--transport", "stdio"]
+# startup_timeout_sec = 90.0
+# tool_timeout_sec = 120.0

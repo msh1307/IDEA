@@ -15,11 +15,13 @@ class ManagerApiServer:
         registry: SessionRegistry,
         host: str = "0.0.0.0",
         port: int = 18080,
+        api_version: int = 3,
         op_dispatcher=None,
     ) -> None:
         self.registry = registry
         self.host = host
         self.port = port
+        self.api_version = api_version
         self.op_dispatcher = op_dispatcher
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -39,7 +41,14 @@ class ManagerApiServer:
 
             def do_GET(self) -> None:
                 if self.path == "/healthz":
-                    self._json(200, {"ok": True, "service": "ida-hybrid-manager", "daemon_api_version": 2})
+                    self._json(
+                        200,
+                        {
+                            "ok": True,
+                            "service": "ida-hybrid-manager",
+                            "daemon_api_version": self.server.manager_api_version,
+                        },
+                    )
                     return
                 self._json(404, {"ok": False, "error": "not_found"})
 
@@ -96,6 +105,7 @@ class ManagerApiServer:
                 self._thread = None
                 return
             raise
+        self._httpd.manager_api_version = self.api_version
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="ida-hybrid-manager-api", daemon=True)
         self._thread.start()
 
