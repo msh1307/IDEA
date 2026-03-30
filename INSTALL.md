@@ -11,7 +11,7 @@ cd IDEA
 This creates `.venv` and installs the manager in editable mode.
 It also updates the Codex MCP config for the current WSL user and the detected
 Windows user at `.codex/config.toml`.
-The detected Windows host IP is written into the generated MCP entry.
+The detected Windows host IP and IDA install root are written into the generated MCP entry.
 
 ## 2. Windows IDA plugin
 
@@ -63,6 +63,7 @@ Current behavior:
 - `list_alive_sessions` is shared across agents
 - `current_session` is tracked per client
 - headless launches are daemon-owned
+- manager-owned headless launches can stage the bundled `idea_ida_backend` package directly from the repo
 - `write_session_tool_output` writes results into WSL paths
 
 ## 4. Quick smoke test
@@ -78,10 +79,12 @@ From WSL:
 
 - The manager package is meant to be installed from Git like a normal Python project.
 - The plugin bundle is self-contained and no longer depends on any pre-existing `ida_mcp` install.
+- Legacy `ida_mcp` being present is not enough for GUI registration; GUI mode expects the native `idea_ida` plugin bundle.
 - The IDA-side backend is now a native HTTP raw API, not an embedded MCP server.
 - The first native raw tool set covers decompile/disasm/xrefs/strings/data inspection/typed reads/comments/types/structs/arrays.
+- Use `inspect_environment` from the MCP server to check IDA paths, GUI plugin install state, and headless bootstrap availability.
 - If your Codex or local MCP config already pins the correct Windows host path, keep using that. The code still keeps fallback probes because WSL networking is inconsistent across systems.
 - The shared daemon uses a fixed port and a lock file at `/tmp/ida-hybrid-manager-daemon.lock`.
-- The default IDA install root used by the launcher is `C:\Program Files\IDA Professional 9.3`. Override with `IDA_INSTALL_ROOT` if needed.
+- The installer now tries to auto-detect the installed IDA root and writes `IDA_INSTALL_ROOT` into the MCP config. Override with `IDA_INSTALL_ROOT` if needed.
 - Codex MCP configs are not hot-reloaded. Restart Codex after `config.toml` changes.
 - If IDA was already open when you patched the plugin, restart IDA or reopen the IDB.

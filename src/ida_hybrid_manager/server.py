@@ -366,11 +366,45 @@ def _normalize_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
     return {"edits": edits}
 
 
+def _merge_payload(arguments: Any = None, **explicit: Any) -> dict[str, Any]:
+    payload = _coerce_tool_arguments(arguments)
+    for key, value in explicit.items():
+        if value in (None, ""):
+            continue
+        payload[key] = value
+    return payload
+
+
 def _resolve_output_path(path: str) -> Path:
     target = Path(path).expanduser()
     if not target.is_absolute():
         target = (Path.cwd() / target).resolve()
     return target
+
+
+def _tail_text_file(path: str, max_lines: int = 40, max_chars: int = 4000) -> str:
+    try:
+        data = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    text = "\n".join(data.splitlines()[-max_lines:]).strip()
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text
+
+
+def _pending_log_summary(pending: PendingLaunch) -> dict[str, Any]:
+    logs: dict[str, Any] = {}
+    for key in ("stdout_log_path", "stderr_log_path", "idat_log_path"):
+        path = str(pending.metadata.get(key) or "")
+        if not path:
+            continue
+        entry: dict[str, Any] = {"path": path}
+        tail = _tail_text_file(path)
+        if tail:
+            entry["tail"] = tail
+        logs[key] = entry
+    return logs
 
 
 def _render_tool_result(result: dict[str, Any], output_format: str) -> str:
@@ -555,6 +589,11 @@ def _local_attach_to_gui(binary_name: str = "", binary_path: str = "", client_id
     return {"matches": _serialize_sessions_for_client(matches, client_id), "auto_selected": False}
 
 
+def _local_inspect_environment() -> dict[str, Any]:
+    launcher = _get_launcher()
+    return {"ok": True, "environment": launcher.inspect_environment()}
+
+
 def _local_open_binary(path: str, mode: str = "auto", reuse: bool = True, client_id: str | None = None) -> dict[str, Any]:
     with _open_binary_lock:
         _sweep_unreachable_sessions()
@@ -587,30 +626,120 @@ def _local_open_binary(path: str, mode: str = "auto", reuse: bool = True, client
                 }
 
         if mode == "gui":
-            pending = _get_launcher().launch_gui(path)
+            launcher = _get_launcher()
+            environment = launcher.inspect_environment()
+            if not environment.get("gui_plugin_installed"):
+                return {
+                    "ok": False,
+                    "error": "GUI mode requires the native Windows plugin bundle, but it does not appear to be installed.",
+                    "environment": environment,
+                }
+            try:
+                pending = launcher.launch_gui(path)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": f"Failed to launch GUI IDA: {exc}",
+                    "environment": environment,
+                }
             registry.register_pending_launch(pending)
             _daemon_debug(f"open_binary launched gui launch_token={pending.launch_token} pid={pending.pid}")
             record = _wait_for_session(pending)
             if record is None:
                 _daemon_debug(f"open_binary wait timeout launch_token={pending.launch_token}")
-                return {"ok": False, "error": f"Timed out waiting for {pending.engine} session", "pending": pending.to_dict()}
+                return {
+                    "ok": False,
+                    "error": f"Timed out waiting for {pending.engine} session",
+                    "pending": pending.to_dict(),
+                    "environment": environment,
+                }
         else:
             launcher = _get_launcher()
-            launcher.terminate_untracked_idat(_tracked_headless_pids())
-            pending = launcher.launch_headless(path, manager_url())
-            registry.register_pending_launch(pending)
-            _daemon_debug(f"open_binary launched headless launch_token={pending.launch_token} pid={pending.pid} port={pending.port}")
-            record = _wait_for_session(pending)
-            if record is None:
-                _daemon_debug(f"open_binary wait timeout launch_token={pending.launch_token}")
-                if pending.pid is not None:
+            attempts = max(1, int(os.getenv("IDA_HEADLESS_LAUNCH_ATTEMPTS", "3")))
+            last_failure: dict[str, Any] | None = None
+            record = None
+            pending = None
+            for attempt in range(1, attempts + 1):
+                launcher.terminate_untracked_idat(_tracked_headless_pids())
+                try:
+                    pending = launcher.launch_headless(path, manager_url())
+                except Exception as exc:
+                    last_failure = {
+                        "ok": False,
+                        "error": f"Failed to launch headless IDA: {exc}",
+                        "environment": launcher.inspect_environment(),
+                        "attempt": attempt,
+                        "attempts": attempts,
+                    }
+                    if attempt >= attempts:
+                        return last_failure
+                    continue
+
+                registry.register_pending_launch(pending)
+                _daemon_debug(
+                    "open_binary launched headless "
+                    f"launch_token={pending.launch_token} pid={pending.pid} port={pending.port} attempt={attempt}/{attempts}"
+                )
+                record = _wait_for_session(pending)
+                if record is None:
+                    _daemon_debug(
+                        "open_binary wait timeout "
+                        f"launch_token={pending.launch_token} attempt={attempt}/{attempts}"
+                    )
+                    if pending.pid is not None:
+                        try:
+                            launcher.terminate_process(pending.pid)
+                        except Exception:
+                            pass
+                    last_failure = {
+                        "ok": False,
+                        "error": f"Timed out waiting for {pending.engine} session",
+                        "pending": pending.to_dict(),
+                        "environment": launcher.inspect_environment(),
+                        "logs": _pending_log_summary(pending),
+                        "attempt": attempt,
+                        "attempts": attempts,
+                    }
+                    if attempt >= attempts:
+                        return last_failure
+                    continue
+
+                _daemon_debug(
+                    "open_binary session-linked "
+                    f"session_id={record.session_id} status={record.status} endpoint={record.endpoint} attempt={attempt}/{attempts}"
+                )
+                if _backend_ready(record):
+                    break
+
+                _daemon_debug(f"open_binary backend_unreachable session_id={record.session_id} attempt={attempt}/{attempts}")
+                if record.closable and record.owner_pid is not None:
                     try:
-                        launcher.terminate_process(pending.pid)
+                        _get_launcher().terminate_process(record.owner_pid)
                     except Exception:
                         pass
-                return {"ok": False, "error": f"Timed out waiting for {pending.engine} session", "pending": pending.to_dict()}
-        _daemon_debug(f"open_binary session-linked session_id={record.session_id} status={record.status} endpoint={record.endpoint}")
-        if not _backend_ready(record):
+                    registry.unregister(record.session_id, "backend_unreachable")
+                last_failure = {
+                    "ok": False,
+                    "error": f"{record.engine} session registered but backend was unreachable",
+                    "session_id": record.session_id,
+                    "endpoint_candidates": _backend_candidates(record),
+                    "environment": _get_launcher().inspect_environment(),
+                    "logs": _pending_log_summary(pending),
+                    "attempt": attempt,
+                    "attempts": attempts,
+                }
+                record = None
+                if attempt >= attempts:
+                    return last_failure
+            if record is None:
+                return last_failure or {
+                    "ok": False,
+                    "error": "Failed to launch headless IDA",
+                    "environment": launcher.inspect_environment(),
+                }
+        if mode == "gui":
+            _daemon_debug(f"open_binary session-linked session_id={record.session_id} status={record.status} endpoint={record.endpoint}")
+        if mode == "gui" and not _backend_ready(record):
             _daemon_debug(f"open_binary backend_unreachable session_id={record.session_id}")
             if record.closable and record.owner_pid is not None:
                 try:
@@ -623,6 +752,8 @@ def _local_open_binary(path: str, mode: str = "auto", reuse: bool = True, client
                 "error": f"{record.engine} session registered but backend was unreachable",
                 "session_id": record.session_id,
                 "endpoint_candidates": _backend_candidates(record),
+                "environment": _get_launcher().inspect_environment(),
+                "logs": _pending_log_summary(pending) if record.engine == "headless" else {},
             }
         if record.engine == "headless":
             try:
@@ -738,6 +869,7 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
     client_id = payload.get("client_id")
     op_map = {
         "connect_client": lambda **kwargs: _client_connect(**kwargs),
+        "inspect_environment": lambda **kwargs: _local_inspect_environment(),
         "list_alive_sessions": lambda **kwargs: _local_list_alive_sessions(client_id=client_id),
         "current_session": lambda **kwargs: _local_current_session(client_id=client_id),
         "select_session": lambda **kwargs: _local_select_session(kwargs["session_id"], client_id=client_id),
@@ -746,6 +878,36 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
         "close_session": lambda **kwargs: _local_close_session(kwargs["session_id"], kwargs.get("save", True), client_id=client_id),
         "list_session_tools": lambda **kwargs: _local_list_session_tools(kwargs.get("session_id", ""), client_id=client_id),
         "call_session_tool": lambda **kwargs: _local_call_session_tool(kwargs["tool_name"], kwargs.get("arguments"), kwargs.get("session_id", ""), client_id=client_id),
+        "inspect": lambda **kwargs: _local_call_session_tool(
+            "inspect",
+            _merge_payload(kwargs.get("arguments"), addr=kwargs["addr"]),
+            kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
+        "read": lambda **kwargs: _local_call_session_tool(
+            "read",
+            _merge_payload(kwargs.get("arguments"), kind=kwargs["kind"], addr=kwargs.get("addr", "")),
+            kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
+        "search": lambda **kwargs: _local_call_session_tool(
+            "search",
+            _merge_payload(kwargs.get("arguments"), kind=kwargs["kind"], query=kwargs.get("query", "")),
+            kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
+        "xrefs": lambda **kwargs: _local_call_session_tool(
+            "xrefs",
+            _merge_payload(kwargs.get("arguments"), direction=kwargs.get("direction", "to"), addr=kwargs.get("addr", "")),
+            kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
+        "define": lambda **kwargs: _local_call_session_tool(
+            "define",
+            _merge_payload(kwargs.get("arguments"), kind=kwargs["kind"], addr=kwargs.get("addr", "")),
+            kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
         "inspect_addr": lambda **kwargs: _local_call_session_tool("inspect_addr", {"addr": kwargs["addr"]}, kwargs.get("session_id", ""), client_id=client_id),
         "get_enclosing_function": lambda **kwargs: _local_call_session_tool("get_enclosing_function", {"addr": kwargs["addr"]}, kwargs.get("session_id", ""), client_id=client_id),
         "decompile": lambda **kwargs: _local_call_session_tool("decompile", {"addr": kwargs["addr"]}, kwargs.get("session_id", ""), client_id=client_id),
@@ -814,6 +976,13 @@ def attach_to_gui(binary_name: str = "", binary_path: str = "") -> dict[str, Any
     return _local_attach_to_gui(binary_name=binary_name, binary_path=binary_path, client_id=CLIENT_ID)
 
 
+@mcp.tool(description="Inspect Windows IDA paths, plugin install state, and headless bootstrap availability.")
+def inspect_environment() -> dict[str, Any]:
+    if ACTIVE_BACKEND == "daemon":
+        return _daemon_request_sync("inspect_environment", {"client_id": CLIENT_ID})
+    return _local_inspect_environment()
+
+
 @mcp.tool(description="Open a binary in headless mode, GUI mode, or auto mode and select the resulting session.")
 def open_binary(path: str, mode: str = "auto", reuse: bool = True) -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
@@ -843,6 +1012,61 @@ async def call_session_tool(tool_name: str, arguments: Any = None, session_id: s
             {"tool_name": tool_name, "arguments": arguments, "session_id": session_id, "client_id": CLIENT_ID},
         )
     return await _local_call_session_tool(tool_name=tool_name, arguments=arguments, session_id=session_id, client_id=CLIENT_ID)
+
+
+@mcp.tool(description="High-level address inspection with optional decompile/disasm payloads.")
+async def inspect(
+    addr: str,
+    session_id: str = "",
+    include_decompile: bool = False,
+    include_disasm: bool = False,
+    include_line_map: bool = False,
+    max_instructions: int = 200,
+    arguments: Any = None,
+) -> dict[str, Any]:
+    payload = _merge_payload(
+        arguments,
+        addr=addr,
+        include_decompile=include_decompile,
+        include_disasm=include_disasm,
+        include_line_map=include_line_map,
+        max_instructions=max_instructions,
+    )
+    if ACTIVE_BACKEND == "daemon":
+        return await _daemon_request_async("inspect", {"session_id": session_id, "client_id": CLIENT_ID, "arguments": payload, "addr": addr})
+    return await _local_call_session_tool("inspect", payload, session_id=session_id, client_id=CLIENT_ID)
+
+
+@mcp.tool(description="High-level read API for bytes/int/string/struct/array/global.")
+async def read(kind: str, addr: str = "", session_id: str = "", arguments: Any = None) -> dict[str, Any]:
+    payload = _merge_payload(arguments, kind=kind, addr=addr)
+    if ACTIVE_BACKEND == "daemon":
+        return await _daemon_request_async("read", {"kind": kind, "addr": addr, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID})
+    return await _local_call_session_tool("read", payload, session_id=session_id, client_id=CLIENT_ID)
+
+
+@mcp.tool(description="High-level search API for text/regex/bytes/immediates/instructions.")
+async def search(kind: str, query: str = "", session_id: str = "", arguments: Any = None) -> dict[str, Any]:
+    payload = _merge_payload(arguments, kind=kind, query=query)
+    if ACTIVE_BACKEND == "daemon":
+        return await _daemon_request_async("search", {"kind": kind, "query": query, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID})
+    return await _local_call_session_tool("search", payload, session_id=session_id, client_id=CLIENT_ID)
+
+
+@mcp.tool(description="High-level xref API for to/from or struct-field lookups.")
+async def xrefs(direction: str = "to", addr: str = "", session_id: str = "", arguments: Any = None) -> dict[str, Any]:
+    payload = _merge_payload(arguments, direction=direction, addr=addr)
+    if ACTIVE_BACKEND == "daemon":
+        return await _daemon_request_async("xrefs", {"direction": direction, "addr": addr, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID})
+    return await _local_call_session_tool("xrefs", payload, session_id=session_id, client_id=CLIENT_ID)
+
+
+@mcp.tool(description="High-level define API for function/code/type/struct/array/stack/undefine.")
+async def define(kind: str, addr: str = "", session_id: str = "", arguments: Any = None) -> dict[str, Any]:
+    payload = _merge_payload(arguments, kind=kind, addr=addr)
+    if ACTIVE_BACKEND == "daemon":
+        return await _daemon_request_async("define", {"kind": kind, "addr": addr, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID})
+    return await _local_call_session_tool("define", payload, session_id=session_id, client_id=CLIENT_ID)
 
 
 @mcp.tool(description="Inspect an address and return code/data/function context.")

@@ -12,6 +12,8 @@ cd IDEA
 
 This creates `.venv`, installs the manager in editable mode, and updates the
 Codex MCP config for the current WSL user plus the detected Windows user.
+The installer now auto-detects both the Windows host IP and the IDA install root
+and writes them into the generated MCP entry.
 
 Windows PowerShell:
 
@@ -27,9 +29,12 @@ Defaults:
 
 Notes:
 
-- The Windows installer now installs a self-contained `idea_ida` plugin bundle.
+- The Windows installer installs the native `idea_ida` GUI plugin bundle.
 - If your plugin directory is non-standard, pass `-PluginRoot` to `install_plugin.ps1`.
 - Headless sessions now advertise the WSL-reachable Windows host IP by default; override with `IDA_MCP_CONNECT_HOST` if needed.
+- The WSL installer writes both `IDA_MCP_CONNECT_HOST` and `IDA_INSTALL_ROOT` into the generated Codex config.
+- Manager-owned headless launches can bootstrap from the repo's bundled `plugin_overlay/idea_ida_backend` even if the Windows plugin has not been installed yet.
+- GUI attach/open still requires the Windows plugin install because GUI session registration happens inside IDA.
 
 ## Run
 
@@ -62,12 +67,23 @@ cd IDEA
 
 Useful tools:
 
+- `inspect_environment`
+- `inspect`
+- `read`
+- `search`
+- `xrefs`
+- `define`
 - `open_binary`
 - `close_session`
 - `list_alive_sessions`
 - `call_session_tool`
 - `write_session_tool_output`
 - backend raw tools now include `decompile`, `disasm`, `get_xrefs_to`, `get_xrefs_from`, `list_strings`, `find_bytes`, `find_text`, `find_immediates`, `find_insns`, `get_data_item`, `read_bytes`, `read_byte`, `read_word`, `read_dword`, `read_qword`, `read_array`, `hex_dump`, `set_type`, `create_struct`, `apply_struct`, and `make_array`
+
+High-level API:
+
+- prefer `inspect`, `read`, `search`, `xrefs`, and `define` for normal usage
+- older fine-grained tools remain available as compatibility paths
 
 ## Config example
 

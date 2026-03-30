@@ -5,18 +5,19 @@
 
 [env]
 IDA_MCP_CONNECT_HOST = "172.31.96.1"
+IDA_INSTALL_ROOT = 'C:\Program Files\IDA Professional 9.3'
 
 [mcp_servers.ida-hybrid-manager]
 command = "/root/IDEA/.venv/bin/python"
 args = ["-m", "ida_hybrid_manager.server", "--transport", "stdio"]
 cwd = "/root/IDEA"
-env = { IDA_MCP_CONNECT_HOST = "172.31.96.1" }
+env = { IDA_MCP_CONNECT_HOST = "172.31.96.1", IDA_INSTALL_ROOT = 'C:\Program Files\IDA Professional 9.3' }
 startup_timeout_sec = 90.0
 tool_timeout_sec = 120.0
 
 # Windows Codex example:
 # [mcp_servers.ida-hybrid-manager]
 # command = "wsl.exe"
-# args = ["-d", "Ubuntu-24.04", "--cd", "/root/IDEA", "env", "IDA_MCP_CONNECT_HOST=172.31.96.1", "./.venv/bin/python", "-m", "ida_hybrid_manager.server", "--transport", "stdio"]
+# args = ["-d", "Ubuntu-24.04", "--cd", "/root/IDEA", "env", "IDA_MCP_CONNECT_HOST=172.31.96.1", "IDA_INSTALL_ROOT=C:\Program Files\IDA Professional 9.3", "./.venv/bin/python", "-m", "ida_hybrid_manager.server", "--transport", "stdio"]
 # startup_timeout_sec = 90.0
 # tool_timeout_sec = 120.0

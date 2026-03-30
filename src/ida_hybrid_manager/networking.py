@@ -5,10 +5,29 @@ import subprocess
 from urllib.parse import urlsplit, urlunsplit
 
 
-def discover_windows_host() -> str:
+def _split_hosts(value: str) -> list[str]:
+    hosts: list[str] = []
+    for item in value.split(","):
+        candidate = item.strip()
+        if candidate:
+            hosts.append(candidate)
+    return hosts
+
+
+def candidate_windows_hosts(*, include_loopback: bool = True) -> list[str]:
+    hosts: list[str] = []
+    seen: set[str] = set()
+
+    def add(host: str) -> None:
+        candidate = host.strip()
+        if not candidate or candidate in seen:
+            return
+        seen.add(candidate)
+        hosts.append(candidate)
+
     env = os.getenv("IDA_MCP_CONNECT_HOST", "").strip()
-    if env:
-        return env
+    for host in _split_hosts(env):
+        add(host)
 
     commands = [
         ["sh", "-lc", "ip route show default | awk '/default/ {print $3; exit}'"],
@@ -18,8 +37,16 @@ def discover_windows_host() -> str:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         value = result.stdout.strip()
         if value:
-            return value
-    return "127.0.0.1"
+            add(value)
+
+    if include_loopback:
+        add("127.0.0.1")
+    return hosts
+
+
+def discover_windows_host() -> str:
+    candidates = candidate_windows_hosts()
+    return candidates[0] if candidates else "127.0.0.1"
 
 
 def rewrite_endpoint_url(url: str, host: str) -> str:
@@ -36,26 +63,11 @@ def rewrite_endpoint_url(url: str, host: str) -> str:
 def candidate_endpoint_urls(url: str) -> list[str]:
     parsed = urlsplit(url)
     hosts: list[str] = []
-
-    env = os.getenv("IDA_MCP_CONNECT_HOST", "").strip()
-    if env:
-        # Codex deployments can pin the known-good Windows/WSL reachability path
-        # in config via IDA_MCP_CONNECT_HOST. Keep the fallback probes below
-        # because localhost vs gateway behavior differs across WSL setups.
-        for item in env.split(","):
-            item = item.strip()
-            if item:
-                hosts.append(item)
-
-    gateway = discover_windows_host()
-    if gateway:
-        hosts.append(gateway)
+    hosts.extend(candidate_windows_hosts())
 
     original_host = parsed.hostname or ""
     if original_host and original_host not in {"0.0.0.0", "::"}:
         hosts.append(original_host)
-
-    hosts.append("127.0.0.1")
 
     urls: list[str] = []
     seen: set[str] = set()
