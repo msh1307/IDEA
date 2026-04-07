@@ -111,6 +111,15 @@ def _hex_to_int(value: str) -> int:
     return int(str(value), 16)
 
 
+def _normalize_test_path(path: str) -> str:
+    text = str(path or "").strip()
+    match = re.match(r"^(?P<drive>[a-zA-Z]):\\(?P<rest>.*)$", text)
+    if match:
+        rest = match.group("rest").replace("\\", "/")
+        return f"/mnt/{match.group('drive').lower()}/{rest}"
+    return text
+
+
 async def call_tool(session: ClientSession, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     result = await session.call_tool(name, arguments)
     payload = result.model_dump(mode="json")
@@ -462,6 +471,27 @@ async def main(target: str) -> int:
                 _assert(export_struct.get("name") == padded_struct_name and exported_header, f"export_struct failed: {_json(export_struct)}")
                 print("EXPORT_STRUCT ok")
 
+                export_struct_file_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {
+                        "session_id": session_id,
+                        "tool_name": "export_struct",
+                        "arguments": {
+                            "struct_name": padded_struct_name,
+                            "format": "json",
+                            "path": f"/mnt/c/Windows/Temp/{padded_struct_name}.json",
+                        },
+                    },
+                )
+                export_struct_file = _inner_structured(export_struct_file_resp) or {}
+                export_path = str(export_struct_file.get("path") or "")
+                _assert(export_path.endswith(f"{padded_struct_name}.json"), f"export_struct path missing: {_json(export_struct_file)}")
+                with open(_normalize_test_path(export_path), "r", encoding="utf-8") as handle:
+                    exported_file_payload = json.load(handle)
+                _assert(exported_file_payload.get("name") == padded_struct_name, f"export_struct file contents unexpected: {_json(exported_file_payload)}")
+                print("EXPORT_STRUCT file ok")
+
                 struct_diff_resp = await call_tool(
                     session,
                     "call_session_tool",
@@ -540,6 +570,7 @@ async def main(target: str) -> int:
                 first_stack_frame = _first(stack_frames, "stack_frame returned no rows")
                 stack_vars = first_stack_frame.get("vars") or []
                 renamed_stack = False
+                renamed_stack_name = ""
                 for stack_var in stack_vars:
                     old_stack_name = str(stack_var.get("name") or "").strip()
                     if not old_stack_name or old_stack_name.startswith("arg_"):
@@ -579,10 +610,29 @@ async def main(target: str) -> int:
                     _assert(new_stack_name in renamed_names, f"stack rename not visible in frame: {_json(first_stack_after)}")
                     print(f"RENAME stack ok {old_stack_name}->{new_stack_name}")
                     renamed_stack = True
+                    renamed_stack_name = new_stack_name
                     break
                 _assert(renamed_stack, "No stack variable candidate could be renamed end-to-end")
 
+                apply_many_stack_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {
+                        "session_id": session_id,
+                        "tool_name": "apply_struct_to_many",
+                        "arguments": {
+                            "struct_name": padded_struct_name,
+                            "items": [{"kind": "stack", "func_addr": func_addr, "name": renamed_stack_name}],
+                        },
+                    },
+                )
+                apply_many_stack = _inner_structured(apply_many_stack_resp) or {}
+                _assert((apply_many_stack.get("ok_count") or 0) >= 1, f"apply_struct_to_many(stack) failed: {_json(apply_many_stack)}")
+                print("APPLY_STRUCT_TO_MANY stack ok")
+
                 local_rename_verified = False
+                renamed_local_name = ""
+                renamed_local_func_addr = ""
                 for candidate in function_items[:24]:
                     candidate_addr = str(candidate.get("address") or "")
                     if not candidate_addr:
@@ -626,8 +676,26 @@ async def main(target: str) -> int:
                     _assert(new_local_name in code_after, f"local rename not visible in decompile output: {_json(decompile_after)}")
                     print(f"RENAME local ok {old_local_name}->{new_local_name}")
                     local_rename_verified = True
+                    renamed_local_name = new_local_name
+                    renamed_local_func_addr = candidate_addr
                     break
                 _assert(local_rename_verified, "No local variable candidate could be renamed end-to-end")
+
+                apply_many_local_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {
+                        "session_id": session_id,
+                        "tool_name": "apply_struct_to_many",
+                        "arguments": {
+                            "struct_name": padded_struct_name,
+                            "items": [{"kind": "local", "func_addr": renamed_local_func_addr, "name": renamed_local_name}],
+                        },
+                    },
+                )
+                apply_many_local = _inner_structured(apply_many_local_resp) or {}
+                _assert((apply_many_local.get("ok_count") or 0) >= 1, f"apply_struct_to_many(local) failed: {_json(apply_many_local)}")
+                print("APPLY_STRUCT_TO_MANY local ok")
 
             finally:
                 if session_id:

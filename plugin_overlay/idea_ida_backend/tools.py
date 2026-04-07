@@ -47,6 +47,8 @@ PRIMITIVE_READERS: dict[str, tuple[int, str | None, Callable[[bytes], Any]]] = {
 }
 
 _INT_CLASS_RE = re.compile(r"^(?P<sign>[iu])(?P<bits>8|16|32|64)(?P<endian>le|be)?$")
+_WINDOWS_DRIVE_RE = re.compile(r"^(?P<drive>[a-zA-Z]):[\\/](?P<rest>.*)$")
+_WSL_DRIVE_RE = re.compile(r"^/mnt/(?P<drive>[a-zA-Z])/(?P<rest>.*)$")
 
 
 def _parse_ea(value: Any) -> int:
@@ -102,6 +104,21 @@ def _pick_fields(entry: dict[str, Any], fields: list[str]) -> dict[str, Any]:
 
 
 _AUTO_PAD_RE = re.compile(r"^__pad_[0-9A-Fa-f]+(?:_[0-9A-Fa-f]+)?$")
+
+
+def _normalize_export_path(path: str) -> Path:
+    raw = str(path or "").strip()
+    if not raw:
+        raise ValueError("path is required")
+    match = _WSL_DRIVE_RE.match(raw)
+    if match:
+        rest = match.group("rest").replace("/", "\\")
+        return Path(f"{match.group('drive').upper()}:\\{rest}")
+    match = _WINDOWS_DRIVE_RE.match(raw)
+    if match:
+        rest = match.group("rest").replace("/", "\\")
+        return Path(f"{match.group('drive').upper()}:\\{rest}")
+    return Path(raw).expanduser()
 
 
 def _read_bytes_raw(ea: int, size: int) -> bytes:
@@ -198,8 +215,16 @@ def _refresh_decompiler(ea: int) -> None:
     if func is None:
         return
     try:
+        ida_hexrays.mark_cfunc_dirty(func.start_ea, False)
+    except Exception:
+        pass
+    try:
         cfunc = ida_hexrays.decompile(func.start_ea)
         if cfunc:
+            try:
+                cfunc.recalc_item_addresses()
+            except Exception:
+                pass
             cfunc.refresh_func_ctext()
     except Exception:
         pass
@@ -546,6 +571,13 @@ def _resolve_type_info(type_name: str) -> ida_typeinf.tinfo_t:
     tif = ida_typeinf.tinfo_t()
     if tif.get_named_type(None, normalized):
         return tif
+    try:
+        parsed = ida_typeinf.tinfo_t(normalized)
+        if parsed:
+            return parsed
+    except Exception:
+        pass
+    raise ValueError(f"Unable to resolve type: {normalized}")
 
 
 def _member_declaration(field_type: str, field_name: str) -> str:
@@ -804,6 +836,28 @@ def _apply_struct_to_local(func_ea: int, local_name: str, struct_name: str) -> d
 
 def _apply_struct_to_stack(func_ea: int, item: dict[str, Any], struct_name: str) -> dict[str, Any]:
     tif = _get_named_struct_tinfo(struct_name)
+    target_name = str(item.get("name") or "").strip()
+    if target_name:
+        try:
+            cfunc, lvar = _find_cfunc_lvar(func_ea, target_name)
+            info = ida_hexrays.lvar_saved_info_t()
+            info.ll = lvar
+            info.type = tif
+            info.size = int(tif.get_size())
+            ok = bool(ida_hexrays.modify_user_lvar_info(cfunc.entry_ea, ida_hexrays.MLI_TYPE, info))
+            if ok:
+                _refresh_decompiler(cfunc.entry_ea)
+                return {
+                    "addr": _hex(cfunc.entry_ea),
+                    "name": target_name,
+                    "struct_name": struct_name,
+                    "ok": True,
+                    "kind": "stack",
+                    "applied_via": "lvar_saved_info",
+                }
+        except Exception:
+            pass
+
     func = idaapi.get_func(func_ea)
     if func is None:
         raise ValueError(f"No function found at {_hex(func_ea)}")
@@ -812,7 +866,6 @@ def _apply_struct_to_stack(func_ea: int, item: dict[str, Any], struct_name: str)
         raise ValueError("No frame")
     udt = ida_typeinf.udt_type_data_t()
     frame_tif.get_udt_details(udt)
-    target_name = str(item.get("name") or "").strip()
     target_offset = item.get("offset")
     selected = None
     for udm in udt:
@@ -832,16 +885,27 @@ def _apply_struct_to_stack(func_ea: int, item: dict[str, Any], struct_name: str)
     ok = bool(ida_frame.define_stkvar(func, var_name, fp_offset, tif))
     if ok:
         _refresh_decompiler(func.start_ea)
-    return {"addr": _hex(func.start_ea), "name": var_name, "offset": _hex(soff), "struct_name": struct_name, "ok": ok, "kind": "stack"}
+    return {
+        "addr": _hex(func.start_ea),
+        "name": var_name,
+        "offset": _hex(soff),
+        "struct_name": struct_name,
+        "ok": ok,
+        "kind": "stack",
+        "applied_via": "define_stkvar",
+    }
 
-    try:
-        parsed = ida_typeinf.tinfo_t(normalized)
-        if parsed:
-            return parsed
-    except Exception:
-        pass
 
-    raise ValueError(f"Unable to resolve type: {normalized}")
+def _workflow_entries_ok(group: list[Any]) -> bool:
+    for entry in group:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("ok") is False:
+            return False
+        nested = entry.get("items")
+        if isinstance(nested, list) and not _workflow_entries_ok(nested):
+            return False
+    return True
 
 
 def _read_display_value(ea: int, size: int, type_name: str = "") -> str:
@@ -2749,7 +2813,7 @@ def export_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         "header": _header_decl_from_layout(struct_name, layout, total_size),
     }
     if path:
-        target = Path(path).expanduser()
+        target = _normalize_export_path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         if output_format in {"h", "header", "c"}:
             target.write_text(payload["header"] + "\n", encoding="utf-8")
@@ -2813,7 +2877,7 @@ def typed_decompile_export(arguments: dict[str, Any] | None = None) -> dict[str,
     if include_line_map:
         payload["line_map"] = _decompile_line_map_payload(ea)
     if path:
-        target = Path(path).expanduser()
+        target = _normalize_export_path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         if output_format in {"txt", "text", "c"}:
             text = str(payload.get("code") or "")
@@ -2824,6 +2888,80 @@ def typed_decompile_export(arguments: dict[str, Any] | None = None) -> dict[str,
             target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         payload["path"] = str(target)
     return payload
+
+
+@idasync
+def type_workflow(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    results: dict[str, Any] = {
+        "decls": [],
+        "structs": [],
+        "applies": [],
+        "exports": [],
+        "typed_decompile": [],
+    }
+
+    for decl in arguments.get("decls", []) or []:
+        try:
+            payload = declare_type({"decls": [decl]})
+            results["decls"].append(payload[0] if isinstance(payload, list) and payload else {"ok": False, "decl": decl})
+        except Exception as exc:
+            results["decls"].append({"ok": False, "decl": decl, "error": str(exc)})
+
+    for item in arguments.get("structs", []) or []:
+        mode = str(item.get("mode") or "upsert").strip().lower()
+        try:
+            if mode in {"padded", "map", "from_map"}:
+                results["structs"].append(create_padded_struct_from_map(item))
+            elif mode in {"create"}:
+                results["structs"].append(create_struct(item))
+            else:
+                results["structs"].append(upsert_struct(item))
+        except Exception as exc:
+            results["structs"].append({"ok": False, "name": item.get("name"), "mode": mode, "error": str(exc)})
+
+    for item in arguments.get("applies", []) or []:
+        try:
+            if item.get("struct_name"):
+                results["applies"].append(
+                    apply_struct_to_many(
+                        {
+                            "struct_name": item.get("struct_name"),
+                            "items": item.get("items") or [],
+                        }
+                    )
+                )
+            elif item.get("decl") or item.get("signature"):
+                edits = item.get("edits")
+                if edits:
+                    results["applies"].append({"kind": "decl_batch", "items": set_type({"edits": edits})})
+                else:
+                    results["applies"].append(apply_decl(item))
+            elif item.get("edits"):
+                results["applies"].append({"kind": "type_batch", "items": set_type({"edits": item.get("edits")})})
+            else:
+                raise ValueError("Unsupported apply workflow item")
+        except Exception as exc:
+            results["applies"].append({"ok": False, "item": item, "error": str(exc)})
+
+    for item in arguments.get("exports", []) or []:
+        try:
+            results["exports"].append(export_struct(item))
+        except Exception as exc:
+            results["exports"].append({"ok": False, "name": item.get("struct_name") or item.get("name"), "error": str(exc)})
+
+    for item in arguments.get("typed_decompile", []) or []:
+        try:
+            results["typed_decompile"].append(typed_decompile_export(item))
+        except Exception as exc:
+            results["typed_decompile"].append({"ok": False, "addr": item.get("addr"), "error": str(exc)})
+
+    results["ok"] = all(
+        _workflow_entries_ok(group)
+        for _group_name, group in results.items()
+        if isinstance(group, list)
+    )
+    return results
 
 
 @idasync
@@ -2927,6 +3065,7 @@ TOOL_DEFINITIONS = [
     {"name": "export_struct", "description": "Export a named struct as canonical header text or json."},
     {"name": "field_xrefs_for_struct", "description": "Return per-field xrefs for a struct with contextual disassembly."},
     {"name": "typed_decompile_export", "description": "Export decompiled code for a function under the current typed DB state."},
+    {"name": "type_workflow", "description": "LLM-friendly high-level workflow for declaring types, upserting structs, applying them, exporting them, and exporting typed decompilation."},
     {"name": "make_array", "description": "Convert the current item into an array."},
     {"name": "save_database", "description": "Save the current database."},
 ]
@@ -2999,6 +3138,7 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any] | None], Any]] = {
     "export_struct": export_struct,
     "field_xrefs_for_struct": field_xrefs_for_struct,
     "typed_decompile_export": typed_decompile_export,
+    "type_workflow": type_workflow,
     "make_array": make_array,
     "save_database": save_database,
 }
