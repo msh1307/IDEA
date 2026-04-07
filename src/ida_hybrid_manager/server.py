@@ -7,6 +7,7 @@ import hashlib
 from io import TextIOWrapper
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -376,10 +377,44 @@ def _merge_payload(arguments: Any = None, **explicit: Any) -> dict[str, Any]:
 
 
 def _resolve_output_path(path: str) -> Path:
-    target = Path(path).expanduser()
+    normalized = normalize_path(path)
+    target = Path(normalized.wsl_path).expanduser()
     if not target.is_absolute():
         target = (Path.cwd() / target).resolve()
     return target
+
+
+def _session_persistent_idb_target(record: Any) -> Path | None:
+    source_wsl_path = str(record.metadata.get("source_wsl_path") or "").strip()
+    if not source_wsl_path:
+        return None
+    source_path = Path(source_wsl_path)
+    target_name = f"{source_path.name}.i64"
+    return source_path.with_name(target_name)
+
+
+def _session_staged_idb_path(record: Any) -> Path | None:
+    staged_binary_path = str(record.metadata.get("staged_binary_path") or "").strip()
+    if not staged_binary_path:
+        return None
+    staged_path = Path(staged_binary_path)
+    return staged_path.with_name(f"{staged_path.name}.i64")
+
+
+def _persist_staged_idb(record: Any) -> dict[str, Any]:
+    staged_idb = _session_staged_idb_path(record)
+    persistent_idb = _session_persistent_idb_target(record)
+    if staged_idb is None or persistent_idb is None:
+        return {"copied": False, "reason": "no_staged_or_source_path"}
+    if not staged_idb.exists():
+        return {"copied": False, "reason": "staged_idb_missing", "staged_idb": str(staged_idb)}
+    persistent_idb.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(staged_idb, persistent_idb)
+    return {
+        "copied": True,
+        "staged_idb": str(staged_idb),
+        "persistent_idb": str(persistent_idb),
+    }
 
 
 def _tail_text_file(path: str, max_lines: int = 40, max_chars: int = 4000) -> str:
@@ -812,6 +847,8 @@ def _local_close_session(session_id: str, save: bool = True, client_id: str | No
     if record.owner_pid is not None:
         _get_launcher().terminate_process(record.owner_pid)
     cleanup = {}
+    if save:
+        cleanup["idb_persist"] = _persist_staged_idb(record)
     staged_dir = str(record.metadata.get("staged_dir") or "")
     if staged_dir:
         cleanup["staged_dir"] = staged_dir
@@ -1181,7 +1218,7 @@ async def xrefs_to(addrs: list[str] | str, limit: int = 100, session_id: str = "
     return await _local_call_session_tool("xrefs_to", {"addrs": addrs, "limit": limit}, session_id=session_id, client_id=CLIENT_ID)
 
 
-@mcp.tool(description="Rename functions, globals, locals, or stack variables in the selected session.")
+@mcp.tool(description="Rename functions, globals, local variables, or stack variables in the selected session.")
 async def rename(batch: dict[str, Any], session_id: str = "") -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
         return await _daemon_request_async("rename", {"batch": batch, "session_id": session_id, "client_id": CLIENT_ID})

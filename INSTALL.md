@@ -65,6 +65,9 @@ Current behavior:
 - headless launches are daemon-owned
 - manager-owned headless launches can stage the bundled `idea_ida_backend` package directly from the repo
 - `write_session_tool_output` writes results into WSL paths
+- Prefer passing `/mnt/c/...` paths directly. If a `C:\...` Windows path is supplied, the manager will normalize it to the matching WSL path before writing.
+- If the original input binary already has an adjacent `.i64`, the manager stages that database too so headless analysis continues from the saved IDB instead of starting fresh.
+- By default, closing a manager-owned headless session with `save=true` now copies the staged `.i64` back next to the original input binary path before staged temp files are removed.
 
 ## 4. Quick smoke test
 

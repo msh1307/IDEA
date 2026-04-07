@@ -264,15 +264,17 @@ class IdaLauncher:
     def _prepare_binary_path(self, binary_path: str, *, always_stage: bool = False) -> tuple[str, str, dict[str, str]]:
         normalized = normalize_path(binary_path)
         windows_path = normalized.windows_path
+        source_wsl = Path(normalized.wsl_path)
+        source_idb = source_wsl.with_name(f"{source_wsl.name}.i64")
         source_metadata = {
             "source_input_path": normalized.input_path,
             "source_windows_path": normalized.windows_path,
             "source_wsl_path": normalized.wsl_path,
+            "source_idb_wsl_path": str(source_idb),
         }
         if len(windows_path) >= 3 and windows_path[1:3] == ":\\" and not always_stage:
             return windows_path, windows_path, source_metadata
 
-        source_wsl = Path(normalized.wsl_path)
         if not source_wsl.exists():
             raise FileNotFoundError(f"Input binary not found: {binary_path}")
 
@@ -280,10 +282,14 @@ class IdaLauncher:
         staged_dir.mkdir(parents=True, exist_ok=True)
         staged_path = staged_dir / source_wsl.name
         shutil.copy2(source_wsl, staged_path)
+        staged_idb = staged_path.with_name(f"{staged_path.name}.i64")
+        if source_idb.exists():
+            shutil.copy2(source_idb, staged_idb)
         display_path = windows_path if len(windows_path) >= 3 and windows_path[1:3] == ":\\" else normalized.input_path
         metadata = {
             "staged_dir": str(staged_dir),
             "staged_binary_path": str(staged_path),
+            "staged_idb_path": str(staged_idb),
         }
         metadata.update(source_metadata)
         return to_windows_path(str(staged_path)), display_path, metadata

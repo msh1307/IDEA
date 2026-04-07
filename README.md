@@ -78,6 +78,9 @@ Useful tools:
 - `list_alive_sessions`
 - `call_session_tool`
 - `write_session_tool_output`
+- For `write_session_tool_output`, prefer `/mnt/c/...` output paths. `C:\...` inputs are normalized to WSL paths before writing.
+- If the original input binary already has an adjacent `.i64`, headless staging copies that database too and reuses it.
+- When a manager-owned headless session is closed with `save=true`, the staged `.i64` is copied back next to the original binary path by default.
 - backend raw tools now include `decompile`, `disasm`, `get_xrefs_to`, `get_xrefs_from`, `list_strings`, `find_bytes`, `find_text`, `find_immediates`, `find_insns`, `get_data_item`, `read_bytes`, `read_byte`, `read_word`, `read_dword`, `read_qword`, `read_array`, `hex_dump`, `set_type`, `create_struct`, `apply_struct`, and `make_array`
 
 High-level API:
