@@ -740,21 +740,45 @@ def _load_struct_reference(arguments: dict[str, Any]) -> dict[str, Any]:
     return _parse_exported_struct_text(text)
 
 
-def _classify_xref_access(ea: int) -> str:
+def _classify_xref_access(ea: int) -> dict[str, Any]:
     insn = _decode_insn_at(ea)
     if insn is None:
-        return "unknown"
+        return {
+            "access_hint": "unknown",
+            "confidence": "none",
+            "basis": "instruction_decode_failed",
+        }
     mem_operand_types = {ida_ua.o_mem, ida_ua.o_phrase, ida_ua.o_displ}
     ops = [insn.ops[idx] for idx in range(ida_ua.UA_MAXOP) if insn.ops[idx].type != ida_ua.o_void]
     if not ops:
-        return "unknown"
+        return {
+            "access_hint": "unknown",
+            "confidence": "none",
+            "basis": "no_operands",
+        }
     if len(ops) == 1 and ops[0].type in mem_operand_types:
-        return "read_write"
+        return {
+            "access_hint": "read_write",
+            "confidence": "low",
+            "basis": "single_memory_operand",
+        }
     if ops[0].type in mem_operand_types:
-        return "write"
+        return {
+            "access_hint": "write_like",
+            "confidence": "medium",
+            "basis": "memory_operand_is_destination",
+        }
     if any(op.type in mem_operand_types for op in ops[1:]):
-        return "read"
-    return "unknown"
+        return {
+            "access_hint": "read_like",
+            "confidence": "medium",
+            "basis": "memory_operand_is_source",
+        }
+    return {
+        "access_hint": "unknown",
+        "confidence": "low",
+        "basis": "no_memory_operand_match",
+    }
 
 
 def _find_cfunc_lvar(func_ea: int, name: str):
@@ -2757,14 +2781,7 @@ def field_xrefs_for_struct(arguments: dict[str, Any] | None = None) -> dict[str,
             for xref in xrefs:
                 xea = _parse_ea(xref["address"])
                 line = ida_lines.tag_remove(ida_lines.generate_disasm_line(xea, 0) or "")
-                enriched.append(
-                    {
-                        **xref,
-                        "access": _classify_xref_access(xea),
-                        "text": line,
-                        "segment": _segment_name(xea),
-                    }
-                )
+                enriched.append({**xref, **_classify_xref_access(xea), "text": line, "segment": _segment_name(xea)})
             xrefs = enriched
         rows.append(
             {
