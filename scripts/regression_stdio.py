@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from typing import Any
@@ -76,6 +77,19 @@ def _pick_function(functions: list[dict[str, Any]]) -> dict[str, Any]:
         if item.get("segment", "").lower() != "extern":
             return item
     raise RegressionFailure("No non-extern function available")
+
+
+def _pick_local_name_from_code(code: str) -> str:
+    patterns = [
+        r"\b(v\d+)\b",
+        r"\b(a\d+)\b",
+        r"\b(result)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, code)
+        if match:
+            return match.group(1)
+    raise RegressionFailure("No renameable local variable candidate found in decompiled code")
 
 
 def _pick_string(strings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -207,7 +221,19 @@ async def main(target: str) -> int:
                 string_item = _pick_string(strings.get("items") or [])
                 string_addr = str(string_item.get("address") or "")
                 string_value = str(string_item.get("value") or "")
+                _assert("length" not in string_item and "type" not in string_item, f"list_strings default is not slim: {_json(string_item)}")
+                _assert((strings.get("count") or 0) == len(strings.get("items") or []), f"list_strings count mismatch: {_json(strings)}")
                 print(f"STRING ok {string_addr} value={string_value[:32]!r}")
+
+                strings_full_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {"session_id": session_id, "tool_name": "list_strings", "arguments": {"count": 8, "full": True}},
+                )
+                strings_full = _inner_structured(strings_full_resp) or {}
+                string_full_item = _pick_string(strings_full.get("items") or [])
+                _assert("length" in string_full_item and "type" in string_full_item, f"list_strings full missing metadata: {_json(string_full_item)}")
+                print("LIST_STRINGS full ok")
 
                 read_string_resp = await call_tool(
                     session,
@@ -250,7 +276,46 @@ async def main(target: str) -> int:
                 )
                 search_text = _inner_structured(search_text_resp) or {}
                 _assert((search_text.get("count") or 0) >= 1, f"search(text) returned nothing: {_json(search_text)}")
+                first_search_item = _first(search_text.get("items") or [], "search(text) returned no items")
+                _assert("segment" not in first_search_item and "name" not in first_search_item, f"search(text) default is not slim: {_json(first_search_item)}")
                 print("SEARCH text ok")
+
+                search_text_full_resp = await call_tool(
+                    session,
+                    "search",
+                    {
+                        "session_id": session_id,
+                        "kind": "text",
+                        "query": _slice_query(string_value),
+                        "arguments": {"kinds": ["strings"], "limit": 5, "full": True},
+                    },
+                )
+                search_text_full = _inner_structured(search_text_full_resp) or {}
+                first_search_full_item = _first(search_text_full.get("items") or [], "search(text, full) returned no items")
+                _assert("segment" in first_search_full_item and "name" in first_search_full_item, f"search(text, full) missing metadata: {_json(first_search_full_item)}")
+                print("SEARCH text full ok")
+
+                regex_pattern = re.escape(_slice_query(string_value))
+                search_regex_resp = await call_tool(
+                    session,
+                    "search",
+                    {"session_id": session_id, "kind": "regex", "query": regex_pattern, "arguments": {"limit": 5}},
+                )
+                search_regex = _inner_structured(search_regex_resp) or {}
+                _assert("count" in search_regex and search_regex.get("count", 0) >= 1, f"search(regex) missing count or matches: {_json(search_regex)}")
+                first_regex_item = _first(search_regex.get("matches") or [], "search(regex) returned no items")
+                _assert("segment" not in first_regex_item and "name" not in first_regex_item, f"search(regex) default is not slim: {_json(first_regex_item)}")
+                print("SEARCH regex ok")
+
+                search_regex_full_resp = await call_tool(
+                    session,
+                    "search",
+                    {"session_id": session_id, "kind": "regex", "query": regex_pattern, "arguments": {"limit": 5, "full": True}},
+                )
+                search_regex_full = _inner_structured(search_regex_full_resp) or {}
+                first_regex_full_item = _first(search_regex_full.get("matches") or [], "search(regex, full) returned no items")
+                _assert("segment" in first_regex_full_item and "name" in first_regex_full_item, f"search(regex, full) missing metadata: {_json(first_regex_full_item)}")
+                print("SEARCH regex full ok")
 
                 search_bytes_resp = await call_tool(
                     session,
@@ -261,7 +326,19 @@ async def main(target: str) -> int:
                 first_pattern = _first(search_bytes, "search(bytes) returned no rows")
                 matches = first_pattern.get("matches") or []
                 _assert(matches, f"search(bytes) returned no matches: {_json(search_bytes)}")
+                _assert("segment" not in matches[0] and "name" not in matches[0], f"search(bytes) default is not slim: {_json(matches[0])}")
                 print("SEARCH bytes ok")
+
+                search_bytes_full_resp = await call_tool(
+                    session,
+                    "search",
+                    {"session_id": session_id, "kind": "bytes", "query": "4D 5A", "arguments": {"limit": 1, "full": True}},
+                )
+                search_bytes_full = _inner_structured(search_bytes_full_resp) or []
+                first_pattern_full = _first(search_bytes_full, "search(bytes, full) returned no rows")
+                first_byte_full_match = _first(first_pattern_full.get("matches") or [], "search(bytes, full) returned no matches")
+                _assert("segment" in first_byte_full_match and "name" in first_byte_full_match, f"search(bytes, full) missing metadata: {_json(first_byte_full_match)}")
+                print("SEARCH bytes full ok")
 
                 imports_resp = await call_tool(
                     session,
@@ -342,6 +419,104 @@ async def main(target: str) -> int:
                 inspect_after = _inner_structured(inspect_after_resp) or {}
                 _assert(inspect_after.get("is_code") is True, f"inspect_addr after define(code) failed: {_json(inspect_after)}")
                 print("POST-CODE inspect ok")
+
+                stack_frame_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {"session_id": session_id, "tool_name": "stack_frame", "arguments": {"addr": func_addr}},
+                )
+                stack_frames = _inner_structured(stack_frame_resp) or []
+                first_stack_frame = _first(stack_frames, "stack_frame returned no rows")
+                stack_vars = first_stack_frame.get("vars") or []
+                renamed_stack = False
+                for stack_var in stack_vars:
+                    old_stack_name = str(stack_var.get("name") or "").strip()
+                    if not old_stack_name or old_stack_name.startswith("arg_"):
+                        continue
+                    new_stack_name = f"reg_stack_{int(time.time())}"
+                    rename_stack_resp = await call_tool(
+                        session,
+                        "rename",
+                        {
+                            "session_id": session_id,
+                            "batch": {
+                                "stack": [
+                                    {
+                                        "func_addr": func_addr,
+                                        "old": old_stack_name,
+                                        "new": new_stack_name,
+                                    }
+                                ]
+                            },
+                        },
+                    )
+                    rename_stack = _inner_structured(rename_stack_resp) or {}
+                    stack_results = rename_stack.get("stack") or []
+                    if not stack_results:
+                        continue
+                    first_stack_result = stack_results[0]
+                    if not first_stack_result.get("ok"):
+                        continue
+                    stack_frame_after_resp = await call_tool(
+                        session,
+                        "call_session_tool",
+                        {"session_id": session_id, "tool_name": "stack_frame", "arguments": {"addr": func_addr}},
+                    )
+                    stack_frame_after = _inner_structured(stack_frame_after_resp) or []
+                    first_stack_after = _first(stack_frame_after, "stack_frame after rename returned no rows")
+                    renamed_names = {str(item.get("name") or "") for item in (first_stack_after.get("vars") or [])}
+                    _assert(new_stack_name in renamed_names, f"stack rename not visible in frame: {_json(first_stack_after)}")
+                    print(f"RENAME stack ok {old_stack_name}->{new_stack_name}")
+                    renamed_stack = True
+                    break
+                _assert(renamed_stack, "No stack variable candidate could be renamed end-to-end")
+
+                local_rename_verified = False
+                for candidate in function_items[:24]:
+                    candidate_addr = str(candidate.get("address") or "")
+                    if not candidate_addr:
+                        continue
+                    decompile_resp = await call_tool(session, "decompile", {"session_id": session_id, "addr": candidate_addr})
+                    decompile_data = _inner_structured(decompile_resp) or {}
+                    if decompile_data.get("mode") != "decompile":
+                        continue
+                    code = str(decompile_data.get("code") or "")
+                    try:
+                        old_local_name = _pick_local_name_from_code(code)
+                    except RegressionFailure:
+                        continue
+                    new_local_name = f"reg_local_{int(time.time())}"
+                    rename_local_resp = await call_tool(
+                        session,
+                        "rename",
+                        {
+                            "session_id": session_id,
+                            "batch": {
+                                "local": [
+                                    {
+                                        "func_addr": candidate_addr,
+                                        "old": old_local_name,
+                                        "new": new_local_name,
+                                    }
+                                ]
+                            },
+                        },
+                    )
+                    rename_local = _inner_structured(rename_local_resp) or {}
+                    local_results = rename_local.get("local") or []
+                    if not local_results:
+                        continue
+                    first_local_result = local_results[0]
+                    if not first_local_result.get("ok"):
+                        continue
+                    decompile_after_resp = await call_tool(session, "decompile", {"session_id": session_id, "addr": candidate_addr})
+                    decompile_after = _inner_structured(decompile_after_resp) or {}
+                    code_after = str(decompile_after.get("code") or "")
+                    _assert(new_local_name in code_after, f"local rename not visible in decompile output: {_json(decompile_after)}")
+                    print(f"RENAME local ok {old_local_name}->{new_local_name}")
+                    local_rename_verified = True
+                    break
+                _assert(local_rename_verified, "No local variable candidate could be renamed end-to-end")
 
             finally:
                 if session_id:

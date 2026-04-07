@@ -83,6 +83,23 @@ def _tool_result(payload: Any, *, is_error: bool = False) -> dict[str, Any]:
     }
 
 
+def _bool_argument(arguments: dict[str, Any] | None, key: str, default: bool = False) -> bool:
+    if not isinstance(arguments, dict) or key not in arguments:
+        return default
+    value = arguments.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    if value is None:
+        return False
+    return bool(value)
+
+
+def _pick_fields(entry: dict[str, Any], fields: list[str]) -> dict[str, Any]:
+    return {field: entry[field] for field in fields if field in entry}
+
+
 def _read_bytes_raw(ea: int, size: int) -> bytes:
     if size < 0:
         raise ValueError("size must be >= 0")
@@ -1128,6 +1145,7 @@ def xrefs_to_field(arguments: dict[str, Any] | None = None) -> list[dict[str, An
 @idasync
 def list_strings(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
+    full = _bool_argument(arguments, "full", False)
     offset = max(0, int(arguments.get("offset", 0)))
     count = max(0, int(arguments.get("count", 100)))
     filt = str(arguments.get("filter", "") or "").lower()
@@ -1137,25 +1155,25 @@ def list_strings(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         value = str(string)
         if filt and filt not in value.lower():
             continue
-        items.append(
-            {
-                "address": _hex(string.ea),
-                "length": int(string.length),
-                "type": int(string.strtype),
-                "value": value,
-            }
-        )
+        item = {
+            "address": _hex(string.ea),
+            "length": int(string.length),
+            "type": int(string.strtype),
+            "value": value,
+        }
+        items.append(item if full else _pick_fields(item, ["address", "value"]))
     total = len(items)
     if count == 0:
         sliced = items[offset:]
     else:
         sliced = items[offset : offset + count]
-    return {"items": sliced, "offset": offset, "count": count, "total": total}
+    return {"items": sliced, "offset": offset, "count": len(sliced), "total": total}
 
 
 @idasync
 def find_bytes(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     arguments = arguments or {}
+    full = _bool_argument(arguments, "full", False)
     patterns = arguments.get("patterns", arguments.get("pattern", []))
     if isinstance(patterns, str):
         patterns = [patterns]
@@ -1185,7 +1203,8 @@ def find_bytes(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
                 if skipped < offset:
                     skipped += 1
                 else:
-                    matches.append({"address": _hex(ea), "segment": _segment_name(ea), "name": _name_at(ea)})
+                    item = {"address": _hex(ea), "segment": _segment_name(ea), "name": _name_at(ea)}
+                    matches.append(item if full else _pick_fields(item, ["address"]))
                     if len(matches) >= limit:
                         next_ea = searcher(ea + 1, max_ea)
                         more = next_ea != ida_idaapi.BADADDR
@@ -1200,6 +1219,7 @@ def find_bytes(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
 @idasync
 def find_text(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
+    full = _bool_argument(arguments, "full", False)
     query = str(arguments.get("query") or arguments.get("text") or arguments.get("needle") or "").strip()
     if not query:
         raise ValueError("query is required")
@@ -1213,6 +1233,7 @@ def find_text(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     query_lower = query.lower()
     normalized_kinds = {str(kind).strip().lower() for kind in kinds}
     matches: list[dict[str, Any]] = []
+    summary: dict[str, int] = {}
 
     def append_match(kind: str, ea: int, text: str, *, extra: dict[str, Any] | None = None) -> None:
         entry = {
@@ -1224,7 +1245,8 @@ def find_text(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         }
         if extra:
             entry.update(extra)
-        matches.append(entry)
+        summary[kind] = summary.get(kind, 0) + 1
+        matches.append(entry if full else _pick_fields(entry, ["kind", "address", "text"]))
 
     if "strings" in normalized_kinds:
         for string in idautils.Strings():
@@ -1266,12 +1288,22 @@ def find_text(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 
     total = len(matches)
     sliced = matches[offset : offset + limit]
-    return {"query": query, "kinds": sorted(normalized_kinds), "items": sliced, "offset": offset, "count": len(sliced), "total": total, "truncated": offset + len(sliced) < total}
+    return {
+        "query": query,
+        "kinds": sorted(normalized_kinds),
+        "summary": summary,
+        "items": sliced,
+        "offset": offset,
+        "count": len(sliced),
+        "total": total,
+        "truncated": offset + len(sliced) < total,
+    }
 
 
 @idasync
 def find_regex(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
+    full = _bool_argument(arguments, "full", False)
     pattern = str(arguments.get("pattern") or "").strip()
     if not pattern:
         raise ValueError("pattern is required")
@@ -1292,9 +1324,18 @@ def find_regex(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         if len(matches) >= limit:
             more = True
             break
-        matches.append({"address": _hex(string.ea), "string": value})
+        item = {
+            "address": _hex(string.ea),
+            "string": value,
+            "segment": _segment_name(string.ea),
+            "name": _name_at(string.ea),
+            "length": int(string.length),
+            "strtype": int(string.strtype),
+        }
+        matches.append(item if full else _pick_fields(item, ["address", "string"]))
     return {
         "pattern": pattern,
+        "count": len(matches),
         "n": len(matches),
         "matches": matches,
         "cursor": {"next": offset + limit} if more else {"done": True},
@@ -1304,6 +1345,7 @@ def find_regex(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 @idasync
 def find_immediates(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     arguments = arguments or {}
+    full = _bool_argument(arguments, "full", False)
     values = arguments.get("values", arguments.get("value", []))
     if isinstance(values, (str, int)):
         values = [values]
@@ -1349,7 +1391,13 @@ def find_immediates(arguments: dict[str, Any] | None = None) -> list[dict[str, A
                         if skipped < offset:
                             skipped += 1
                         else:
-                            matches.append({"address": _hex(current), "segment": _segment_name(current), "text": line, "function": ida_funcs.get_func_name(current) or ""})
+                            item = {
+                                "address": _hex(current),
+                                "segment": _segment_name(current),
+                                "text": line,
+                                "function": ida_funcs.get_func_name(current) or "",
+                            }
+                            matches.append(item if full else _pick_fields(item, ["address", "text"]))
                             if len(matches) >= limit:
                                 more = True
                                 matched = True
@@ -1371,6 +1419,7 @@ def find_immediates(arguments: dict[str, Any] | None = None) -> list[dict[str, A
 @idasync
 def find_insns(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     arguments = arguments or {}
+    full = _bool_argument(arguments, "full", False)
     sequences = arguments.get("sequences", arguments.get("sequence", []))
     if isinstance(sequences, str):
         sequences = [sequences]
@@ -1422,7 +1471,13 @@ def find_insns(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
             if skipped < offset:
                 skipped += 1
                 continue
-            matches.append({"address": _hex(head), "segment": _segment_name(head), "function": ida_funcs.get_func_name(head) or "", "lines": matched_lines})
+            item = {
+                "address": _hex(head),
+                "segment": _segment_name(head),
+                "function": ida_funcs.get_func_name(head) or "",
+                "lines": matched_lines,
+            }
+            matches.append(item if full else _pick_fields(item, ["address", "lines"]))
             if len(matches) >= limit:
                 more = True
                 break
@@ -2002,6 +2057,8 @@ def rename(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     batch = arguments.get("batch", arguments)
     if isinstance(batch, dict) and "addr" in batch and "name" in batch:
         batch = {"func": [batch]}
+    if not isinstance(batch, dict):
+        raise ValueError("batch must be an object")
     results = {"func": [], "data": [], "local": [], "stack": []}
     for item in batch.get("func", []) or []:
         ea = _parse_ea(item.get("addr"))
@@ -2016,9 +2073,53 @@ def rename(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         ok = idaapi.set_name(ea, new_name, ida_name.SN_CHECK)
         results["data"].append({"addr": _hex(ea), "name": new_name, "ok": bool(ok)})
     for item in batch.get("local", []) or []:
-        results["local"].append({"item": item, "ok": False, "error": "local rename not implemented yet"})
+        try:
+            fn_ea = _parse_ea(item.get("func_addr") or item.get("addr"))
+            old_name = str(item.get("old") or item.get("name") or "").strip()
+            new_name = str(item.get("new") or "").strip()
+            if not old_name or not new_name:
+                raise ValueError("local rename requires func_addr/addr, old/name, and new")
+            func = idaapi.get_func(fn_ea)
+            if func is None:
+                raise ValueError(f"No function found at {_hex(fn_ea)}")
+            ok = bool(ida_hexrays.rename_lvar(func.start_ea, old_name, new_name))
+            if ok:
+                _refresh_decompiler(func.start_ea)
+            results["local"].append({"addr": _hex(func.start_ea), "old": old_name, "new": new_name, "ok": ok, "error": None if ok else "Rename failed"})
+        except Exception as exc:
+            results["local"].append({"item": item, "ok": False, "error": str(exc)})
     for item in batch.get("stack", []) or []:
-        results["stack"].append({"item": item, "ok": False, "error": "stack rename not implemented yet"})
+        try:
+            fn_ea = _parse_ea(item.get("func_addr") or item.get("addr"))
+            old_name = str(item.get("old") or item.get("name") or "").strip()
+            new_name = str(item.get("new") or "").strip()
+            if not old_name or not new_name:
+                raise ValueError("stack rename requires func_addr/addr, old/name, and new")
+            func = idaapi.get_func(fn_ea)
+            if func is None:
+                raise ValueError(f"No function found at {_hex(fn_ea)}")
+            frame_tif = ida_typeinf.tinfo_t()
+            if not ida_frame.get_func_frame(frame_tif, func):
+                raise ValueError("No frame")
+            idx, udm = frame_tif.get_udm(old_name)
+            if not udm:
+                raise ValueError(f"{old_name} not found")
+            tid = frame_tif.get_udm_tid(idx)
+            if ida_frame.is_special_frame_member(tid):
+                raise ValueError("Special frame member")
+            udm_current = ida_typeinf.udm_t()
+            if not frame_tif.get_udm_by_tid(udm_current, tid):
+                raise ValueError("Unable to resolve stack member")
+            offset = udm_current.offset // 8
+            if ida_frame.is_funcarg_off(func, offset):
+                raise ValueError("Argument member")
+            fp_offset = ida_frame.soff_to_fpoff(func, offset)
+            ok = bool(ida_frame.define_stkvar(func, new_name, fp_offset, udm_current.type))
+            if ok:
+                _refresh_decompiler(func.start_ea)
+            results["stack"].append({"addr": _hex(func.start_ea), "old": old_name, "new": new_name, "ok": ok, "error": None if ok else "Rename failed"})
+        except Exception as exc:
+            results["stack"].append({"item": item, "ok": False, "error": str(exc)})
     return results
 
 
@@ -2143,14 +2244,11 @@ def create_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
             raise ValueError(f"Invalid struct field: {field}")
         field_lines.append(f"    {field_type} {field_name};")
     decl = "typedef struct {name} {{\n{fields}\n}} {name};".format(name=name, fields="\n".join(field_lines))
-    if hasattr(ida_typeinf, "del_named_type"):
-        try:
-            ida_typeinf.del_named_type(None, name, 0)
-        except Exception:
-            pass
+    if _type_exists(name):
+        return {"name": name, "ok": False, "errors": None, "decl": decl, "error": f"Type already exists: {name}"}
     errors = ida_typeinf.parse_decls(None, decl, False, ida_typeinf.HTI_PAKDEF)
     ok = errors == 0 and _type_exists(name)
-    return {"name": name, "ok": ok, "errors": int(errors), "decl": decl}
+    return {"name": name, "ok": ok, "errors": int(errors), "decl": decl, "error": None if ok else "Failed to parse declaration"}
 
 
 @idasync
@@ -2257,7 +2355,7 @@ TOOL_DEFINITIONS = [
     {"name": "undefine", "description": "Undefine items back to raw bytes."},
     {"name": "declare_stack", "description": "Create stack variables in a function frame."},
     {"name": "delete_stack", "description": "Delete stack variables from a function frame."},
-    {"name": "rename", "description": "Rename functions or data symbols."},
+    {"name": "rename", "description": "Rename functions, globals, local variables, or stack variables."},
     {"name": "set_comments", "description": "Set comments at addresses."},
     {"name": "set_type", "description": "Apply C declarations or types to addresses."},
     {"name": "apply_decl", "description": "Apply a C declaration to a symbol/address like the GUI Y command."},
