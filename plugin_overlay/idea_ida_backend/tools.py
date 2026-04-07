@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+from pathlib import Path
 import re
 import struct
 import time
@@ -98,6 +99,9 @@ def _bool_argument(arguments: dict[str, Any] | None, key: str, default: bool = F
 
 def _pick_fields(entry: dict[str, Any], fields: list[str]) -> dict[str, Any]:
     return {field: entry[field] for field in fields if field in entry}
+
+
+_AUTO_PAD_RE = re.compile(r"^__pad_[0-9A-Fa-f]+(?:_[0-9A-Fa-f]+)?$")
 
 
 def _read_bytes_raw(ea: int, size: int) -> bytes:
@@ -542,6 +546,269 @@ def _resolve_type_info(type_name: str) -> ida_typeinf.tinfo_t:
     tif = ida_typeinf.tinfo_t()
     if tif.get_named_type(None, normalized):
         return tif
+
+
+def _member_declaration(field_type: str, field_name: str) -> str:
+    normalized = str(field_type or "").strip().rstrip(";")
+    if not normalized:
+        raise ValueError("Missing field type")
+    if "{name}" in normalized:
+        return normalized.format(name=field_name)
+    bracket_index = normalized.find("[")
+    if bracket_index > 0:
+        return f"{normalized[:bracket_index].rstrip()} {field_name}{normalized[bracket_index:]}"
+    return f"{normalized} {field_name}"
+
+
+def _parse_member_tinfo(field_type: str, field_name: str) -> ida_typeinf.tinfo_t:
+    tif = ida_typeinf.tinfo_t()
+    declaration = _member_declaration(field_type, field_name)
+    if tif.parse(f"{declaration};"):
+        return tif
+    return _resolve_type_info(field_type)
+
+
+def _type_size_bytes(field_type: str, field_name: str = "__field") -> int:
+    tif = _parse_member_tinfo(field_type, field_name)
+    size = int(tif.get_size())
+    if size <= 0:
+        raise ValueError(f"Unable to determine size for type: {field_type}")
+    return size
+
+
+def _parse_offset_bytes(item: dict[str, Any]) -> int:
+    if "bit_offset" in item:
+        bit_offset = _parse_int_like(item.get("bit_offset"), "bit_offset")
+        if bit_offset % 8 != 0:
+            raise ValueError(f"bit_offset must be byte-aligned: {bit_offset}")
+        return bit_offset // 8
+    for key in ("offset", "byte_offset"):
+        if key in item:
+            return _parse_int_like(item.get(key), key)
+    raise ValueError(f"Missing offset/byte_offset in field: {item}")
+
+
+def _normalize_struct_field(item: dict[str, Any], index: int = 0) -> dict[str, Any]:
+    name = str(item.get("name") or "").strip()
+    field_type = str(item.get("type") or item.get("ty") or "").strip()
+    if not name or not field_type:
+        raise ValueError(f"Invalid struct field: {item}")
+    offset = _parse_offset_bytes(item)
+    size = int(item.get("size") or item.get("byte_size") or 0)
+    if size <= 0:
+        size = _type_size_bytes(field_type, name)
+    return {
+        "name": name,
+        "type": field_type,
+        "offset": offset,
+        "size": size,
+        "comment": str(item.get("comment") or item.get("cmt") or "").strip(),
+        "index": index,
+    }
+
+
+def _build_padded_layout(fields: list[dict[str, Any]], total_size: int | None = None) -> list[dict[str, Any]]:
+    logical_fields = sorted((_normalize_struct_field(item, idx) for idx, item in enumerate(fields)), key=lambda x: (x["offset"], x["index"]))
+    layout: list[dict[str, Any]] = []
+    cursor = 0
+    for field in logical_fields:
+        offset = field["offset"]
+        size = field["size"]
+        if offset < cursor:
+            raise ValueError(f"Overlapping field at 0x{offset:X}: {field['name']}")
+        if offset > cursor:
+            gap = offset - cursor
+            layout.append(
+                {
+                    "name": f"__pad_{cursor:04X}",
+                    "type": "unsigned char" if gap == 1 else f"unsigned char[{gap}]",
+                    "offset": cursor,
+                    "size": gap,
+                    "auto_pad": True,
+                    "comment": "",
+                }
+            )
+            cursor = offset
+        layout.append({**field, "auto_pad": False})
+        cursor = offset + size
+    if total_size is not None and total_size > cursor:
+        gap = total_size - cursor
+        layout.append(
+            {
+                "name": f"__pad_{cursor:04X}",
+                "type": "unsigned char" if gap == 1 else f"unsigned char[{gap}]",
+                "offset": cursor,
+                "size": gap,
+                "auto_pad": True,
+                "comment": "",
+            }
+        )
+    return layout
+
+
+def _struct_fields_from_tif(tif: ida_typeinf.tinfo_t, *, include_auto_pad: bool = True) -> list[dict[str, Any]]:
+    udt = ida_typeinf.udt_type_data_t()
+    if not tif.get_udt_details(udt):
+        raise ValueError("Unable to enumerate structure members")
+    fields: list[dict[str, Any]] = []
+    for idx, udm in enumerate(udt):
+        if udm.is_gap():
+            continue
+        name = str(udm.name or "")
+        field = {
+            "name": name,
+            "type": str(udm.type),
+            "offset": udm.offset // 8,
+            "size": max(0, udm.size // 8),
+            "comment": "",
+            "auto_pad": bool(_AUTO_PAD_RE.match(name)),
+            "index": idx,
+        }
+        if include_auto_pad or not field["auto_pad"]:
+            fields.append(field)
+    return fields
+
+
+def _get_named_struct_tinfo(struct_name: str) -> ida_typeinf.tinfo_t:
+    tif = _resolve_type_info(struct_name)
+    if not tif.is_udt():
+        raise ValueError(f"{struct_name} is not a struct/union type")
+    return tif
+
+
+def _save_named_struct(struct_name: str, layout: list[dict[str, Any]]) -> dict[str, Any]:
+    tif = ida_typeinf.tinfo_t()
+    tif.create_udt()
+    for field in layout:
+        tif.add_udm(field["name"], _parse_member_tinfo(field["type"], field["name"]), field["offset"] * 8)
+    flags = ida_typeinf.NTF_TYPE | ida_typeinf.NTF_COPY
+    if _type_exists(struct_name):
+        flags |= ida_typeinf.NTF_REPLACE
+    code = tif.set_named_type(None, struct_name, flags)
+    ok = int(code) == int(ida_typeinf.TERR_OK) and _type_exists(struct_name)
+    return {"ok": ok, "code": int(code)}
+
+
+def _header_decl_from_layout(struct_name: str, layout: list[dict[str, Any]], total_size: int) -> str:
+    lines = [f"typedef struct {struct_name} {{"]
+    for field in layout:
+        decl = _member_declaration(field["type"], field["name"])
+        lines.append(f"    /* 0x{field['offset']:X} */ {decl};")
+    lines.append(f"}} {struct_name}; /* size: 0x{total_size:X} */")
+    return "\n".join(lines)
+
+
+def _parse_exported_struct_text(text: str) -> dict[str, Any]:
+    struct_match = re.search(r"typedef\s+struct\s+(\w+)\s*\{(?P<body>.*?)\}\s*(\w+)\s*;\s*/\*\s*size:\s*0x([0-9A-Fa-f]+)\s*\*/", text, re.S)
+    if not struct_match:
+        raise ValueError("Unsupported struct header format")
+    name = struct_match.group(1)
+    body = struct_match.group("body")
+    size = int(struct_match.group(4), 16)
+    fields: list[dict[str, Any]] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r"/\*\s*0x([0-9A-Fa-f]+)\s*\*/\s*(.+?)\s*;", line)
+        if not match:
+            continue
+        offset = int(match.group(1), 16)
+        decl = match.group(2).strip()
+        name_match = re.search(r"([A-Za-z_]\w*)(\s*(\[[^\]]+\])*)$", decl)
+        if not name_match:
+            raise ValueError(f"Unable to parse field declaration: {decl}")
+        field_name = name_match.group(1)
+        field_type = decl[: name_match.start(1)].rstrip() + (name_match.group(2) or "")
+        fields.append({"name": field_name, "type": field_type.strip(), "offset": offset})
+    return {"name": name, "size": size, "fields": fields}
+
+
+def _load_struct_reference(arguments: dict[str, Any]) -> dict[str, Any]:
+    if arguments.get("decl"):
+        return _parse_exported_struct_text(str(arguments.get("decl") or ""))
+    path = str(arguments.get("path") or "").strip()
+    if not path:
+        raise ValueError("path or decl is required")
+    target = Path(path).expanduser()
+    text = target.read_text(encoding="utf-8", errors="ignore")
+    if target.suffix.lower() == ".json":
+        payload = json.loads(text)
+        if "fields" not in payload:
+            raise ValueError("Invalid struct json payload")
+        return payload
+    return _parse_exported_struct_text(text)
+
+
+def _classify_xref_access(ea: int) -> str:
+    insn = _decode_insn_at(ea)
+    if insn is None:
+        return "unknown"
+    mem_operand_types = {ida_ua.o_mem, ida_ua.o_phrase, ida_ua.o_displ}
+    ops = [insn.ops[idx] for idx in range(ida_ua.UA_MAXOP) if insn.ops[idx].type != ida_ua.o_void]
+    if not ops:
+        return "unknown"
+    if len(ops) == 1 and ops[0].type in mem_operand_types:
+        return "read_write"
+    if ops[0].type in mem_operand_types:
+        return "write"
+    if any(op.type in mem_operand_types for op in ops[1:]):
+        return "read"
+    return "unknown"
+
+
+def _find_cfunc_lvar(func_ea: int, name: str):
+    _func, cfunc = _decompile_cfunc(func_ea)
+    for lvar in cfunc.lvars:
+        if str(getattr(lvar, "name", "") or "") == name:
+            return cfunc, lvar
+    raise ValueError(f"Local variable not found: {name}")
+
+
+def _apply_struct_to_local(func_ea: int, local_name: str, struct_name: str) -> dict[str, Any]:
+    tif = _get_named_struct_tinfo(struct_name)
+    cfunc, lvar = _find_cfunc_lvar(func_ea, local_name)
+    info = ida_hexrays.lvar_saved_info_t()
+    info.ll = lvar
+    info.type = tif
+    info.size = int(tif.get_size())
+    ok = bool(ida_hexrays.modify_user_lvar_info(cfunc.entry_ea, ida_hexrays.MLI_TYPE, info))
+    if ok:
+        _refresh_decompiler(cfunc.entry_ea)
+    return {"addr": _hex(cfunc.entry_ea), "name": local_name, "struct_name": struct_name, "ok": ok, "kind": "local"}
+
+
+def _apply_struct_to_stack(func_ea: int, item: dict[str, Any], struct_name: str) -> dict[str, Any]:
+    tif = _get_named_struct_tinfo(struct_name)
+    func = idaapi.get_func(func_ea)
+    if func is None:
+        raise ValueError(f"No function found at {_hex(func_ea)}")
+    frame_tif = ida_typeinf.tinfo_t()
+    if not ida_frame.get_func_frame(frame_tif, func):
+        raise ValueError("No frame")
+    udt = ida_typeinf.udt_type_data_t()
+    frame_tif.get_udt_details(udt)
+    target_name = str(item.get("name") or "").strip()
+    target_offset = item.get("offset")
+    selected = None
+    for udm in udt:
+        if udm.is_gap():
+            continue
+        off = udm.offset // 8
+        if target_name and str(udm.name or "") == target_name:
+            selected = (str(udm.name or ""), off)
+            break
+        if target_offset is not None and off == _parse_int_like(target_offset, "offset"):
+            selected = (str(udm.name or ""), off)
+            break
+    if selected is None:
+        raise ValueError("Stack variable not found")
+    var_name, soff = selected
+    fp_offset = ida_frame.soff_to_fpoff(func, soff)
+    ok = bool(ida_frame.define_stkvar(func, var_name, fp_offset, tif))
+    if ok:
+        _refresh_decompiler(func.start_ea)
+    return {"addr": _hex(func.start_ea), "name": var_name, "offset": _hex(soff), "struct_name": struct_name, "ok": ok, "kind": "stack"}
 
     try:
         parsed = ida_typeinf.tinfo_t(normalized)
@@ -2252,6 +2519,86 @@ def create_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 @idasync
+def create_padded_struct_from_map(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    name = str(arguments.get("name") or "").strip()
+    fields = arguments.get("fields", [])
+    total_size_arg = arguments.get("size")
+    if not name:
+        raise ValueError("name is required")
+    if not isinstance(fields, list) or not fields:
+        raise ValueError("fields must be a non-empty list")
+    total_size = _parse_int_like(total_size_arg, "size") if total_size_arg not in (None, "") else None
+    layout = _build_padded_layout(fields, total_size=total_size)
+    materialized = _save_named_struct(name, layout)
+    logical_count = len([field for field in layout if not field.get("auto_pad")])
+    total_size_value = max((field["offset"] + field["size"] for field in layout), default=0)
+    return {
+        "name": name,
+        "ok": materialized["ok"],
+        "code": materialized["code"],
+        "field_count": logical_count,
+        "layout_count": len(layout),
+        "size": total_size_value,
+        "decl": _header_decl_from_layout(name, layout, total_size_value),
+    }
+
+
+@idasync
+def upsert_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    name = str(arguments.get("name") or "").strip()
+    incoming = arguments.get("fields", [])
+    total_size_arg = arguments.get("size")
+    if not name:
+        raise ValueError("name is required")
+    if not isinstance(incoming, list) or not incoming:
+        raise ValueError("fields must be a non-empty list")
+
+    existing_fields: list[dict[str, Any]] = []
+    existed = _type_exists(name)
+    if existed:
+        tif = _get_named_struct_tinfo(name)
+        existing_fields = _struct_fields_from_tif(tif, include_auto_pad=False)
+
+    merged_by_key: dict[tuple[int, str], dict[str, Any]] = {}
+    for field in existing_fields:
+        merged_by_key[(field["offset"], field["name"])] = {
+            "name": field["name"],
+            "type": field["type"],
+            "offset": field["offset"],
+            "size": field["size"],
+            "comment": field.get("comment", ""),
+        }
+    for idx, raw in enumerate(incoming):
+        field = _normalize_struct_field(raw, idx)
+        replaced = False
+        for key in list(merged_by_key.keys()):
+            current = merged_by_key[key]
+            if current["offset"] == field["offset"] or current["name"] == field["name"]:
+                merged_by_key.pop(key, None)
+                replaced = True
+        merged_by_key[(field["offset"], field["name"])] = field
+
+    merged_fields = sorted(merged_by_key.values(), key=lambda x: (x["offset"], x["name"]))
+    inferred_size = max((field["offset"] + field["size"] for field in merged_fields), default=0)
+    total_size = _parse_int_like(total_size_arg, "size") if total_size_arg not in (None, "") else inferred_size
+    layout = _build_padded_layout(merged_fields, total_size=total_size)
+    materialized = _save_named_struct(name, layout)
+    return {
+        "name": name,
+        "ok": materialized["ok"],
+        "code": materialized["code"],
+        "created": not existed,
+        "updated": existed,
+        "field_count": len(merged_fields),
+        "layout_count": len(layout),
+        "size": max((field["offset"] + field["size"] for field in layout), default=0),
+        "decl": _header_decl_from_layout(name, layout, max((field["offset"] + field["size"] for field in layout), default=0)),
+    }
+
+
+@idasync
 def apply_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
     ea = _parse_ea(arguments.get("addr"))
@@ -2266,6 +2613,200 @@ def apply_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     if applied or created:
         _refresh_decompiler(ea)
     return {"addr": _hex(ea), "struct_name": struct_name, "ok": bool(applied or created), "apply_named_type": applied, "create_struct": created}
+
+
+@idasync
+def apply_struct_to_many(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    struct_name = str(arguments.get("struct_name") or arguments.get("name") or "").strip()
+    items = arguments.get("items", [])
+    if not struct_name:
+        raise ValueError("struct_name is required")
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list")
+
+    results = []
+    for item in items:
+        kind = str(item.get("kind") or "address").strip().lower()
+        try:
+            if kind in {"address", "global"}:
+                payload = apply_struct({"addr": item.get("addr"), "struct_name": struct_name})
+                payload["kind"] = kind
+                results.append(payload)
+                continue
+            if kind == "stack":
+                func_ea = _parse_ea(item.get("func_addr") or item.get("addr"))
+                results.append(_apply_struct_to_stack(func_ea, item, struct_name))
+                continue
+            if kind == "local":
+                func_ea = _parse_ea(item.get("func_addr") or item.get("addr"))
+                local_name = str(item.get("name") or "").strip()
+                if not local_name:
+                    raise ValueError("local application requires name")
+                results.append(_apply_struct_to_local(func_ea, local_name, struct_name))
+                continue
+            raise ValueError(f"Unsupported kind: {kind}")
+        except Exception as exc:
+            results.append({"item": item, "struct_name": struct_name, "ok": False, "error": str(exc), "kind": kind})
+
+    ok_count = sum(1 for item in results if item.get("ok"))
+    return {"struct_name": struct_name, "count": len(results), "ok_count": ok_count, "items": results}
+
+
+@idasync
+def struct_diff(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    struct_name = str(arguments.get("struct_name") or arguments.get("name") or "").strip()
+    if not struct_name:
+        raise ValueError("struct_name is required")
+    current_tif = _get_named_struct_tinfo(struct_name)
+    current_fields = _struct_fields_from_tif(current_tif, include_auto_pad=False)
+    reference = _load_struct_reference(arguments)
+    reference_fields = [
+        field
+        for idx, raw in enumerate(reference.get("fields", []))
+        for field in [_normalize_struct_field(raw, idx)]
+        if not _AUTO_PAD_RE.match(field["name"])
+    ]
+
+    current_by_offset = {field["offset"]: field for field in current_fields}
+    reference_by_offset = {field["offset"]: field for field in reference_fields}
+    offsets = sorted(set(current_by_offset) | set(reference_by_offset))
+    added = []
+    removed = []
+    changed = []
+    for offset in offsets:
+        current = current_by_offset.get(offset)
+        reference_field = reference_by_offset.get(offset)
+        if current is None and reference_field is not None:
+            added.append(reference_field)
+            continue
+        if current is not None and reference_field is None:
+            removed.append(current)
+            continue
+        assert current is not None and reference_field is not None
+        if current["name"] != reference_field["name"] or current["type"] != reference_field["type"] or current["size"] != reference_field["size"]:
+            changed.append({"offset": offset, "current": current, "reference": reference_field})
+
+    current_size = int(current_tif.get_size())
+    reference_size = int(reference.get("size") or max((field["offset"] + field["size"] for field in reference_fields), default=0))
+    return {
+        "struct_name": struct_name,
+        "identical": not added and not removed and not changed and current_size == reference_size,
+        "current_size": current_size,
+        "reference_size": reference_size,
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "count": len(added) + len(removed) + len(changed) + (0 if current_size == reference_size else 1),
+    }
+
+
+@idasync
+def export_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    struct_name = str(arguments.get("struct_name") or arguments.get("name") or "").strip()
+    output_format = str(arguments.get("format") or "json").strip().lower()
+    path = str(arguments.get("path") or "").strip()
+    if not struct_name:
+        raise ValueError("struct_name is required")
+    tif = _get_named_struct_tinfo(struct_name)
+    logical_fields = _struct_fields_from_tif(tif, include_auto_pad=False)
+    total_size = int(tif.get_size())
+    layout = _build_padded_layout(logical_fields, total_size=total_size)
+    payload = {
+        "name": struct_name,
+        "size": total_size,
+        "field_count": len(logical_fields),
+        "fields": logical_fields,
+        "layout": layout,
+        "header": _header_decl_from_layout(struct_name, layout, total_size),
+    }
+    if path:
+        target = Path(path).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if output_format in {"h", "header", "c"}:
+            target.write_text(payload["header"] + "\n", encoding="utf-8")
+        else:
+            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        payload["path"] = str(target)
+    return payload
+
+
+@idasync
+def field_xrefs_for_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    struct_name = str(arguments.get("struct_name") or arguments.get("name") or "").strip()
+    field_name = str(arguments.get("field") or arguments.get("field_name") or "").strip()
+    include_context = _bool_argument(arguments, "include_context", True)
+    if not struct_name:
+        raise ValueError("struct_name is required")
+    tif = _get_named_struct_tinfo(struct_name)
+    all_fields = _struct_fields_from_tif(tif, include_auto_pad=False)
+    selected_fields = [field for field in all_fields if not field_name or field["name"] == field_name]
+    if field_name and not selected_fields:
+        raise ValueError(f"Field not found: {struct_name}.{field_name}")
+    rows = []
+    for field in selected_fields:
+        refs_payload = xrefs_to_field({"queries": [{"struct": struct_name, "field": field["name"]}]})[0]
+        xrefs = refs_payload.get("xrefs") or []
+        if include_context:
+            enriched = []
+            for xref in xrefs:
+                xea = _parse_ea(xref["address"])
+                line = ida_lines.tag_remove(ida_lines.generate_disasm_line(xea, 0) or "")
+                enriched.append(
+                    {
+                        **xref,
+                        "access": _classify_xref_access(xea),
+                        "text": line,
+                        "segment": _segment_name(xea),
+                    }
+                )
+            xrefs = enriched
+        rows.append(
+            {
+                "struct": struct_name,
+                "field": field["name"],
+                "offset": _hex(field["offset"]),
+                "type": field["type"],
+                "count": len(xrefs),
+                "xrefs": xrefs,
+            }
+        )
+    return {"struct_name": struct_name, "field_count": len(rows), "fields": rows}
+
+
+@idasync
+def typed_decompile_export(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    ea = _parse_ea(arguments.get("addr"))
+    include_line_map = _bool_argument(arguments, "include_line_map", False)
+    output_format = str(arguments.get("format") or "json").strip().lower()
+    path = str(arguments.get("path") or "").strip()
+    decomp = decompile({"addr": ea, "fallback": arguments.get("fallback", "disasm"), "max_instructions": arguments.get("max_instructions", 400)})
+    payload = {
+        "addr": decomp.get("addr"),
+        "name": decomp.get("name"),
+        "mode": decomp.get("mode"),
+        "code": decomp.get("code") or "",
+    }
+    if include_line_map:
+        payload["line_map"] = _decompile_line_map_payload(ea)
+    if path:
+        target = Path(path).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if output_format in {"txt", "text", "c"}:
+            text = str(payload.get("code") or "")
+            if include_line_map:
+                text += "\n\n/* line_map */\n" + json.dumps(payload["line_map"], ensure_ascii=False, indent=2)
+            target.write_text(text + "\n", encoding="utf-8")
+        else:
+            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        payload["path"] = str(target)
+    return payload
 
 
 @idasync
@@ -2361,7 +2902,14 @@ TOOL_DEFINITIONS = [
     {"name": "apply_decl", "description": "Apply a C declaration to a symbol/address like the GUI Y command."},
     {"name": "reanalyze_function", "description": "Create/reanalyze the function containing an address."},
     {"name": "create_struct", "description": "Create a named struct type from field definitions."},
+    {"name": "upsert_struct", "description": "Create or update a named struct type from offset-preserving field definitions."},
+    {"name": "create_padded_struct_from_map", "description": "Create a struct from {offset,name,type} field maps with automatic padding members."},
     {"name": "apply_struct", "description": "Apply a named struct type at an address."},
+    {"name": "apply_struct_to_many", "description": "Apply a named struct type to many addresses, stack variables, or local variables."},
+    {"name": "struct_diff", "description": "Compare the current IDA struct definition against an exported header/json reference."},
+    {"name": "export_struct", "description": "Export a named struct as canonical header text or json."},
+    {"name": "field_xrefs_for_struct", "description": "Return per-field xrefs for a struct with contextual disassembly."},
+    {"name": "typed_decompile_export", "description": "Export decompiled code for a function under the current typed DB state."},
     {"name": "make_array", "description": "Convert the current item into an array."},
     {"name": "save_database", "description": "Save the current database."},
 ]
@@ -2426,7 +2974,14 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any] | None], Any]] = {
     "apply_decl": apply_decl,
     "reanalyze_function": reanalyze_function,
     "create_struct": create_struct,
+    "upsert_struct": upsert_struct,
+    "create_padded_struct_from_map": create_padded_struct_from_map,
     "apply_struct": apply_struct,
+    "apply_struct_to_many": apply_struct_to_many,
+    "struct_diff": struct_diff,
+    "export_struct": export_struct,
+    "field_xrefs_for_struct": field_xrefs_for_struct,
+    "typed_decompile_export": typed_decompile_export,
     "make_array": make_array,
     "save_database": save_database,
 }

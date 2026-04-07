@@ -391,6 +391,117 @@ async def main(target: str) -> int:
                 _assert(define_struct.get("ok") is True, f"define(struct) failed: {_json(define_struct)}")
                 print(f"DEFINE struct ok {struct_name}")
 
+                padded_struct_name = f"regression_padded_{int(time.time())}"
+                padded_struct_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {
+                        "session_id": session_id,
+                        "tool_name": "create_padded_struct_from_map",
+                        "arguments": {
+                            "name": padded_struct_name,
+                            "fields": [
+                                {"offset": 0, "name": "magic", "type": "unsigned int"},
+                                {"offset": 8, "name": "tag", "type": "unsigned short"},
+                            ],
+                            "size": 12,
+                        },
+                    },
+                )
+                padded_struct = _inner_structured(padded_struct_resp) or {}
+                _assert(padded_struct.get("ok") is True, f"create_padded_struct_from_map failed: {_json(padded_struct)}")
+                _assert("__pad_" in str(padded_struct.get("decl") or ""), f"create_padded_struct_from_map did not add padding: {_json(padded_struct)}")
+                print(f"CREATE_PADDED_STRUCT ok {padded_struct_name}")
+
+                upsert_struct_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {
+                        "session_id": session_id,
+                        "tool_name": "upsert_struct",
+                        "arguments": {
+                            "name": padded_struct_name,
+                            "fields": [
+                                {"offset": 10, "name": "flags", "type": "unsigned short"},
+                            ],
+                            "size": 12,
+                        },
+                    },
+                )
+                upsert_struct = _inner_structured(upsert_struct_resp) or {}
+                _assert(upsert_struct.get("ok") is True, f"upsert_struct failed: {_json(upsert_struct)}")
+                print("UPSERT_STRUCT ok")
+
+                apply_many_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {
+                        "session_id": session_id,
+                        "tool_name": "apply_struct_to_many",
+                        "arguments": {
+                            "struct_name": padded_struct_name,
+                            "items": [{"kind": "address", "addr": string_addr}],
+                        },
+                    },
+                )
+                apply_many = _inner_structured(apply_many_resp) or {}
+                _assert((apply_many.get("ok_count") or 0) >= 1, f"apply_struct_to_many failed: {_json(apply_many)}")
+                print("APPLY_STRUCT_TO_MANY ok")
+
+                export_struct_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {
+                        "session_id": session_id,
+                        "tool_name": "export_struct",
+                        "arguments": {"struct_name": padded_struct_name, "format": "json"},
+                    },
+                )
+                export_struct = _inner_structured(export_struct_resp) or {}
+                exported_header = str(export_struct.get("header") or "")
+                _assert(export_struct.get("name") == padded_struct_name and exported_header, f"export_struct failed: {_json(export_struct)}")
+                print("EXPORT_STRUCT ok")
+
+                struct_diff_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {
+                        "session_id": session_id,
+                        "tool_name": "struct_diff",
+                        "arguments": {"struct_name": padded_struct_name, "decl": exported_header},
+                    },
+                )
+                struct_diff = _inner_structured(struct_diff_resp) or {}
+                _assert(struct_diff.get("identical") is True, f"struct_diff expected identical: {_json(struct_diff)}")
+                print("STRUCT_DIFF ok")
+
+                field_xrefs_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {
+                        "session_id": session_id,
+                        "tool_name": "field_xrefs_for_struct",
+                        "arguments": {"struct_name": padded_struct_name},
+                    },
+                )
+                field_xrefs = _inner_structured(field_xrefs_resp) or {}
+                _assert((field_xrefs.get("field_count") or 0) >= 1, f"field_xrefs_for_struct failed: {_json(field_xrefs)}")
+                print("FIELD_XREFS_FOR_STRUCT ok")
+
+                typed_export_resp = await call_tool(
+                    session,
+                    "call_session_tool",
+                    {
+                        "session_id": session_id,
+                        "tool_name": "typed_decompile_export",
+                        "arguments": {"addr": func_addr, "include_line_map": True, "format": "json"},
+                    },
+                )
+                typed_export = _inner_structured(typed_export_resp) or {}
+                _assert(str(typed_export.get("code") or ""), f"typed_decompile_export returned empty code: {_json(typed_export)}")
+                _assert("line_map" in typed_export, f"typed_decompile_export missing line_map: {_json(typed_export)}")
+                print("TYPED_DECOMPILE_EXPORT ok")
+
                 second = func_instructions[1]
                 third = func_instructions[2] if len(func_instructions) > 2 else None
                 undef_addr = str(second.get("address") or "")
