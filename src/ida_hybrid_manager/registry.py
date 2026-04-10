@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import threading
 import uuid
 from datetime import timedelta
@@ -14,8 +15,24 @@ class SessionRegistry:
         self._lock = threading.RLock()
         self._sessions: dict[str, SessionRecord] = {}
         self._pending_launches: dict[str, PendingLaunch] = {}
-        self._current_session_id: str | None = None
         self.stale_after = timedelta(seconds=30)
+
+    def _attach_client_unlocked(
+        self,
+        record: SessionRecord,
+        client_id: str | None,
+        *,
+        refresh_snapshot: bool = False,
+    ) -> SessionRecord:
+        if not client_id:
+            return record
+        entry = dict(record.attached_clients.get(client_id, {}))
+        entry["attached_at"] = entry.get("attached_at") or utc_now()
+        entry["last_seen"] = utc_now()
+        if refresh_snapshot or "last_seen_txid" not in entry:
+            entry["last_seen_txid"] = record.txid
+        record.attached_clients[client_id] = entry
+        return record
 
     def register_pending_launch(self, pending: PendingLaunch) -> None:
         with self._lock:
@@ -117,8 +134,6 @@ class SessionRegistry:
             record.metadata.pop("unregister_reason", None)
             record.last_seen = utc_now()
             self._link_pending_launch(record)
-            if self._current_session_id is None:
-                self.select_session(record.session_id)
             return record
 
     def register_managed_session(
@@ -152,7 +167,6 @@ class SessionRegistry:
                 closable=engine == "headless",
             )
             self._sessions[record.session_id] = record
-            self.select_session(record.session_id)
             return record
 
     def update_managed_session(
@@ -197,17 +211,174 @@ class SessionRegistry:
             record.metadata.pop("unregister_reason", None)
             return record
 
+    def attach_client(
+        self,
+        session_id: str,
+        client_id: str | None,
+        *,
+        refresh_snapshot: bool = False,
+    ) -> SessionRecord | None:
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return None
+            if record.closing or record.status == "dead":
+                return None
+            record.last_seen = utc_now()
+            return self._attach_client_unlocked(record, client_id, refresh_snapshot=refresh_snapshot)
+
+    def touch_client(self, session_id: str, client_id: str | None) -> SessionRecord | None:
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return None
+            if client_id and client_id in record.attached_clients:
+                record.attached_clients[client_id]["last_seen"] = utc_now()
+                record.attached_clients[client_id]["last_seen_txid"] = record.txid
+            record.last_seen = utc_now()
+            return record
+
+    def get_client_attachment(self, session_id: str, client_id: str | None) -> dict[str, Any] | None:
+        if not client_id:
+            return None
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return None
+            entry = record.attached_clients.get(client_id)
+            return dict(entry) if isinstance(entry, dict) else None
+
+    def get_attachment_count(self, session_id: str) -> int:
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return 0
+            return len(record.attached_clients)
+
+    def get_txid(self, session_id: str) -> int | None:
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return None
+            return record.txid
+
+    @contextmanager
+    def track_operation(self, session_id: str):
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                raise ValueError(f"Unknown session: {session_id}")
+            if record.closing or record.status == "dead":
+                raise ValueError(f"Session {session_id} is closing")
+            record.active_ops += 1
+            record.last_seen = utc_now()
+        try:
+            yield record
+        finally:
+            with self._lock:
+                current = self._sessions.get(session_id)
+                if current is None:
+                    return
+                current.active_ops = max(0, int(current.active_ops) - 1)
+                current.last_seen = utc_now()
+
+    @contextmanager
+    def acquire_write_lock(self, session_id: str):
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                raise ValueError(f"Unknown session: {session_id}")
+            lock = record.write_lock
+        lock.acquire()
+        try:
+            yield record
+        finally:
+            lock.release()
+
+    def bump_txid(self, session_id: str, client_id: str | None, tool_name: str) -> SessionRecord | None:
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return None
+            record.txid += 1
+            record.last_writer_client_id = client_id
+            record.last_write_at = utc_now()
+            record.metadata["last_write_tool"] = tool_name
+            record.metadata["last_write_txid"] = record.txid
+            if client_id:
+                entry = record.attached_clients.get(client_id, {})
+                entry["last_seen"] = utc_now()
+                entry["last_seen_txid"] = record.txid
+                record.attached_clients[client_id] = entry
+            record.last_seen = utc_now()
+            return record
+
+    def detach_client(self, client_id: str | None) -> list[SessionRecord]:
+        detached: list[SessionRecord] = []
+        if not client_id:
+            return detached
+        with self._lock:
+            for record in self._sessions.values():
+                if client_id not in record.attached_clients:
+                    continue
+                record.attached_clients.pop(client_id, None)
+                record.last_seen = utc_now()
+                detached.append(record)
+        return detached
+
+    def begin_close(
+        self,
+        session_id: str,
+        *,
+        client_id: str | None = None,
+        force: bool = False,
+        require_client_attached: bool = False,
+    ) -> tuple[SessionRecord | None, dict[str, Any] | None]:
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return None, {"ok": False, "error": f"Unknown session: {session_id}"}
+            if record.closing:
+                return None, {"ok": False, "error": f"Session {session_id} is already closing"}
+            if require_client_attached and client_id and client_id not in record.attached_clients:
+                return None, {"ok": False, "error": f"Client {client_id} is not attached to session {session_id}"}
+            other_clients = [attached for attached in record.attached_clients if attached != client_id]
+            if other_clients and not force:
+                return None, {
+                    "ok": False,
+                    "error": "Session is still attached by other clients",
+                    "attached_client_count": len(record.attached_clients),
+                    "other_clients": other_clients,
+                }
+            if record.active_ops > 0 and not force:
+                return None, {
+                    "ok": False,
+                    "error": "Session still has active operations",
+                    "active_ops": record.active_ops,
+                }
+            record.closing = True
+            record.last_seen = utc_now()
+            return record, None
+
+    def cancel_close(self, session_id: str) -> SessionRecord | None:
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return None
+            if record.status != "dead":
+                record.closing = False
+                record.last_seen = utc_now()
+            return record
+
     def unregister(self, session_id: str, reason: str) -> SessionRecord | None:
         with self._lock:
             record = self._sessions.get(session_id)
             if record is None:
                 return None
             record.status = "dead"
+            record.closing = False
             record.metadata["unregister_reason"] = reason
             record.last_seen = utc_now()
-            if self._current_session_id == session_id:
-                self._current_session_id = None
-                record.current = False
             return record
 
     def _effective_status(self, record: SessionRecord) -> str:
@@ -227,33 +398,18 @@ class SessionRegistry:
                 if not include_dead and effective == "dead":
                     continue
                 record.status = effective
-                record.current = record.session_id == self._current_session_id
                 sessions.append(record)
-            sessions.sort(key=lambda item: (not item.current, item.engine, item.display_name.lower()))
+            sessions.sort(key=lambda item: (item.engine, item.display_name.lower()))
             return sessions
 
     def get_session(self, session_id: str | None) -> SessionRecord | None:
         with self._lock:
-            if session_id is None:
-                session_id = self._current_session_id
             if session_id is None:
                 return None
             record = self._sessions.get(session_id)
             if record is None:
                 return None
             record.status = self._effective_status(record)
-            record.current = record.session_id == self._current_session_id
-            return record
-
-    def select_session(self, session_id: str) -> SessionRecord | None:
-        with self._lock:
-            record = self._sessions.get(session_id)
-            if record is None:
-                return None
-            for item in self._sessions.values():
-                item.current = False
-            self._current_session_id = session_id
-            record.current = True
             return record
 
     def find_candidates(self, *, engine: str | None = None, binary_name: str | None = None, binary_path: str | None = None) -> list[SessionRecord]:

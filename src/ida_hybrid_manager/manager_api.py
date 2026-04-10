@@ -16,12 +16,14 @@ class ManagerApiServer:
         host: str = "0.0.0.0",
         port: int = 18080,
         api_version: int = 3,
+        build_token: str = "",
         op_dispatcher=None,
     ) -> None:
         self.registry = registry
         self.host = host
         self.port = port
         self.api_version = api_version
+        self.build_token = build_token
         self.op_dispatcher = op_dispatcher
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -47,6 +49,7 @@ class ManagerApiServer:
                             "ok": True,
                             "service": "ida-hybrid-manager",
                             "daemon_api_version": self.server.manager_api_version,
+                            "build_token": self.server.manager_build_token,
                         },
                     )
                     return
@@ -106,6 +109,7 @@ class ManagerApiServer:
                 return
             raise
         self._httpd.manager_api_version = self.api_version
+        self._httpd.manager_build_token = self.build_token
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="ida-hybrid-manager-api", daemon=True)
         self._thread.start()
 

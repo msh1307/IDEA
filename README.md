@@ -78,10 +78,19 @@ Useful tools:
 - `list_alive_sessions`
 - `call_session_tool`
 - `write_session_tool_output`
+- Tools that accept `session_id` will target that explicit session when provided; if omitted, they run against the current selected session for the client.
+- There is no implicit "only live session" auto-pick anymore. If no `session_id` is supplied, the client must already have selected a current session.
+- `open_binary(..., reuse=true)` is the default fast path. Use `remove_previous_idb=true` only when you want a fresh launch that ignores and deletes the adjacent saved `.i64`.
 - For `write_session_tool_output`, prefer `/mnt/c/...` output paths. `C:\...` inputs are normalized to WSL paths before writing.
 - If the original input binary already has an adjacent `.i64`, headless staging copies that database too and reuses it.
 - When a manager-owned headless session is closed with `save=true`, the staged `.i64` is copied back next to the original binary path by default.
 - backend raw tools now include `decompile`, `disasm`, `get_xrefs_to`, `get_xrefs_from`, `list_strings`, `find_bytes`, `find_text`, `find_immediates`, `find_insns`, `get_data_item`, `read_bytes`, `read_byte`, `read_word`, `read_dword`, `read_qword`, `read_array`, `hex_dump`, `set_type`, `create_struct`, `apply_struct`, and `make_array`
+- Session-bearing responses now expose a canonical `revision` block:
+  `txid`, `snapshot_txid`, `requires_refresh`, `attached_client_count`, `last_writer_client_id`
+- Legacy flat fields like `txid`, `snapshot_txid`, and `requires_refresh` may still appear for compatibility, but `revision` should be treated as canonical.
+- Mutating tool calls can pass `expected_txid` to reject stale writes and `force=true` to suppress stale warnings when best-effort continuation is intended.
+- `close_session(..., force=true)` bypasses attached-client / in-flight-op guards and should be reserved for explicit teardown.
+- `type_workflow` now reports `db_changed` and `changed_count`, so partial-success workflows can still advance session revision while all-failure workflows do not.
 
 High-level API:
 

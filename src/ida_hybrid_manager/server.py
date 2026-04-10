@@ -29,18 +29,26 @@ from mcp.shared.message import SessionMessage
 from .backend import BackendUnavailableError, call_backend_tool_any, list_backend_tools_any
 from .launch import IdaLauncher
 from .manager_api import ManagerApiServer
-from .models import PendingLaunch
+from .models import PendingLaunch, utc_now
 from .pathing import normalize_path
 from .registry import SessionRegistry
 
 
 DAEMON_HOST = "127.0.0.1"
 DAEMON_PORT = 18080
-DAEMON_API_VERSION = 3
+DAEMON_API_VERSION = 4
 DAEMON_URL = f"http://{DAEMON_HOST}:{DAEMON_PORT}"
 DAEMON_LOCK_PATH = Path("/tmp/ida-hybrid-manager-daemon.lock")
 DAEMON_LOG_PATH = Path("/tmp/ida-hybrid-manager-daemon.log")
 STDIO_DEBUG_PATH = Path("/tmp/ida-hybrid-manager-stdio.log")
+DAEMON_BUILD_FILES = (
+    Path(__file__).resolve(),
+    Path(__file__).with_name("launch.py"),
+    Path(__file__).with_name("registry.py"),
+    Path(__file__).with_name("models.py"),
+    Path(__file__).with_name("backend.py"),
+    Path(__file__).with_name("manager_api.py"),
+)
 
 registry = SessionRegistry()
 ACTIVE_BACKEND = "local"
@@ -49,6 +57,28 @@ _client_lock = threading.RLock()
 _client_current_sessions: dict[str, str | None] = {}
 _launcher: IdaLauncher | None = None
 _open_binary_lock = threading.RLock()
+MUTATING_BACKEND_TOOLS = {
+    "apply_decl",
+    "apply_struct",
+    "apply_struct_to_many",
+    "create_struct",
+    "create_padded_struct_from_map",
+    "declare_stack",
+    "declare_type",
+    "define",
+    "define_code",
+    "define_func",
+    "delete_stack",
+    "make_array",
+    "reanalyze_function",
+    "rename",
+    "save_database",
+    "set_comments",
+    "set_type",
+    "type_workflow",
+    "undefine",
+    "upsert_struct",
+}
 
 mcp = FastMCP(
     "IDA Hybrid Manager",
@@ -83,6 +113,19 @@ def _get_launcher() -> IdaLauncher:
     if _launcher is None:
         _launcher = IdaLauncher()
     return _launcher
+
+
+def _compute_daemon_build_token() -> str:
+    digest = hashlib.sha256()
+    for path in DAEMON_BUILD_FILES:
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(str(path).encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+DAEMON_BUILD_TOKEN = _compute_daemon_build_token()
 
 
 async def _run_stdio_server() -> None:
@@ -133,12 +176,12 @@ async def _run_stdio_server() -> None:
         tg.start_soon(stdout_writer)
         _stdio_debug("stdio transport ready")
         try:
-            await mcp._mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp._mcp_server.create_initialization_options(),
-                raise_exceptions=True,
-            )
+                await mcp._mcp_server.run(
+                    read_stream,
+                    write_stream,
+                    mcp._mcp_server.create_initialization_options(),
+                    raise_exceptions=False,
+                )
         except Exception as exc:
             _stdio_debug(f"stdio server exception: {exc!r}")
             _stdio_debug(traceback.format_exc())
@@ -158,6 +201,30 @@ def _client_connect(client_name: str = "", client_pid: int | None = None) -> dic
     with _client_lock:
         _client_current_sessions[client_id] = None
     return {"client_id": client_id, "client_name": client_name, "client_pid": client_pid}
+
+
+def _client_disconnect(client_id: str | None) -> dict[str, Any]:
+    detached_session_id = None
+    with _client_lock:
+        if client_id:
+            detached_session_id = _client_current_sessions.pop(client_id, None)
+    detached_records = registry.detach_client(client_id)
+    auto_closed: list[str] = []
+    for record in detached_records:
+        if record.status == "dead":
+            continue
+        if record.engine != "headless" or record.source != "manager_created" or not record.closable:
+            continue
+        closable, error = registry.begin_close(record.session_id)
+        if error is not None or closable is None:
+            continue
+        try:
+            _terminate_session_record(closable, save=True, reason="last_client_detached")
+        except Exception:
+            registry.cancel_close(record.session_id)
+            raise
+        auto_closed.append(record.session_id)
+    return {"ok": True, "client_id": client_id, "detached_session_id": detached_session_id, "auto_closed_session_ids": auto_closed}
 
 
 def _client_get_current_session_id(client_id: str | None) -> str | None:
@@ -183,9 +250,35 @@ def _client_clear_session_references(session_id: str) -> None:
                 _client_current_sessions[client_id] = None
 
 
+def _client_session_refresh_state(record, client_id: str | None) -> dict[str, Any]:
+    if not client_id:
+        return {"attached": False, "snapshot_txid": None, "requires_refresh": False}
+    attachment = record.attached_clients.get(client_id) or {}
+    snapshot_txid = attachment.get("last_seen_txid")
+    requires_refresh = snapshot_txid is not None and int(snapshot_txid) != int(record.txid)
+    return {
+        "attached": bool(client_id in record.attached_clients),
+        "snapshot_txid": snapshot_txid,
+        "requires_refresh": requires_refresh,
+    }
+
+
+def _session_revision_payload(record, client_id: str | None) -> dict[str, Any]:
+    refresh_state = _client_session_refresh_state(record, client_id)
+    return {
+        "txid": int(record.txid),
+        "snapshot_txid": refresh_state["snapshot_txid"],
+        "requires_refresh": refresh_state["requires_refresh"],
+        "attached_client_count": len(record.attached_clients),
+        "last_writer_client_id": record.last_writer_client_id,
+    }
+
+
 def _session_to_client_dict(record, client_id: str | None) -> dict[str, Any]:
     data = record.to_dict()
     data["current"] = bool(client_id and record.session_id == _client_get_current_session_id(client_id))
+    data.update(_client_session_refresh_state(record, client_id))
+    data["revision"] = _session_revision_payload(record, client_id)
     return data
 
 
@@ -210,10 +303,8 @@ def _wait_for_session(pending: PendingLaunch, timeout_sec: float = 90.0):
         sessions = registry.list_sessions(include_dead=False)
         for record in sessions:
             if record.metadata.get("launch_token") == pending.launch_token:
-                registry.select_session(record.session_id)
                 return record
             if pending.engine == "gui" and record.engine == "gui" and record.binary_path.lower() == pending.binary_path.lower():
-                registry.select_session(record.session_id)
                 return record
         time.sleep(1.0)
     return None
@@ -228,6 +319,9 @@ def _current_or_explicit(session_id: str | None, client_id: str | None = None):
         raise ValueError("No active session selected")
     if record.status not in {"ready", "busy"}:
         raise ValueError(f"Session {record.session_id} is not available: {record.status}")
+    attached = registry.attach_client(record.session_id, client_id)
+    if attached is not None:
+        record = attached
     return record
 
 
@@ -271,7 +365,7 @@ def _owner_pid_alive(pid: int | None) -> bool:
     return _get_launcher().is_process_alive(pid)
 
 
-def _sweep_unreachable_sessions(probe_timeout_sec: float = 0.2) -> None:
+def _sweep_unreachable_sessions(probe_timeout_sec: float = 1.0, max_failures: int = 3) -> None:
     for record in registry.list_sessions(include_dead=False):
         if record.engine != "headless" or record.source != "manager_created":
             continue
@@ -281,9 +375,25 @@ def _sweep_unreachable_sessions(probe_timeout_sec: float = 0.2) -> None:
             registry.unregister(record.session_id, "owner_pid_exited")
             _client_clear_session_references(record.session_id)
             continue
-        if not _backend_ready(record, timeout_sec=probe_timeout_sec):
-            registry.unregister(record.session_id, "backend_unreachable")
-            _client_clear_session_references(record.session_id)
+        if _backend_ready(record, timeout_sec=probe_timeout_sec):
+            if int(record.metadata.get("backend_probe_failures", 0)) > 0:
+                registry.update_managed_session(
+                    record.session_id,
+                    metadata={"backend_probe_failures": 0, "last_backend_probe_failed_at": ""},
+                )
+            continue
+        failures = int(record.metadata.get("backend_probe_failures", 0)) + 1
+        registry.update_managed_session(
+            record.session_id,
+            metadata={
+                "backend_probe_failures": failures,
+                "last_backend_probe_failed_at": utc_now().isoformat(),
+            },
+        )
+        if failures < max_failures:
+            continue
+        registry.unregister(record.session_id, "backend_unreachable")
+        _client_clear_session_references(record.session_id)
 
 
 def _session_matches_any_path(record, candidate_paths: set[str]) -> bool:
@@ -292,10 +402,15 @@ def _session_matches_any_path(record, candidate_paths: set[str]) -> bool:
         return False
     possible_paths = {
         str(record.binary_path or "").lower(),
+        str(record.idb_path or "").lower(),
         str(record.metadata.get("source_input_path") or "").lower(),
         str(record.metadata.get("source_windows_path") or "").lower(),
         str(record.metadata.get("source_wsl_path") or "").lower(),
+        str(record.metadata.get("source_binary_windows_path") or "").lower(),
+        str(record.metadata.get("source_binary_wsl_path") or "").lower(),
+        str(record.metadata.get("source_idb_wsl_path") or "").lower(),
         str(record.metadata.get("staged_binary_path") or "").lower(),
+        str(record.metadata.get("staged_idb_path") or "").lower(),
     }
     possible_paths.discard("")
     return bool(possible_paths & normalized_candidates)
@@ -315,6 +430,20 @@ def _compute_input_binary_hash(normalized_path) -> str:
                 digest.update(chunk)
         return f"sha256:{digest.hexdigest()}"
     return ""
+
+
+def _remove_adjacent_idb(normalized_path) -> dict[str, Any]:
+    source_wsl = Path(normalized_path.wsl_path)
+    if source_wsl.suffix.lower() == ".i64":
+        if not source_wsl.exists():
+            return {"removed": False, "path": str(source_wsl), "reason": "missing"}
+        source_wsl.unlink()
+        return {"removed": True, "path": str(source_wsl)}
+    source_idb = source_wsl.with_name(f"{source_wsl.name}.i64")
+    if not source_idb.exists():
+        return {"removed": False, "path": str(source_idb), "reason": "missing"}
+    source_idb.unlink()
+    return {"removed": True, "path": str(source_idb)}
 
 
 def _coerce_tool_arguments(arguments: Any) -> dict[str, Any]:
@@ -385,6 +514,10 @@ def _resolve_output_path(path: str) -> Path:
 
 
 def _session_persistent_idb_target(record: Any) -> Path | None:
+    source_kind = str(record.metadata.get("source_input_kind") or "").strip().lower()
+    if source_kind == "idb":
+        source_idb_path = str(record.metadata.get("source_idb_wsl_path") or "").strip()
+        return Path(source_idb_path) if source_idb_path else None
     source_wsl_path = str(record.metadata.get("source_wsl_path") or "").strip()
     if not source_wsl_path:
         return None
@@ -394,11 +527,33 @@ def _session_persistent_idb_target(record: Any) -> Path | None:
 
 
 def _session_staged_idb_path(record: Any) -> Path | None:
+    staged_idb_path = str(record.metadata.get("staged_idb_path") or "").strip()
+    if staged_idb_path:
+        return Path(staged_idb_path)
     staged_binary_path = str(record.metadata.get("staged_binary_path") or "").strip()
     if not staged_binary_path:
         return None
     staged_path = Path(staged_binary_path)
     return staged_path.with_name(f"{staged_path.name}.i64")
+
+
+def _session_idb_status(record: Any) -> dict[str, Any]:
+    source_kind = str(record.metadata.get("source_input_kind") or "").strip().lower()
+    source_idb_path = str(record.metadata.get("source_idb_wsl_path") or "").strip()
+    source_idb_exists = bool(record.metadata.get("source_idb_exists")) or source_kind == "idb" or bool(source_idb_path)
+    staged_from_existing = bool(record.metadata.get("staged_from_existing_idb"))
+    staged_idb = _session_staged_idb_path(record)
+    persistent_idb = _session_persistent_idb_target(record)
+    idb_path = ""
+    if persistent_idb is not None:
+        idb_path = str(persistent_idb)
+    elif record.idb_path:
+        idb_path = str(normalize_path(record.idb_path).wsl_path)
+    return {
+        "idb_loaded": source_idb_exists or staged_from_existing,
+        "idb_path": idb_path,
+        "idb_source_path": source_idb_path or idb_path,
+    }
 
 
 def _persist_staged_idb(record: Any) -> dict[str, Any]:
@@ -442,6 +597,26 @@ def _pending_log_summary(pending: PendingLaunch) -> dict[str, Any]:
     return logs
 
 
+def _augment_session_meta(result: dict[str, Any], record, *, client_id: str | None = None, warning: str = "") -> dict[str, Any]:
+    revision = _session_revision_payload(record, client_id)
+    meta = dict(result.get("meta") or {})
+    meta.update(
+        {
+            "session_id": record.session_id,
+            "session_txid": revision["txid"],
+            "attached_client_count": revision["attached_client_count"],
+            "client_snapshot_txid": revision["snapshot_txid"],
+            "requires_refresh": revision["requires_refresh"],
+            "last_writer_client_id": revision["last_writer_client_id"],
+            "revision": revision,
+        }
+    )
+    if warning:
+        meta["warning"] = warning
+    result["meta"] = meta
+    return result
+
+
 def _render_tool_result(result: dict[str, Any], output_format: str) -> str:
     if output_format == "json":
         return json.dumps(result, ensure_ascii=False, indent=2)
@@ -458,6 +633,87 @@ def _render_tool_result(result: dict[str, Any], output_format: str) -> str:
         return json.dumps(structured, ensure_ascii=False, indent=2) + "\n"
     return json.dumps(result, ensure_ascii=False, indent=2) + "\n"
 
+
+def _tool_result(payload: Any, *, is_error: bool = False) -> dict[str, Any]:
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}],
+        "structuredContent": payload,
+        "isError": is_error,
+    }
+
+
+def _tool_error(message: str, **extra: Any) -> dict[str, Any]:
+    payload = {"ok": False, "error": message}
+    payload.update(extra)
+    return _tool_result(payload, is_error=True)
+
+
+def _backend_tool_is_error(result: dict[str, Any]) -> bool:
+    if bool(result.get("isError")):
+        return True
+    structured = result.get("structuredContent")
+    return isinstance(structured, dict) and bool(structured.get("isError"))
+
+
+def _backend_mutation_changed_db(result: dict[str, Any]) -> bool:
+    if _backend_tool_is_error(result):
+        return False
+    payload = result.get("structuredContent")
+    if isinstance(payload, dict) and "structuredContent" in payload and {"content", "structuredContent", "isError", "meta"} >= set(payload.keys()):
+        payload = payload.get("structuredContent")
+    if isinstance(payload, dict):
+        if "db_changed" in payload:
+            return bool(payload.get("db_changed"))
+        if "changed_count" in payload:
+            return int(payload.get("changed_count") or 0) > 0
+        if "ok" in payload:
+            return bool(payload.get("ok"))
+        if "ok_count" in payload:
+            return int(payload.get("ok_count") or 0) > 0
+        for value in payload.values():
+            if isinstance(value, list) and _backend_mutation_changed_db({"structuredContent": value}):
+                return True
+        return False
+    if isinstance(payload, list):
+        saw_status = False
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            if "ok" in item:
+                saw_status = True
+                if bool(item.get("ok")):
+                    return True
+            elif "ok_count" in item:
+                saw_status = True
+                if int(item.get("ok_count") or 0) > 0:
+                    return True
+        return not saw_status
+    return False
+
+
+def _annotate_tool_result(result: dict[str, Any], *, session_txid: int | None = None, expected_txid: int | None = None, stale_warning: str | None = None) -> dict[str, Any]:
+    annotated = dict(result)
+    meta = dict(annotated.get("meta") or {})
+    if session_txid is not None:
+        meta["session_txid"] = session_txid
+    if expected_txid is not None:
+        meta["expected_txid"] = expected_txid
+    if stale_warning:
+        meta["stale_txid_warning"] = stale_warning
+    if meta:
+        annotated["meta"] = meta
+    structured = annotated.get("structuredContent")
+    if isinstance(structured, dict):
+        structured = dict(structured)
+        if session_txid is not None:
+            structured["session_txid"] = session_txid
+        if expected_txid is not None:
+            structured["expected_txid"] = expected_txid
+        if stale_warning:
+            structured["stale_txid_warning"] = stale_warning
+        annotated["structuredContent"] = structured
+    return annotated
+
 def _daemon_healthz_ok(timeout_sec: float = 2.0) -> bool:
     req = urllib.request.Request(f"{DAEMON_URL}/healthz", method="GET")
     try:
@@ -467,6 +723,7 @@ def _daemon_healthz_ok(timeout_sec: float = 2.0) -> bool:
             bool(payload.get("ok"))
             and payload.get("service") == "ida-hybrid-manager"
             and int(payload.get("daemon_api_version", 0)) >= DAEMON_API_VERSION
+            and str(payload.get("build_token") or "") == DAEMON_BUILD_TOKEN
         )
     except Exception:
         return False
@@ -555,7 +812,7 @@ def _ensure_shared_daemon(timeout_sec: float = 20.0) -> None:
                 if _daemon_healthz_ok():
                     lock_file.seek(0)
                     lock_file.truncate()
-                    lock_file.write(json.dumps({"url": DAEMON_URL, "started_at": time.time()}) + "\n")
+                    lock_file.write(json.dumps({"url": DAEMON_URL, "started_at": time.time(), "build_token": DAEMON_BUILD_TOKEN}) + "\n")
                     lock_file.flush()
                     return
                 time.sleep(0.5)
@@ -607,14 +864,21 @@ def _local_select_session(session_id: str, client_id: str | None = None) -> dict
     record = registry.get_session(session_id)
     if record is None:
         return {"ok": False, "error": f"Unknown session: {session_id}"}
+    attached = registry.attach_client(record.session_id, client_id, refresh_snapshot=True) or record
     _client_set_current_session(client_id, session_id)
-    return {"ok": True, "current_session_id": record.session_id}
+    return {
+        "ok": True,
+        "current_session_id": attached.session_id,
+        "session": _session_to_client_dict(attached, client_id),
+        "revision": _session_revision_payload(attached, client_id),
+    }
 
 
 def _local_attach_to_gui(binary_name: str = "", binary_path: str = "", client_id: str | None = None) -> dict[str, Any]:
     normalized_path = normalize_path(binary_path).windows_path if binary_path else ""
     matches = registry.find_candidates(engine="gui", binary_name=binary_name or None, binary_path=normalized_path or None)
     if len(matches) == 1:
+        registry.attach_client(matches[0].session_id, client_id, refresh_snapshot=True)
         _client_set_current_session(client_id, matches[0].session_id)
         return {
             "matches": _serialize_sessions_for_client(matches, client_id),
@@ -629,13 +893,25 @@ def _local_inspect_environment() -> dict[str, Any]:
     return {"ok": True, "environment": launcher.inspect_environment()}
 
 
-def _local_open_binary(path: str, mode: str = "auto", reuse: bool = True, client_id: str | None = None) -> dict[str, Any]:
+def _local_open_binary(
+    path: str,
+    mode: str = "auto",
+    reuse: bool = True,
+    remove_previous_idb: bool = False,
+    client_id: str | None = None,
+) -> dict[str, Any]:
     with _open_binary_lock:
         _sweep_unreachable_sessions()
         normalized = normalize_path(path)
         candidate_paths = {normalized.input_path, normalized.windows_path, normalized.wsl_path}
+        if remove_previous_idb:
+            reuse = False
         candidate_hash = _compute_input_binary_hash(normalized) if reuse else ""
-        _daemon_debug(f"open_binary start path={path!r} mode={mode} reuse={reuse} client_id={client_id}")
+        removed_idb = _remove_adjacent_idb(normalized) if remove_previous_idb else None
+        _daemon_debug(
+            "open_binary start "
+            f"path={path!r} mode={mode} reuse={reuse} remove_previous_idb={remove_previous_idb} client_id={client_id}"
+        )
         if reuse:
             preferred_engine = None if mode == "auto" else mode
             matches = [
@@ -650,14 +926,22 @@ def _local_open_binary(path: str, mode: str = "auto", reuse: bool = True, client
             ]
             if matches:
                 _daemon_debug(f"open_binary reuse-hit session_id={matches[0].session_id}")
+                attached = registry.attach_client(matches[0].session_id, client_id, refresh_snapshot=True) or matches[0]
                 _client_set_current_session(client_id, matches[0].session_id)
                 return {
                     "ok": True,
-                    "session_id": matches[0].session_id,
-                    "engine": matches[0].engine,
-                    "status": matches[0].status,
+                    "session_id": attached.session_id,
+                    "engine": attached.engine,
+                    "status": attached.status,
+                    "txid": attached.txid,
+                    "snapshot_txid": _session_revision_payload(attached, client_id)["snapshot_txid"],
+                    "requires_refresh": _session_revision_payload(attached, client_id)["requires_refresh"],
+                    "revision": _session_revision_payload(attached, client_id),
                     "selected": True,
                     "reused": True,
+                    "remove_previous_idb": False,
+                    "removed_previous_idb": None,
+                    **_session_idb_status(attached),
                 }
 
         if mode == "gui":
@@ -670,7 +954,7 @@ def _local_open_binary(path: str, mode: str = "auto", reuse: bool = True, client
                     "environment": environment,
                 }
             try:
-                pending = launcher.launch_gui(path)
+                pending = launcher.launch_gui(path, allow_existing_idb=not remove_previous_idb)
             except Exception as exc:
                 return {
                     "ok": False,
@@ -697,7 +981,7 @@ def _local_open_binary(path: str, mode: str = "auto", reuse: bool = True, client
             for attempt in range(1, attempts + 1):
                 launcher.terminate_untracked_idat(_tracked_headless_pids())
                 try:
-                    pending = launcher.launch_headless(path, manager_url())
+                    pending = launcher.launch_headless(path, manager_url(), allow_existing_idb=not remove_previous_idb)
                 except Exception as exc:
                     last_failure = {
                         "ok": False,
@@ -823,25 +1107,255 @@ def _local_open_binary(path: str, mode: str = "auto", reuse: bool = True, client
                 status="ready",
                 capabilities=capabilities,
                 owner_pid=listener_pid or record.owner_pid,
+                metadata=pending.metadata if pending is not None else None,
             )
         _daemon_debug(f"open_binary done session_id={record.session_id}")
+        attached = registry.attach_client(record.session_id, client_id, refresh_snapshot=True) or record
         _client_set_current_session(client_id, record.session_id)
         return {
             "ok": True,
-            "session_id": record.session_id,
-            "engine": record.engine,
+            "session_id": attached.session_id,
+            "engine": attached.engine,
             "status": "ready",
+            "txid": attached.txid,
+            "snapshot_txid": _session_revision_payload(attached, client_id)["snapshot_txid"],
+            "requires_refresh": _session_revision_payload(attached, client_id)["requires_refresh"],
+            "revision": _session_revision_payload(attached, client_id),
             "selected": True,
             "reused": False,
+            "remove_previous_idb": remove_previous_idb,
+            "removed_previous_idb": removed_idb,
+            **_session_idb_status(attached),
         }
 
 
-def _local_close_session(session_id: str, save: bool = True, client_id: str | None = None) -> dict[str, Any]:
-    record = registry.get_session(session_id)
-    if record is None:
-        return {"ok": False, "error": f"Unknown session: {session_id}"}
-    if not record.closable:
-        return {"ok": False, "error": "GUI sessions are attach-only in v1 and are not closed by the manager"}
+def _local_load_idb(
+    path: str,
+    mode: str = "headless",
+    reuse: bool = True,
+    client_id: str | None = None,
+) -> dict[str, Any]:
+    with _open_binary_lock:
+        _sweep_unreachable_sessions()
+        normalized = normalize_path(path)
+        if not str(normalized.wsl_path).lower().endswith(".i64"):
+            return {"ok": False, "error": "load_idb expects a .i64 path"}
+        candidate_paths = {normalized.input_path, normalized.windows_path, normalized.wsl_path}
+        _daemon_debug(
+            "load_idb start "
+            f"path={path!r} mode={mode} reuse={reuse} client_id={client_id}"
+        )
+        if reuse:
+            preferred_engine = None if mode == "auto" else mode
+            matches = [
+                record
+                for record in registry.list_sessions(include_dead=False)
+                if record.status in {"ready", "busy"}
+                and (preferred_engine is None or record.engine == preferred_engine)
+                and _session_matches_any_path(record, candidate_paths)
+            ]
+            if matches:
+                _daemon_debug(f"load_idb reuse-hit session_id={matches[0].session_id}")
+                attached = registry.attach_client(matches[0].session_id, client_id, refresh_snapshot=True) or matches[0]
+                _client_set_current_session(client_id, matches[0].session_id)
+                return {
+                    "ok": True,
+                    "session_id": attached.session_id,
+                    "engine": attached.engine,
+                    "status": attached.status,
+                    "txid": attached.txid,
+                    "snapshot_txid": _session_revision_payload(attached, client_id)["snapshot_txid"],
+                    "requires_refresh": _session_revision_payload(attached, client_id)["requires_refresh"],
+                    "revision": _session_revision_payload(attached, client_id),
+                    "selected": True,
+                    "reused": True,
+                    **_session_idb_status(attached),
+                }
+
+        launcher = _get_launcher()
+        if mode == "gui":
+            environment = launcher.inspect_environment()
+            if not environment.get("gui_plugin_installed"):
+                return {
+                    "ok": False,
+                    "error": "GUI mode requires the native Windows plugin bundle, but it does not appear to be installed.",
+                    "environment": environment,
+                }
+            try:
+                pending = launcher.launch_gui_idb(path)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": f"Failed to load GUI IDA database: {exc}",
+                    "environment": environment,
+                }
+            registry.register_pending_launch(pending)
+            _daemon_debug(f"load_idb launched gui launch_token={pending.launch_token} pid={pending.pid}")
+            record = _wait_for_session(pending)
+            if record is None:
+                _daemon_debug(f"load_idb wait timeout launch_token={pending.launch_token}")
+                return {
+                    "ok": False,
+                    "error": f"Timed out waiting for {pending.engine} session",
+                    "pending": pending.to_dict(),
+                    "environment": environment,
+                }
+        else:
+            attempts = max(1, int(os.getenv("IDA_HEADLESS_LAUNCH_ATTEMPTS", "3")))
+            last_failure: dict[str, Any] | None = None
+            record = None
+            pending = None
+            for attempt in range(1, attempts + 1):
+                launcher.terminate_untracked_idat(_tracked_headless_pids())
+                try:
+                    pending = launcher.launch_headless_idb(path, manager_url())
+                except Exception as exc:
+                    last_failure = {
+                        "ok": False,
+                        "error": f"Failed to load headless IDA database: {exc}",
+                        "environment": launcher.inspect_environment(),
+                        "attempt": attempt,
+                        "attempts": attempts,
+                    }
+                    if attempt >= attempts:
+                        return last_failure
+                    continue
+
+                registry.register_pending_launch(pending)
+                _daemon_debug(
+                    "load_idb launched headless "
+                    f"launch_token={pending.launch_token} pid={pending.pid} port={pending.port} attempt={attempt}/{attempts}"
+                )
+                record = _wait_for_session(pending)
+                if record is None:
+                    _daemon_debug(
+                        "load_idb wait timeout "
+                        f"launch_token={pending.launch_token} attempt={attempt}/{attempts}"
+                    )
+                    if pending.pid is not None:
+                        try:
+                            launcher.terminate_process(pending.pid)
+                        except Exception:
+                            pass
+                    last_failure = {
+                        "ok": False,
+                        "error": f"Timed out waiting for {pending.engine} session",
+                        "pending": pending.to_dict(),
+                        "environment": launcher.inspect_environment(),
+                        "logs": _pending_log_summary(pending),
+                        "attempt": attempt,
+                        "attempts": attempts,
+                    }
+                    if attempt >= attempts:
+                        return last_failure
+                    continue
+
+                _daemon_debug(
+                    "load_idb session-linked "
+                    f"session_id={record.session_id} status={record.status} endpoint={record.endpoint} attempt={attempt}/{attempts}"
+                )
+                if _backend_ready(record):
+                    break
+
+                _daemon_debug(f"load_idb backend_unreachable session_id={record.session_id} attempt={attempt}/{attempts}")
+                if record.closable and record.owner_pid is not None:
+                    try:
+                        _get_launcher().terminate_process(record.owner_pid)
+                    except Exception:
+                        pass
+                    registry.unregister(record.session_id, "backend_unreachable")
+                last_failure = {
+                    "ok": False,
+                    "error": f"{record.engine} session registered but backend was unreachable",
+                    "session_id": record.session_id,
+                    "endpoint_candidates": _backend_candidates(record),
+                    "environment": _get_launcher().inspect_environment(),
+                    "logs": _pending_log_summary(pending),
+                    "attempt": attempt,
+                    "attempts": attempts,
+                }
+                record = None
+                if attempt >= attempts:
+                    return last_failure
+            if record is None:
+                return last_failure or {
+                    "ok": False,
+                    "error": "Failed to load headless IDA database",
+                    "environment": launcher.inspect_environment(),
+                }
+
+        if mode == "gui":
+            _daemon_debug(f"load_idb session-linked session_id={record.session_id} status={record.status} endpoint={record.endpoint}")
+        if mode == "gui" and not _backend_ready(record):
+            _daemon_debug(f"load_idb backend_unreachable session_id={record.session_id}")
+            if record.closable and record.owner_pid is not None:
+                try:
+                    _get_launcher().terminate_process(record.owner_pid)
+                except Exception:
+                    pass
+                registry.unregister(record.session_id, "backend_unreachable")
+            return {
+                "ok": False,
+                "error": f"{record.engine} session registered but backend was unreachable",
+                "session_id": record.session_id,
+                "endpoint_candidates": _backend_candidates(record),
+                "environment": _get_launcher().inspect_environment(),
+                "logs": _pending_log_summary(pending) if record.engine == "headless" else {},
+            }
+        if record.engine == "headless":
+            try:
+                _daemon_debug(f"load_idb wait_for_autoanalysis start session_id={record.session_id}")
+                analysis_result = asyncio.run(
+                    call_backend_tool_any(
+                        _backend_candidates(record),
+                        "wait_for_autoanalysis",
+                        {"timeout_sec": float(os.getenv("IDA_AUTOANALYSIS_TIMEOUT_SEC", "120"))},
+                        timeout_sec=float(os.getenv("IDA_AUTOANALYSIS_TIMEOUT_SEC", "120")) + 10.0,
+                    )
+                )
+                _daemon_debug(
+                    "load_idb wait_for_autoanalysis done "
+                    f"session_id={record.session_id} result={analysis_result.get('structuredContent', analysis_result)}"
+                )
+            except Exception:
+                _daemon_debug(f"load_idb wait_for_autoanalysis failed session_id={record.session_id}")
+            try:
+                _daemon_debug(f"load_idb list_backend_tools start session_id={record.session_id}")
+                tools_info = asyncio.run(list_backend_tools_any(_backend_candidates(record)))
+                capabilities = [tool.get("name") for tool in tools_info.get("tools", []) if tool.get("name")]
+                _daemon_debug(f"load_idb list_backend_tools done session_id={record.session_id} count={len(capabilities)}")
+            except Exception:
+                capabilities = []
+                _daemon_debug(f"load_idb list_backend_tools failed session_id={record.session_id}")
+            _daemon_debug(f"load_idb lookup_listener_pid start session_id={record.session_id}")
+            listener_pid = _get_launcher().lookup_listener_pid(record.endpoint.get("url", ""))
+            _daemon_debug(f"load_idb lookup_listener_pid done session_id={record.session_id} listener_pid={listener_pid}")
+            registry.update_managed_session(
+                record.session_id,
+                status="ready",
+                capabilities=capabilities,
+                owner_pid=listener_pid or record.owner_pid,
+                metadata=pending.metadata if pending is not None else None,
+            )
+        _daemon_debug(f"load_idb done session_id={record.session_id}")
+        attached = registry.attach_client(record.session_id, client_id, refresh_snapshot=True) or record
+        _client_set_current_session(client_id, record.session_id)
+        return {
+            "ok": True,
+            "session_id": attached.session_id,
+            "engine": attached.engine,
+            "status": "ready",
+            "txid": attached.txid,
+            "snapshot_txid": _session_revision_payload(attached, client_id)["snapshot_txid"],
+            "requires_refresh": _session_revision_payload(attached, client_id)["requires_refresh"],
+            "revision": _session_revision_payload(attached, client_id),
+            "selected": True,
+            "reused": False,
+            **_session_idb_status(attached),
+        }
+
+
+def _terminate_session_record(record, *, save: bool, reason: str) -> dict[str, Any]:
     if save and "save_database" in record.capabilities:
         asyncio.run(call_backend_tool_any(_backend_candidates(record), "save_database", {}))
     if record.owner_pid is not None:
@@ -853,25 +1367,99 @@ def _local_close_session(session_id: str, save: bool = True, client_id: str | No
     if staged_dir:
         cleanup["staged_dir"] = staged_dir
         cleanup["deleted"] = _get_launcher().cleanup_staged_dir(staged_dir)
-    registry.unregister(record.session_id, "manager_close")
+    registry.unregister(record.session_id, reason)
     _client_clear_session_references(record.session_id)
     return {"ok": True, "closed_session_id": record.session_id, "cleanup": cleanup}
 
 
+def _local_close_session(session_id: str, save: bool = True, force: bool = False, client_id: str | None = None) -> dict[str, Any]:
+    record = registry.get_session(session_id)
+    if record is None:
+        return {"ok": False, "error": f"Unknown session: {session_id}"}
+    if not record.closable:
+        return {"ok": False, "error": "GUI sessions are attach-only in v1 and are not closed by the manager"}
+    closable, error = registry.begin_close(
+        session_id,
+        client_id=client_id,
+        force=force,
+        require_client_attached=True,
+    )
+    if error is not None or closable is None:
+        return error or {"ok": False, "error": f"Unknown session: {session_id}"}
+    try:
+        return _terminate_session_record(closable, save=save, reason="manager_close")
+    except Exception:
+        registry.cancel_close(session_id)
+        raise
+
+
 async def _local_list_session_tools(session_id: str = "", client_id: str | None = None) -> dict[str, Any]:
     record = _current_or_explicit(session_id or None, client_id=client_id)
-    return await list_backend_tools_any(_backend_candidates(record))
+    with registry.track_operation(record.session_id):
+        with record.write_lock:
+            latest = registry.get_session(record.session_id)
+            if latest is None:
+                raise ValueError(f"Unknown session: {record.session_id}")
+            result = await list_backend_tools_any(_backend_candidates(latest))
+            touched = registry.touch_client(latest.session_id, client_id) or latest
+            if isinstance(result, dict):
+                return _augment_session_meta(dict(result), touched, client_id=client_id)
+            return result
 
 
 async def _local_call_session_tool(tool_name: str, arguments: Any = None, session_id: str = "", client_id: str | None = None) -> dict[str, Any]:
     record = _current_or_explicit(session_id or None, client_id=client_id)
-    try:
-        return await call_backend_tool_any(_backend_candidates(record), tool_name, _normalize_tool_arguments(tool_name, arguments))
-    except BackendUnavailableError:
-        if record.engine == "headless" and record.source == "manager_created":
-            registry.unregister(record.session_id, "backend_unreachable")
-            _client_clear_session_references(record.session_id)
-        raise
+    with registry.track_operation(record.session_id):
+        payload = _normalize_tool_arguments(tool_name, arguments)
+        attachment = registry.get_client_attachment(record.session_id, client_id) or {}
+        expected_txid = payload.get("expected_txid")
+        force_write = bool(payload.get("force", False))
+        warning = ""
+        backend_payload = dict(payload)
+        backend_payload.pop("expected_txid", None)
+        backend_payload.pop("force", None)
+        with record.write_lock:
+            latest = registry.get_session(record.session_id)
+            if latest is None:
+                raise ValueError(f"Unknown session: {record.session_id}")
+            if tool_name in MUTATING_BACKEND_TOOLS:
+                current_txid = latest.txid
+                seen_txid = attachment.get("last_seen_txid")
+                if expected_txid is not None and int(expected_txid) != current_txid:
+                    return _augment_session_meta(
+                        {
+                            "ok": False,
+                            "error": "stale_session_revision",
+                            "expected_txid": int(expected_txid),
+                            "current_txid": current_txid,
+                            "session_id": latest.session_id,
+                        },
+                        latest,
+                        client_id=client_id,
+                    )
+                if expected_txid is None and seen_txid is not None and seen_txid != current_txid and not force_write:
+                    warning = f"session_txid changed from {seen_txid} to {current_txid} before {tool_name}"
+                try:
+                    result = await call_backend_tool_any(_backend_candidates(latest), tool_name, backend_payload)
+                except BackendUnavailableError:
+                    if latest.engine == "headless" and latest.source == "manager_created":
+                        registry.unregister(latest.session_id, "backend_unreachable")
+                        _client_clear_session_references(latest.session_id)
+                    raise
+                if not _backend_mutation_changed_db(result):
+                    touched = registry.touch_client(latest.session_id, client_id) or latest
+                    return _augment_session_meta(result, touched, client_id=client_id, warning=warning)
+                updated = registry.bump_txid(latest.session_id, client_id, tool_name) or latest
+                return _augment_session_meta(result, updated, client_id=client_id, warning=warning)
+            try:
+                result = await call_backend_tool_any(_backend_candidates(latest), tool_name, backend_payload)
+                touched = registry.touch_client(latest.session_id, client_id) or latest
+                return _augment_session_meta(result, touched, client_id=client_id)
+            except BackendUnavailableError:
+                if latest.engine == "headless" and latest.source == "manager_created":
+                    registry.unregister(latest.session_id, "backend_unreachable")
+                    _client_clear_session_references(latest.session_id)
+                raise
 
 
 async def _local_write_session_tool_output(
@@ -906,13 +1494,26 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
     client_id = payload.get("client_id")
     op_map = {
         "connect_client": lambda **kwargs: _client_connect(**kwargs),
+        "disconnect_client": lambda **kwargs: _client_disconnect(kwargs.get("client_id")),
         "inspect_environment": lambda **kwargs: _local_inspect_environment(),
         "list_alive_sessions": lambda **kwargs: _local_list_alive_sessions(client_id=client_id),
         "current_session": lambda **kwargs: _local_current_session(client_id=client_id),
         "select_session": lambda **kwargs: _local_select_session(kwargs["session_id"], client_id=client_id),
         "attach_to_gui": lambda **kwargs: _local_attach_to_gui(kwargs.get("binary_name", ""), kwargs.get("binary_path", ""), client_id=client_id),
-        "open_binary": lambda **kwargs: _local_open_binary(kwargs["path"], kwargs.get("mode", "auto"), kwargs.get("reuse", True), client_id=client_id),
-        "close_session": lambda **kwargs: _local_close_session(kwargs["session_id"], kwargs.get("save", True), client_id=client_id),
+        "open_binary": lambda **kwargs: _local_open_binary(
+            kwargs["path"],
+            kwargs.get("mode", "auto"),
+            kwargs.get("reuse", True),
+            kwargs.get("remove_previous_idb", False),
+            client_id=client_id,
+        ),
+        "load_idb": lambda **kwargs: _local_load_idb(
+            kwargs["path"],
+            kwargs.get("mode", "headless"),
+            kwargs.get("reuse", True),
+            client_id=client_id,
+        ),
+        "close_session": lambda **kwargs: _local_close_session(kwargs["session_id"], kwargs.get("save", True), kwargs.get("force", False), client_id=client_id),
         "list_session_tools": lambda **kwargs: _local_list_session_tools(kwargs.get("session_id", ""), client_id=client_id),
         "call_session_tool": lambda **kwargs: _local_call_session_tool(kwargs["tool_name"], kwargs.get("arguments"), kwargs.get("session_id", ""), client_id=client_id),
         "inspect": lambda **kwargs: _local_call_session_tool(
@@ -1020,28 +1621,57 @@ def inspect_environment() -> dict[str, Any]:
     return _local_inspect_environment()
 
 
-@mcp.tool(description="Open a binary in headless mode, GUI mode, or auto mode and select the resulting session.")
-def open_binary(path: str, mode: str = "auto", reuse: bool = True) -> dict[str, Any]:
+@mcp.tool(description="Open a binary in headless mode, GUI mode, or auto mode and select the resulting session. By default this reuses an existing live session when possible and reuses an adjacent .i64 when launching fresh. Set remove_previous_idb=true to force a fresh launch without reusing the adjacent .i64.")
+def open_binary(path: str, mode: str = "auto", reuse: bool = True, remove_previous_idb: bool = False) -> dict[str, Any]:
+    if str(path or "").strip().lower().endswith(".i64"):
+        return {
+            "ok": False,
+            "error": "open_binary expects the original binary path. Use load_idb() to open an existing .i64 database.",
+        }
     if ACTIVE_BACKEND == "daemon":
-        return _daemon_request_sync("open_binary", {"path": path, "mode": mode, "reuse": reuse, "client_id": CLIENT_ID})
-    return _local_open_binary(path=path, mode=mode, reuse=reuse, client_id=CLIENT_ID)
+        return _daemon_request_sync(
+            "open_binary",
+            {"path": path, "mode": mode, "reuse": reuse, "remove_previous_idb": remove_previous_idb, "client_id": CLIENT_ID},
+        )
+    return _local_open_binary(
+        path=path,
+        mode=mode,
+        reuse=reuse,
+        remove_previous_idb=remove_previous_idb,
+        client_id=CLIENT_ID,
+    )
+
+
+@mcp.tool(description="Load an existing .i64 database in headless or GUI mode and select the resulting session.")
+def load_idb(path: str, mode: str = "headless", reuse: bool = True) -> dict[str, Any]:
+    if ACTIVE_BACKEND == "daemon":
+        return _daemon_request_sync(
+            "load_idb",
+            {"path": path, "mode": mode, "reuse": reuse, "client_id": CLIENT_ID},
+        )
+    return _local_load_idb(
+        path=path,
+        mode=mode,
+        reuse=reuse,
+        client_id=CLIENT_ID,
+    )
 
 
 @mcp.tool(description="Close a manager-owned headless session.")
-def close_session(session_id: str, save: bool = True) -> dict[str, Any]:
+def close_session(session_id: str, save: bool = True, force: bool = False) -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
-        return _daemon_request_sync("close_session", {"session_id": session_id, "save": save, "client_id": CLIENT_ID})
-    return _local_close_session(session_id=session_id, save=save, client_id=CLIENT_ID)
+        return _daemon_request_sync("close_session", {"session_id": session_id, "save": save, "force": force, "client_id": CLIENT_ID})
+    return _local_close_session(session_id=session_id, save=save, force=force, client_id=CLIENT_ID)
 
 
-@mcp.tool(description="List backend tools exposed by the selected or explicit session.")
+@mcp.tool(description="List backend tools exposed by the explicit session_id, or by the current selected session when session_id is omitted.")
 async def list_session_tools(session_id: str = "") -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
         return await _daemon_request_async("list_session_tools", {"session_id": session_id, "client_id": CLIENT_ID})
     return await _local_list_session_tools(session_id=session_id, client_id=CLIENT_ID)
 
 
-@mcp.tool(description="Call any backend MCP tool on the selected or explicit session.")
+@mcp.tool(description="Call any backend raw tool on the explicit session_id, or on the current selected session when session_id is omitted.")
 async def call_session_tool(tool_name: str, arguments: Any = None, session_id: str = "") -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
         return await _daemon_request_async(
@@ -1153,21 +1783,21 @@ async def write_session_tool_output(
     )
 
 
-@mcp.tool(description="Decompile a function in the selected session.")
+@mcp.tool(description="Decompile a function in the explicit session_id, or in the current selected session when session_id is omitted.")
 async def decompile(addr: str, session_id: str = "") -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
         return await _daemon_request_async("decompile", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID})
     return await _local_call_session_tool("decompile", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID)
 
 
-@mcp.tool(description="Return pseudocode lines with best-effort disassembly address mapping.")
+@mcp.tool(description="Return pseudocode lines with best-effort disassembly address mapping from the explicit session_id, or from the current selected session when session_id is omitted.")
 async def decompile_line_map(addr: str, session_id: str = "") -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
         return await _daemon_request_async("decompile_line_map", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID})
     return await _local_call_session_tool("get_decompile_line_map", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID)
 
 
-@mcp.tool(description="Disassemble the full containing function for an address.")
+@mcp.tool(description="Disassemble the full containing function for an address in the explicit session_id, or in the current selected session when session_id is omitted.")
 async def disasm_function(addr: str, session_id: str = "", max_instructions: int = 4000) -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
         return await _daemon_request_async(
@@ -1201,14 +1831,14 @@ async def reanalyze_function(addr: str, session_id: str = "") -> dict[str, Any]:
     return await _local_call_session_tool("reanalyze_function", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID)
 
 
-@mcp.tool(description="Lookup one or more functions in the selected session.")
+@mcp.tool(description="Lookup one or more functions in the explicit session_id, or in the current selected session when session_id is omitted.")
 async def lookup_funcs(queries: list[str] | str, session_id: str = "") -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
         return await _daemon_request_async("lookup_funcs", {"queries": queries, "session_id": session_id, "client_id": CLIENT_ID})
     return await _local_call_session_tool("lookup_funcs", {"queries": queries}, session_id=session_id, client_id=CLIENT_ID)
 
 
-@mcp.tool(description="Find xrefs to one or more addresses in the selected session.")
+@mcp.tool(description="Find xrefs to one or more addresses in the explicit session_id, or in the current selected session when session_id is omitted.")
 async def xrefs_to(addrs: list[str] | str, limit: int = 100, session_id: str = "") -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
         return await _daemon_request_async(
@@ -1218,14 +1848,14 @@ async def xrefs_to(addrs: list[str] | str, limit: int = 100, session_id: str = "
     return await _local_call_session_tool("xrefs_to", {"addrs": addrs, "limit": limit}, session_id=session_id, client_id=CLIENT_ID)
 
 
-@mcp.tool(description="Rename functions, globals, local variables, or stack variables in the selected session.")
+@mcp.tool(description="Rename functions, globals, local variables, or stack variables in the explicit session_id, or in the current selected session when session_id is omitted.")
 async def rename(batch: dict[str, Any], session_id: str = "") -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
         return await _daemon_request_async("rename", {"batch": batch, "session_id": session_id, "client_id": CLIENT_ID})
     return await _local_call_session_tool("rename", {"batch": batch}, session_id=session_id, client_id=CLIENT_ID)
 
 
-@mcp.tool(description="Set comments in the selected session.")
+@mcp.tool(description="Set comments in the explicit session_id, or in the current selected session when session_id is omitted.")
 async def set_comments(items: dict[str, Any] | list[dict[str, Any]], session_id: str = "") -> dict[str, Any]:
     if ACTIVE_BACKEND == "daemon":
         return await _daemon_request_async("set_comments", {"items": items, "session_id": session_id, "client_id": CLIENT_ID})
@@ -1238,6 +1868,7 @@ def _run_daemon() -> None:
         host=DAEMON_HOST,
         port=DAEMON_PORT,
         api_version=DAEMON_API_VERSION,
+        build_token=DAEMON_BUILD_TOKEN,
         op_dispatcher=_dispatch_operation,
     )
     manager_api.start()
@@ -1276,7 +1907,14 @@ def main() -> None:
         )
         CLIENT_ID = connect_info.get("client_id")
         _stdio_debug(f"connect_client ok client_id={CLIENT_ID}")
-        anyio.run(_run_stdio_server)
+        try:
+            anyio.run(_run_stdio_server)
+        finally:
+            if CLIENT_ID:
+                try:
+                    _daemon_request_sync("disconnect_client", {"client_id": CLIENT_ID})
+                except Exception as exc:
+                    _stdio_debug(f"disconnect_client failed: {exc!r}")
         return
 
     ACTIVE_BACKEND = "local"
@@ -1284,6 +1922,7 @@ def main() -> None:
         registry=registry,
         host=DAEMON_HOST,
         port=DAEMON_PORT,
+        build_token=DAEMON_BUILD_TOKEN,
         op_dispatcher=_dispatch_operation,
     )
     manager_api.start()

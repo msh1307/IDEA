@@ -62,6 +62,9 @@ Current behavior:
 
 - `list_alive_sessions` is shared across agents
 - `current_session` is tracked per client
+- Any tool that accepts `session_id` will use that explicit session; if omitted, it falls back to the client's current selected session.
+- There is no implicit "pick the only live session" fallback. Clients should either pass `session_id` explicitly or call `select_session` first.
+- `open_binary(..., reuse=true)` remains the default. Use `remove_previous_idb=true` only when you explicitly want a fresh session that discards the adjacent saved `.i64`.
 - headless launches are daemon-owned
 - manager-owned headless launches can stage the bundled `idea_ida_backend` package directly from the repo
 - `write_session_tool_output` writes results into WSL paths
@@ -88,6 +91,10 @@ From WSL:
 - Use `inspect_environment` from the MCP server to check IDA paths, GUI plugin install state, and headless bootstrap availability.
 - If your Codex or local MCP config already pins the correct Windows host path, keep using that. The code still keeps fallback probes because WSL networking is inconsistent across systems.
 - The shared daemon uses a fixed port and a lock file at `/tmp/ida-hybrid-manager-daemon.lock`.
+- The shared daemon health check now includes a build token derived from the daemon-side source files, so changing manager code forces daemon replacement automatically.
 - The installer now tries to auto-detect the installed IDA root and writes `IDA_INSTALL_ROOT` into the MCP config. Override with `IDA_INSTALL_ROOT` if needed.
 - Codex MCP configs are not hot-reloaded. Restart Codex after `config.toml` changes.
 - If IDA was already open when you patched the plugin, restart IDA or reopen the IDB.
+- Session-bearing responses expose a canonical `revision` block with `txid`, `snapshot_txid`, `requires_refresh`, `attached_client_count`, and `last_writer_client_id`.
+- Mutating calls may pass `expected_txid` to reject stale writes. `force=true` is available for teardown or best-effort write continuation when you explicitly want to bypass stale warnings / close guards.
+- `type_workflow` now reports `db_changed` and `changed_count`, and session revision only advances when the workflow actually changes the database.

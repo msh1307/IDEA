@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -29,8 +30,14 @@ class SessionRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=utc_now)
     last_seen: datetime = field(default_factory=utc_now)
-    current: bool = False
     closable: bool = False
+    closing: bool = False
+    txid: int = 0
+    attached_clients: dict[str, dict[str, Any]] = field(default_factory=dict)
+    last_writer_client_id: str | None = None
+    last_write_at: datetime | None = None
+    active_ops: int = 0
+    write_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,8 +55,13 @@ class SessionRecord:
             "metadata": dict(self.metadata),
             "created_at": isoformat(self.created_at),
             "last_seen": isoformat(self.last_seen),
-            "current": self.current,
             "closable": self.closable,
+            "closing": self.closing,
+            "txid": self.txid,
+            "attached_client_count": len(self.attached_clients),
+            "last_writer_client_id": self.last_writer_client_id,
+            "last_write_at": isoformat(self.last_write_at),
+            "active_ops": self.active_ops,
         }
 
 

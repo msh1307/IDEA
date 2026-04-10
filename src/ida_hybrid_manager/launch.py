@@ -261,16 +261,25 @@ class IdaLauncher:
         )
         return to_windows_path(str(script_path))
 
-    def _prepare_binary_path(self, binary_path: str, *, always_stage: bool = False) -> tuple[str, str, dict[str, str]]:
+    def _prepare_binary_path(
+        self,
+        binary_path: str,
+        *,
+        always_stage: bool = False,
+        allow_existing_idb: bool = True,
+    ) -> tuple[str, str, dict[str, Any]]:
         normalized = normalize_path(binary_path)
         windows_path = normalized.windows_path
         source_wsl = Path(normalized.wsl_path)
         source_idb = source_wsl.with_name(f"{source_wsl.name}.i64")
+        source_idb_exists = source_idb.exists()
         source_metadata = {
             "source_input_path": normalized.input_path,
             "source_windows_path": normalized.windows_path,
             "source_wsl_path": normalized.wsl_path,
             "source_idb_wsl_path": str(source_idb),
+            "source_idb_exists": source_idb_exists,
+            "existing_idb_allowed": allow_existing_idb,
         }
         if len(windows_path) >= 3 and windows_path[1:3] == ":\\" and not always_stage:
             return windows_path, windows_path, source_metadata
@@ -283,16 +292,57 @@ class IdaLauncher:
         staged_path = staged_dir / source_wsl.name
         shutil.copy2(source_wsl, staged_path)
         staged_idb = staged_path.with_name(f"{staged_path.name}.i64")
-        if source_idb.exists():
+        if allow_existing_idb and source_idb_exists:
             shutil.copy2(source_idb, staged_idb)
         display_path = windows_path if len(windows_path) >= 3 and windows_path[1:3] == ":\\" else normalized.input_path
         metadata = {
             "staged_dir": str(staged_dir),
             "staged_binary_path": str(staged_path),
             "staged_idb_path": str(staged_idb),
+            "staged_from_existing_idb": allow_existing_idb and source_idb_exists,
         }
         metadata.update(source_metadata)
         return to_windows_path(str(staged_path)), display_path, metadata
+
+    def _prepare_idb_path(
+        self,
+        idb_path: str,
+        *,
+        always_stage: bool = False,
+    ) -> tuple[str, str, dict[str, Any]]:
+        normalized = normalize_path(idb_path)
+        windows_path = normalized.windows_path
+        source_idb = Path(normalized.wsl_path)
+        if source_idb.suffix.lower() != ".i64":
+            raise ValueError(f"Expected an .i64 path, got: {idb_path}")
+        if not source_idb.exists():
+            raise FileNotFoundError(f"Input IDB not found: {idb_path}")
+        source_binary = Path(str(source_idb)[:-4])
+        source_metadata = {
+            "source_input_kind": "idb",
+            "source_input_path": normalized.input_path,
+            "source_windows_path": normalized.windows_path,
+            "source_wsl_path": normalized.wsl_path,
+            "source_idb_wsl_path": normalized.wsl_path,
+            "source_idb_exists": True,
+            "source_binary_wsl_path": str(source_binary),
+            "source_binary_windows_path": to_windows_path(str(source_binary)),
+            "staged_from_existing_idb": True,
+        }
+        if len(windows_path) >= 3 and windows_path[1:3] == ":\\" and not always_stage:
+            return windows_path, normalized.input_path, source_metadata
+
+        staged_dir = self.stage_root / uuid.uuid4().hex[:12]
+        staged_dir.mkdir(parents=True, exist_ok=True)
+        staged_idb = staged_dir / source_idb.name
+        shutil.copy2(source_idb, staged_idb)
+        metadata = {
+            "staged_dir": str(staged_dir),
+            "staged_binary_path": "",
+            "staged_idb_path": str(staged_idb),
+        }
+        metadata.update(source_metadata)
+        return to_windows_path(str(staged_idb)), normalized.input_path, metadata
 
     def _start_process(
         self,
@@ -329,8 +379,16 @@ class IdaLauncher:
         stdout = result.stdout.strip()
         return int(stdout) if stdout.isdigit() else None
 
-    def launch_headless(self, binary_path: str, manager_url: str) -> PendingLaunch:
-        binary_windows, display_path, metadata = self._prepare_binary_path(binary_path, always_stage=True)
+    def _launch_headless_open_path(
+        self,
+        *,
+        open_path_windows: str,
+        display_path: str,
+        idb_path: str,
+        metadata: dict[str, Any],
+        manager_url: str,
+        existing_idb: bool,
+    ) -> PendingLaunch:
         launch_token = f"launch-{uuid.uuid4().hex[:12]}"
         port = self._reserve_headless_port()
         connect_hosts = self._resolve_connect_hosts()
@@ -339,7 +397,7 @@ class IdaLauncher:
         stdout_log_path = to_windows_path(str(self.wsl_temp / f"{launch_token}.stdout.log"))
         stderr_log_path = to_windows_path(str(self.wsl_temp / f"{launch_token}.stderr.log"))
         headless_mode = (os.getenv("IDA_HEADLESS_MODE", "idat").strip() or "idat").lower()
-        use_gui_hidden = headless_mode in {"gui", "gui-hidden", "ida", "auto"}
+        use_gui_hidden = existing_idb or headless_mode in {"gui", "gui-hidden", "ida", "auto"}
         idat_log_path = to_windows_path(str(self.wsl_temp / f"{launch_token}.idat.log"))
         bootstrap_path = self._write_headless_bootstrap(
             port=port,
@@ -349,9 +407,10 @@ class IdaLauncher:
             persist=not use_gui_hidden,
             bootstrap_root=bootstrap_root,
         )
-        idb_path = f"{binary_windows}.i64"
-        args = ["-A"]
-        if not use_gui_hidden:
+        args: list[str] = []
+        if not existing_idb:
+            args.append("-A")
+        if not use_gui_hidden and not existing_idb:
             args.extend(
                 [
                     "-c",
@@ -359,10 +418,12 @@ class IdaLauncher:
                     f"-L{idat_log_path}",
                 ]
             )
+        elif not use_gui_hidden:
+            args.append(f"-L{idat_log_path}")
         args.extend(
             [
                 f"-S{bootstrap_path}",
-                binary_windows,
+                open_path_windows,
             ]
         )
         pid = self._start_process(
@@ -384,6 +445,7 @@ class IdaLauncher:
         metadata["stderr_log_path"] = to_wsl_path(stderr_log_path)
         metadata["idat_log_path"] = to_wsl_path(idat_log_path)
         metadata["headless_mode"] = "gui-hidden" if use_gui_hidden else "idat"
+        metadata["opened_existing_idb"] = existing_idb
         metadata["connect_host"] = endpoint_host
         metadata["connect_host_candidates"] = connect_hosts
         metadata["bootstrap_root"] = to_wsl_path(bootstrap_root)
@@ -396,6 +458,36 @@ class IdaLauncher:
             port=port,
             pid=pid,
             metadata=metadata,
+        )
+
+    def launch_headless(self, binary_path: str, manager_url: str, *, allow_existing_idb: bool = True) -> PendingLaunch:
+        binary_windows, display_path, metadata = self._prepare_binary_path(
+            binary_path,
+            always_stage=True,
+            allow_existing_idb=allow_existing_idb,
+        )
+        staged_idb_path = str(metadata.get("staged_idb_path") or "")
+        existing_idb = allow_existing_idb and bool(metadata.get("staged_from_existing_idb")) and bool(staged_idb_path)
+        open_path_windows = to_windows_path(staged_idb_path) if existing_idb else binary_windows
+        idb_path = to_windows_path(staged_idb_path) if existing_idb else f"{binary_windows}.i64"
+        return self._launch_headless_open_path(
+            open_path_windows=open_path_windows,
+            display_path=display_path,
+            idb_path=idb_path,
+            metadata=metadata,
+            manager_url=manager_url,
+            existing_idb=existing_idb,
+        )
+
+    def launch_headless_idb(self, idb_path: str, manager_url: str) -> PendingLaunch:
+        idb_windows, display_path, metadata = self._prepare_idb_path(idb_path, always_stage=True)
+        return self._launch_headless_open_path(
+            open_path_windows=idb_windows,
+            display_path=display_path,
+            idb_path=idb_windows,
+            metadata=metadata,
+            manager_url=manager_url,
+            existing_idb=True,
         )
 
     def list_idat_pids(self) -> list[int]:
@@ -424,13 +516,26 @@ class IdaLauncher:
                 continue
         return terminated
 
-    def launch_gui(self, binary_path: str) -> PendingLaunch:
-        binary_windows, display_path, metadata = self._prepare_binary_path(binary_path)
+    def launch_gui(self, binary_path: str, *, allow_existing_idb: bool = True) -> PendingLaunch:
+        binary_windows, display_path, metadata = self._prepare_binary_path(binary_path, allow_existing_idb=allow_existing_idb)
         pid = self._start_process(self.ida_gui, [binary_windows], hidden=False)
         return PendingLaunch(
             launch_token=f"gui-{uuid.uuid4().hex[:12]}",
             binary_path=display_path,
             idb_path=f"{binary_windows}.i64",
+            engine="gui",
+            port=None,
+            pid=pid,
+            metadata=metadata,
+        )
+
+    def launch_gui_idb(self, idb_path: str) -> PendingLaunch:
+        idb_windows, display_path, metadata = self._prepare_idb_path(idb_path)
+        pid = self._start_process(self.ida_gui, [idb_windows], hidden=False)
+        return PendingLaunch(
+            launch_token=f"gui-{uuid.uuid4().hex[:12]}",
+            binary_path=display_path,
+            idb_path=idb_windows,
             engine="gui",
             port=None,
             pid=pid,

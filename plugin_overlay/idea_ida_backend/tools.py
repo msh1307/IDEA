@@ -908,6 +908,21 @@ def _workflow_entries_ok(group: list[Any]) -> bool:
     return True
 
 
+def _workflow_entries_changed(group: list[Any]) -> int:
+    count = 0
+    for entry in group:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("ok") is True:
+            count += 1
+        elif "ok_count" in entry and int(entry.get("ok_count") or 0) > 0:
+            count += int(entry.get("ok_count") or 0)
+        nested = entry.get("items")
+        if isinstance(nested, list):
+            count += _workflow_entries_changed(nested)
+    return count
+
+
 def _read_display_value(ea: int, size: int, type_name: str = "") -> str:
     if size <= 0:
         return ""
@@ -2961,6 +2976,12 @@ def type_workflow(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         for _group_name, group in results.items()
         if isinstance(group, list)
     )
+    results["changed_count"] = (
+        _workflow_entries_changed(results["decls"])
+        + _workflow_entries_changed(results["structs"])
+        + _workflow_entries_changed(results["applies"])
+    )
+    results["db_changed"] = results["changed_count"] > 0
     return results
 
 
