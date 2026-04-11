@@ -55,20 +55,38 @@ def _outer_structured(payload: dict[str, Any]) -> Any:
     return payload.get("structuredContent")
 
 
+def _content_text(payload: dict[str, Any]) -> str:
+    chunks: list[str] = []
+    for item in payload.get("content") or []:
+        if isinstance(item, dict) and item.get("type") == "text":
+            chunks.append(str(item.get("text") or ""))
+    return "\n".join(chunk for chunk in chunks if chunk).strip()
+
+
 def _inner_structured(payload: dict[str, Any]) -> Any:
     structured = payload.get("structuredContent")
     if isinstance(structured, dict) and "structuredContent" in structured:
-        return structured["structuredContent"]
+        structured = structured["structuredContent"]
+    if isinstance(structured, dict) and "result" in structured and len(structured) == 1:
+        return structured["result"]
     return structured
 
 
 def _outer_meta(payload: dict[str, Any]) -> dict[str, Any]:
-    structured = payload.get("structuredContent")
-    if isinstance(structured, dict):
-        meta = structured.get("meta")
-        if isinstance(meta, dict):
-            return meta
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        return meta
     return {}
+
+
+def _meta_revision(meta: dict[str, Any]) -> dict[str, Any]:
+    revision = meta.get("revision")
+    return revision if isinstance(revision, dict) else {}
+
+
+def _meta_txid(meta: dict[str, Any]) -> int:
+    revision = _meta_revision(meta)
+    return int(revision.get("txid") or 0)
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -162,17 +180,29 @@ async def main(target: str) -> int:
             _assert(not missing, f"Missing manager tools: {missing}")
             print(f"TOOLS ok count={len(tool_names)}")
 
+            misuse_resp = (await session.call_tool("open_binary", {"path": "/tmp/example.i64", "mode": "headless"})).model_dump(mode="json")
+            misuse_data = _outer_structured(misuse_resp) or {}
+            _assert(misuse_resp.get("isError") is True, f"open_binary(.i64) should be an MCP error: {_json(misuse_resp)}")
+            _assert(misuse_data.get("ok") is False and "load_idb" in str(misuse_data.get("error") or ""), f"open_binary(.i64) error payload unexpected: {_json(misuse_resp)}")
+            print("OPEN misuse error ok")
+
             opened = await call_tool(session, "open_binary", {"path": target, "mode": "headless", "reuse": False})
             open_data = _outer_structured(opened) or {}
+            open_text = _content_text(opened)
+            open_meta = _outer_meta(opened)
             _assert(open_data.get("ok") is True, f"open_binary failed: {_json(open_data)}")
             session_id = str(open_data.get("session_id") or "")
             _assert(session_id, "open_binary did not return a session_id")
+            _assert(open_meta.get("content_mode") == "summary", f"open_binary missing summary mode: {_json(opened)}")
+            _assert(open_text and len(open_text) < 120 and "{" not in open_text, f"open_binary content is not a short summary: {_json(opened)}")
             open_revision = open_data.get("revision") or {}
-            _assert(int(open_revision.get("txid") or 0) == int(open_data.get("txid") or 0), f"open_binary revision mismatch: {_json(open_data)}")
-            _assert(int(open_revision.get("snapshot_txid") or 0) == int(open_data.get("txid") or 0), f"open_binary snapshot mismatch: {_json(open_data)}")
+            _assert(int(open_revision.get("txid") or 0) == 0, f"open_binary revision mismatch: {_json(open_data)}")
+            _assert(int(open_revision.get("snapshot_txid") or 0) == int(open_revision.get("txid") or 0), f"open_binary snapshot mismatch: {_json(open_data)}")
+            for field in ("txid", "snapshot_txid", "requires_refresh", "attached_client_count", "last_writer_client_id"):
+                _assert(field not in open_data, f"open_binary leaked flat revision field {field}: {_json(open_data)}")
             print(f"OPEN ok session_id={session_id}")
 
-            observer_stale_txid = int(open_data.get("txid") or 0)
+            observer_stale_txid = int(open_revision.get("txid") or 0)
             try:
                 async with stdio_client(params) as (read2, write2):
                     async with ClientSession(read2, write2) as observer:
@@ -188,8 +218,8 @@ async def main(target: str) -> int:
                         observer_session = observer_current_data.get("session") or {}
                         _assert(observer_session.get("session_id") == session_id, f"observer current_session mismatch: {_json(observer_current_data)}")
                         observer_revision = observer_session.get("revision") or {}
-                        _assert(int(observer_revision.get("txid") or 0) == int(observer_session.get("txid") or 0), f"observer revision mismatch: {_json(observer_current_data)}")
-                        observer_stale_txid = int(observer_session.get("txid") or observer_stale_txid)
+                        _assert(int(observer_revision.get("txid") or 0) == observer_stale_txid, f"observer revision mismatch: {_json(observer_current_data)}")
+                        observer_stale_txid = int(observer_revision.get("txid") or observer_stale_txid)
                         print(f"OBSERVER attach ok txid={observer_stale_txid}")
 
                         session_tools = await call_tool(session, "list_session_tools", {"session_id": session_id})
@@ -221,7 +251,28 @@ async def main(target: str) -> int:
                         func_name = str(func.get("name") or "")
                         print(f"FUNCTION ok {func_name} @ {func_addr}")
 
+                        decompile_preview_resp = await call_tool(session, "decompile", {"session_id": session_id, "addr": func_addr})
+                        decompile_preview = _outer_structured(decompile_preview_resp) or {}
+                        decompile_preview_meta = _outer_meta(decompile_preview_resp)
+                        decompile_preview_text = _content_text(decompile_preview_resp)
+                        preview_code = str(decompile_preview.get("code") or "")
+                        _assert(decompile_preview_meta.get("content_mode") == "summary", f"decompile missing summary mode: {_json(decompile_preview_resp)}")
+                        _assert(decompile_preview.get("mode") == "decompile" and preview_code, f"decompile missing code payload: {_json(decompile_preview)}")
+                        _assert(
+                            decompile_preview_text.startswith("decompile ") and len(decompile_preview_text) < min(len(preview_code), 160),
+                            f"decompile content is not slim summary text: {_json(decompile_preview_resp)}",
+                        )
+                        _assert("session_txid" not in decompile_preview_meta, f"decompile leaked legacy flat meta: {_json(decompile_preview_meta)}")
+                        print("DECOMPILE envelope ok")
+
+                        decompile_full_resp = await call_tool(session, "decompile", {"session_id": session_id, "addr": func_addr, "detail": "full"})
+                        decompile_full = _inner_structured(decompile_full_resp) or {}
+                        _assert(isinstance(decompile_full.get("line_map"), dict), f"decompile(detail=full) missing line_map: {_json(decompile_full)}")
+                        print("DECOMPILE full ok")
+
                         lookup_resp = await call_tool(session, "lookup_funcs", {"session_id": session_id, "queries": [func_name]})
+                        lookup_outer = _outer_structured(lookup_resp) or {}
+                        _assert(isinstance(lookup_outer, dict) and isinstance(lookup_outer.get("result"), list), f"lookup_funcs should wrap list payloads under structuredContent.result: {_json(lookup_resp)}")
                         lookup = _inner_structured(lookup_resp) or []
                         first_lookup = _first(lookup, "lookup_funcs returned no rows")
                         lookup_matches = first_lookup.get("matches") or []
@@ -238,6 +289,13 @@ async def main(target: str) -> int:
                         instructions = disasm_payload.get("instructions") or []
                         _assert(instructions, f"inspect returned no disassembly: {_json(inspect_payload)}")
                         print(f"INSPECT ok instructions={len(instructions)}")
+
+                        inspect_full_resp = await call_tool(session, "inspect", {"session_id": session_id, "addr": func_addr, "detail": "full", "max_instructions": 12})
+                        inspect_full = _inner_structured(inspect_full_resp) or {}
+                        _assert(isinstance(inspect_full.get("decompile"), dict), f"inspect(detail=full) missing decompile payload: {_json(inspect_full)}")
+                        _assert(isinstance(inspect_full.get("disasm"), dict), f"inspect(detail=full) missing disasm payload: {_json(inspect_full)}")
+                        _assert(isinstance(inspect_full.get("line_map"), dict), f"inspect(detail=full) missing line_map payload: {_json(inspect_full)}")
+                        print("INSPECT full ok")
 
                         enclosing_resp = await call_tool(session, "get_enclosing_function", {"session_id": session_id, "addr": func_addr})
                         enclosing = _inner_structured(enclosing_resp) or {}
@@ -333,6 +391,22 @@ async def main(target: str) -> int:
                         _assert("segment" in first_search_full_item and "name" in first_search_full_item, f"search(text, full) missing metadata: {_json(first_search_full_item)}")
                         print("SEARCH text full ok")
 
+                        search_text_detail_resp = await call_tool(
+                            session,
+                            "search",
+                            {
+                                "session_id": session_id,
+                                "kind": "text",
+                                "query": _slice_query(string_value),
+                                "detail": "full",
+                                "arguments": {"kinds": ["strings"], "limit": 5},
+                            },
+                        )
+                        search_text_detail = _inner_structured(search_text_detail_resp) or {}
+                        first_search_detail_item = _first(search_text_detail.get("items") or [], "search(text, detail=full) returned no items")
+                        _assert("segment" in first_search_detail_item and "name" in first_search_detail_item, f"search(text, detail=full) missing metadata: {_json(first_search_detail_item)}")
+                        print("SEARCH detail full ok")
+
                         regex_pattern = re.escape(_slice_query(string_value))
                         search_regex_resp = await call_tool(
                             session,
@@ -400,20 +474,46 @@ async def main(target: str) -> int:
                             "define",
                             {"session_id": session_id, "kind": "type", "arguments": {"decl": "typedef unsigned __int64 regression_u64;"}},
                         )
+                        declare_type_outer = _outer_structured(declare_type_resp) or {}
+                        _assert(isinstance(declare_type_outer, dict) and isinstance(declare_type_outer.get("result"), list), f"define(type) should wrap list payloads under structuredContent.result: {_json(declare_type_resp)}")
                         declare_type = _inner_structured(declare_type_resp) or []
                         first_decl = _first(declare_type, "define(type decl) returned no rows")
                         _assert(first_decl.get("ok") is True, f"define(type decl) failed: {_json(declare_type)}")
                         declare_meta = _outer_meta(declare_type_resp)
                         _assert(isinstance(declare_meta.get("revision"), dict), f"define(type) missing revision meta: {_json(declare_meta)}")
-                        current_txid = int(declare_meta.get("session_txid") or 0)
+                        _assert("session_txid" not in declare_meta, f"define(type) leaked legacy flat revision meta: {_json(declare_meta)}")
+                        current_txid = _meta_txid(declare_meta)
                         _assert(current_txid > observer_stale_txid, f"txid did not advance after mutation: {_json(declare_meta)}")
                         print(f"DEFINE type ok txid={current_txid}")
+
+                        apply_decl_resp = await call_tool(
+                            session,
+                            "call_session_tool",
+                            {
+                                "session_id": session_id,
+                                "tool_name": "apply_decl",
+                                "arguments": {
+                                    "addr": func_addr,
+                                    "decl": "regression_apply_u64 __fastcall regression_apply_fn(regression_apply_u64 a1);",
+                                    "supporting_decls": ["typedef unsigned __int64 regression_apply_u64;"],
+                                },
+                            },
+                        )
+                        apply_decl_data = _inner_structured(apply_decl_resp) or {}
+                        _assert(apply_decl_data.get("ok") is True, f"apply_decl with supporting_decls failed: {_json(apply_decl_data)}")
+                        supporting_decl_rows = apply_decl_data.get("supporting_decls") or []
+                        first_supporting_decl = _first(supporting_decl_rows, f"apply_decl missing supporting declarations: {_json(apply_decl_data)}")
+                        _assert(first_supporting_decl.get("ok") is True, f"apply_decl supporting declaration failed: {_json(apply_decl_data)}")
+                        apply_decl_meta = _outer_meta(apply_decl_resp)
+                        current_txid = _meta_txid(apply_decl_meta) or current_txid
+                        print("APPLY_DECL supporting_decls ok")
 
                         observer_stale_state_resp = await call_tool(observer, "current_session", {})
                         observer_stale_state = _outer_structured(observer_stale_state_resp) or {}
                         observer_stale_session = observer_stale_state.get("session") or {}
-                        _assert(observer_stale_session.get("requires_refresh") is True, f"observer session did not report stale snapshot: {_json(observer_stale_state)}")
-                        _assert(int(observer_stale_session.get("snapshot_txid") or 0) == observer_stale_txid, f"observer snapshot txid drifted unexpectedly: {_json(observer_stale_state)}")
+                        observer_stale_revision = observer_stale_session.get("revision") or {}
+                        _assert(observer_stale_revision.get("requires_refresh") is True, f"observer session did not report stale snapshot: {_json(observer_stale_state)}")
+                        _assert(int(observer_stale_revision.get("snapshot_txid") or 0) == observer_stale_txid, f"observer snapshot txid drifted unexpectedly: {_json(observer_stale_state)}")
                         print("REFRESH state flagged ok")
 
                         stale_write_resp = await call_tool(
@@ -435,11 +535,12 @@ async def main(target: str) -> int:
                             {"session_id": session_id, "tool_name": "get_metadata", "arguments": {}},
                         )
                         observer_refresh_meta = _outer_meta(observer_refresh_resp)
-                        _assert(int(observer_refresh_meta.get("session_txid") or 0) == current_txid, f"observer refresh did not pick up new txid: {_json(observer_refresh_meta)}")
+                        _assert(_meta_txid(observer_refresh_meta) == current_txid, f"observer refresh did not pick up new txid: {_json(observer_refresh_meta)}")
                         observer_refreshed_state_resp = await call_tool(observer, "current_session", {})
                         observer_refreshed_state = _outer_structured(observer_refreshed_state_resp) or {}
                         observer_refreshed_session = observer_refreshed_state.get("session") or {}
-                        _assert(observer_refreshed_session.get("requires_refresh") is False, f"observer session stayed stale after refresh: {_json(observer_refreshed_state)}")
+                        observer_refreshed_revision = observer_refreshed_session.get("revision") or {}
+                        _assert(observer_refreshed_revision.get("requires_refresh") is False, f"observer session stayed stale after refresh: {_json(observer_refreshed_state)}")
                         print("REFRESH clear ok")
 
                         observer_reuse_resp = await call_tool(
@@ -478,7 +579,7 @@ async def main(target: str) -> int:
                         define_struct = _inner_structured(define_struct_resp) or {}
                         _assert(define_struct.get("ok") is True, f"define(struct) failed: {_json(define_struct)}")
                         define_struct_meta = _outer_meta(define_struct_resp)
-                        next_txid = int(define_struct_meta.get("session_txid") or 0)
+                        next_txid = _meta_txid(define_struct_meta)
                         _assert(next_txid > current_txid, f"define(struct) did not advance txid: {_json(define_struct_meta)}")
                         current_txid = next_txid
                         print(f"DEFINE struct ok {struct_name}")
@@ -500,7 +601,7 @@ async def main(target: str) -> int:
                         duplicate_struct = _inner_structured(duplicate_struct_resp) or {}
                         _assert(duplicate_struct.get("ok") is False, f"duplicate define(struct) unexpectedly succeeded: {_json(duplicate_struct)}")
                         duplicate_struct_meta = _outer_meta(duplicate_struct_resp)
-                        _assert(int(duplicate_struct_meta.get("session_txid") or 0) == current_txid, f"failed mutator incorrectly advanced txid: {_json(duplicate_struct_meta)}")
+                        _assert(_meta_txid(duplicate_struct_meta) == current_txid, f"failed mutator incorrectly advanced txid: {_json(duplicate_struct_meta)}")
                         print("FAILED mutator no-bump ok")
 
                         padded_struct_name = f"regression_padded_{int(time.time())}"
@@ -524,7 +625,7 @@ async def main(target: str) -> int:
                         _assert(padded_struct.get("ok") is True, f"create_padded_struct_from_map failed: {_json(padded_struct)}")
                         _assert("__pad_" in str(padded_struct.get("decl") or ""), f"create_padded_struct_from_map did not add padding: {_json(padded_struct)}")
                         padded_struct_meta = _outer_meta(padded_struct_resp)
-                        next_txid = int(padded_struct_meta.get("session_txid") or 0)
+                        next_txid = _meta_txid(padded_struct_meta)
                         _assert(next_txid > current_txid, f"create_padded_struct_from_map did not advance txid: {_json(padded_struct_meta)}")
                         current_txid = next_txid
                         print(f"CREATE_PADDED_STRUCT ok {padded_struct_name}")
@@ -545,7 +646,7 @@ async def main(target: str) -> int:
                         upsert_struct = _inner_structured(upsert_struct_resp) or {}
                         _assert(upsert_struct.get("ok") is True, f"upsert_struct failed: {_json(upsert_struct)}")
                         upsert_struct_meta = _outer_meta(upsert_struct_resp)
-                        next_txid = int(upsert_struct_meta.get("session_txid") or 0)
+                        next_txid = _meta_txid(upsert_struct_meta)
                         _assert(next_txid > current_txid, f"upsert_struct did not advance txid: {_json(upsert_struct_meta)}")
                         current_txid = next_txid
                         print("UPSERT_STRUCT ok")
@@ -562,10 +663,30 @@ async def main(target: str) -> int:
                         apply_many = _inner_structured(apply_many_resp) or {}
                         _assert((apply_many.get("ok_count") or 0) >= 1, f"apply_struct_to_many failed: {_json(apply_many)}")
                         apply_many_meta = _outer_meta(apply_many_resp)
-                        next_txid = int(apply_many_meta.get("session_txid") or 0)
+                        next_txid = _meta_txid(apply_many_meta)
                         _assert(next_txid > current_txid, f"apply_struct_to_many did not advance txid: {_json(apply_many_meta)}")
                         current_txid = next_txid
                         print("APPLY_STRUCT_TO_MANY ok")
+
+                        read_struct_resp = await call_tool(
+                            session,
+                            "read",
+                            {"session_id": session_id, "kind": "struct", "addr": string_addr, "arguments": {"struct_name": padded_struct_name}},
+                        )
+                        read_struct = _inner_structured(read_struct_resp) or {}
+                        read_struct_member = _first(read_struct.get("members") or [], "read(struct) returned no members")
+                        _assert("bytes" not in read_struct_member, f"read(struct) default is not slim: {_json(read_struct_member)}")
+                        print("READ struct ok")
+
+                        read_struct_full_resp = await call_tool(
+                            session,
+                            "read",
+                            {"session_id": session_id, "kind": "struct", "addr": string_addr, "detail": "full", "arguments": {"struct_name": padded_struct_name}},
+                        )
+                        read_struct_full = _inner_structured(read_struct_full_resp) or {}
+                        read_struct_full_member = _first(read_struct_full.get("members") or [], "read(struct, full) returned no members")
+                        _assert("bytes" in read_struct_full_member, f"read(struct, detail=full) missing bytes metadata: {_json(read_struct_full_member)}")
+                        print("READ struct full ok")
 
                         raw_stale_mutator_resp = await call_tool(
                             observer,
@@ -602,7 +723,7 @@ async def main(target: str) -> int:
                         _assert(workflow_partial.get("ok") is False, f"type_workflow partial expected overall false: {_json(workflow_partial)}")
                         _assert(workflow_partial.get("db_changed") is True, f"type_workflow partial missing db_changed: {_json(workflow_partial)}")
                         workflow_partial_meta = _outer_meta(workflow_partial_resp)
-                        next_txid = int(workflow_partial_meta.get("session_txid") or 0)
+                        next_txid = _meta_txid(workflow_partial_meta)
                         _assert(next_txid > current_txid, f"type_workflow partial success did not advance txid: {_json(workflow_partial_meta)}")
                         current_txid = next_txid
                         print("TYPE_WORKFLOW partial bump ok")
@@ -621,7 +742,7 @@ async def main(target: str) -> int:
                         workflow_fail = _inner_structured(workflow_fail_resp) or {}
                         _assert(workflow_fail.get("ok") is False and workflow_fail.get("db_changed") is False, f"type_workflow fail expected no db change: {_json(workflow_fail)}")
                         workflow_fail_meta = _outer_meta(workflow_fail_resp)
-                        _assert(int(workflow_fail_meta.get("session_txid") or 0) == current_txid, f"type_workflow fail incorrectly advanced txid: {_json(workflow_fail_meta)}")
+                        _assert(_meta_txid(workflow_fail_meta) == current_txid, f"type_workflow fail incorrectly advanced txid: {_json(workflow_fail_meta)}")
                         print("TYPE_WORKFLOW fail no-bump ok")
 
                         export_struct_resp = await call_tool(
@@ -698,6 +819,27 @@ async def main(target: str) -> int:
                         _assert(str(typed_export.get("code") or ""), f"typed_decompile_export returned empty code: {_json(typed_export)}")
                         _assert("line_map" in typed_export, f"typed_decompile_export missing line_map: {_json(typed_export)}")
                         print("TYPED_DECOMPILE_EXPORT ok")
+
+                        write_output_path = f"/mnt/c/Windows/Temp/regression_decompile_{int(time.time())}.txt"
+                        write_output_resp = await call_tool(
+                            session,
+                            "write_session_tool_output",
+                            {
+                                "session_id": session_id,
+                                "path": write_output_path,
+                                "tool_name": "decompile",
+                                "arguments": {"addr": func_addr},
+                                "output_format": "text",
+                                "overwrite": True,
+                            },
+                        )
+                        write_output_data = _outer_structured(write_output_resp) or {}
+                        rendered_path = _normalize_test_path(str(write_output_data.get("path") or write_output_path))
+                        with open(rendered_path, "r", encoding="utf-8") as handle:
+                            rendered_text = handle.read()
+                        _assert('"mode": "decompile"' in rendered_text and '"code": ' in rendered_text, "write_session_tool_output(text) did not render the full structured payload")
+                        _assert(rendered_text.strip() != decompile_preview_text.strip(), "write_session_tool_output(text) unexpectedly rendered only the slim summary")
+                        print("WRITE_SESSION_TOOL_OUTPUT ok")
 
                         second = func_instructions[1]
                         third = func_instructions[2] if len(func_instructions) > 2 else None

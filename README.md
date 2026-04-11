@@ -87,7 +87,10 @@ Useful tools:
 - backend raw tools now include `decompile`, `disasm`, `get_xrefs_to`, `get_xrefs_from`, `list_strings`, `find_bytes`, `find_text`, `find_immediates`, `find_insns`, `get_data_item`, `read_bytes`, `read_byte`, `read_word`, `read_dword`, `read_qword`, `read_array`, `hex_dump`, `set_type`, `create_struct`, `apply_struct`, and `make_array`
 - Session-bearing responses now expose a canonical `revision` block:
   `txid`, `snapshot_txid`, `requires_refresh`, `attached_client_count`, `last_writer_client_id`
-- Legacy flat fields like `txid`, `snapshot_txid`, and `requires_refresh` may still appear for compatibility, but `revision` should be treated as canonical.
+- Raw backend tool results now use `content` as a short summary and keep full payloads in `structuredContent` to avoid duplicating large responses like decompilation text.
+- Public MCP tool results always expose `structuredContent` as an object. If the underlying payload is a list or scalar, it is wrapped as `structuredContent.result`.
+- Tool-result metadata also uses `revision` as the canonical session state block instead of repeating flat session revision fields.
+- High-level analysis tools now treat `full=true` (or `detail="full"`) as the common expansion switch. Defaults stay slim; `full` opts into heavier fields such as line maps or raw member bytes when supported by the tool.
 - Mutating tool calls can pass `expected_txid` to reject stale writes and `force=true` to suppress stale warnings when best-effort continuation is intended.
 - `close_session(..., force=true)` bypasses attached-client / in-flight-op guards and should be reserved for explicit teardown.
 - `type_workflow` now reports `db_changed` and `changed_count`, so partial-success workflows can still advance session revision while all-failure workflows do not.

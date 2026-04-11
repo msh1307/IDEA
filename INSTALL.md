@@ -96,5 +96,9 @@ From WSL:
 - Codex MCP configs are not hot-reloaded. Restart Codex after `config.toml` changes.
 - If IDA was already open when you patched the plugin, restart IDA or reopen the IDB.
 - Session-bearing responses expose a canonical `revision` block with `txid`, `snapshot_txid`, `requires_refresh`, `attached_client_count`, and `last_writer_client_id`.
+- Raw backend tool results now keep only a short summary in `content`; the full payload lives in `structuredContent`.
+- Public MCP tool results always keep `structuredContent` as an object. List/scalar payloads are wrapped under `structuredContent.result`.
+- Tool-result metadata also uses `revision` as the canonical session state block instead of repeating flat revision fields.
+- High-level analysis tools share a common `full=true` / `detail="full"` expansion flag. Default responses stay slim and `full` opts into heavier metadata when the underlying tool supports it.
 - Mutating calls may pass `expected_txid` to reject stale writes. `force=true` is available for teardown or best-effort write continuation when you explicitly want to bypass stale warnings / close guards.
 - `type_workflow` now reports `db_changed` and `changed_count`, and session revision only advances when the workflow actually changes the database.

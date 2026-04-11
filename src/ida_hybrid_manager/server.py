@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import AsyncExitStack
 import fcntl
 import hashlib
 from io import TextIOWrapper
@@ -24,7 +25,9 @@ import uuid
 import anyio
 import mcp.types as mcp_types
 from mcp.server.fastmcp import FastMCP
+from mcp.server.session import ServerSession
 from mcp.shared.message import SessionMessage
+from mcp.shared.session import RequestResponder
 
 from .backend import BackendUnavailableError, call_backend_tool_any, list_backend_tools_any
 from .launch import IdaLauncher
@@ -126,6 +129,9 @@ def _compute_daemon_build_token() -> str:
 
 
 DAEMON_BUILD_TOKEN = _compute_daemon_build_token()
+STDIO_IDLE_TIMEOUT_SEC = max(0, int(os.getenv("IDA_MCP_STDIO_IDLE_TIMEOUT_SEC", "600") or 0))
+STDIO_PING_TIMEOUT_SEC = max(1.0, float(os.getenv("IDA_MCP_STDIO_PING_TIMEOUT_SEC", "10") or 10.0))
+STDIO_IDLE_CHECK_INTERVAL_SEC = max(5.0, min(60.0, float(os.getenv("IDA_MCP_STDIO_IDLE_CHECK_INTERVAL_SEC", "30") or 30.0)))
 
 
 async def _run_stdio_server() -> None:
@@ -134,12 +140,16 @@ async def _run_stdio_server() -> None:
     stdout = anyio.wrap_file(TextIOWrapper(sys.stdout.buffer, encoding="utf-8"))
     read_stream_writer, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](0)
     write_stream, write_stream_reader = anyio.create_memory_object_stream[SessionMessage](0)
+    last_activity_at = time.monotonic()
+    active_requests = 0
 
     async def stdin_reader() -> None:
+        nonlocal last_activity_at
         _stdio_debug("stdin_reader start")
         try:
             async with read_stream_writer:
                 async for line in stdin:
+                    last_activity_at = time.monotonic()
                     _stdio_debug(f"stdin line: {line[:200]!r}")
                     try:
                         message = mcp_types.JSONRPCMessage.model_validate_json(line)
@@ -171,21 +181,75 @@ async def _run_stdio_server() -> None:
         finally:
             _stdio_debug("stdout_writer stop")
 
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(stdin_reader)
-        tg.start_soon(stdout_writer)
-        _stdio_debug("stdio transport ready")
-        try:
-                await mcp._mcp_server.run(
-                    read_stream,
-                    write_stream,
-                    mcp._mcp_server.create_initialization_options(),
-                    raise_exceptions=False,
+    async with AsyncExitStack() as stack:
+        lifespan_context = await stack.enter_async_context(mcp._mcp_server.lifespan(mcp._mcp_server))
+        session = await stack.enter_async_context(
+            ServerSession(
+                read_stream,
+                write_stream,
+                mcp._mcp_server.create_initialization_options(),
+            )
+        )
+        task_support = mcp._mcp_server._experimental_handlers.task_support if mcp._mcp_server._experimental_handlers else None
+        if task_support is not None:
+            task_support.configure_session(session)
+            await stack.enter_async_context(task_support.run())
+
+        async def handle_message(
+            message: RequestResponder[mcp_types.ClientRequest, mcp_types.ServerResult] | mcp_types.ClientNotification | Exception,
+        ) -> None:
+            nonlocal active_requests, last_activity_at
+            is_request = isinstance(message, RequestResponder)
+            if is_request:
+                active_requests += 1
+            try:
+                await mcp._mcp_server._handle_message(
+                    message,
+                    session,
+                    lifespan_context,
+                    False,
                 )
-        except Exception as exc:
-            _stdio_debug(f"stdio server exception: {exc!r}")
-            _stdio_debug(traceback.format_exc())
-            raise
+            finally:
+                last_activity_at = time.monotonic()
+                if is_request:
+                    active_requests = max(0, active_requests - 1)
+
+        async def idle_monitor() -> None:
+            nonlocal last_activity_at
+            if STDIO_IDLE_TIMEOUT_SEC <= 0:
+                return
+            while True:
+                await anyio.sleep(STDIO_IDLE_CHECK_INTERVAL_SEC)
+                if active_requests > 0:
+                    continue
+                if session.client_params is None:
+                    continue
+                idle_for = time.monotonic() - last_activity_at
+                if idle_for < STDIO_IDLE_TIMEOUT_SEC:
+                    continue
+                _stdio_debug(f"idle heartbeat start idle_sec={idle_for:.1f}")
+                try:
+                    with anyio.fail_after(STDIO_PING_TIMEOUT_SEC):
+                        await session.send_ping()
+                    last_activity_at = time.monotonic()
+                    _stdio_debug("idle heartbeat ok")
+                except Exception as exc:
+                    _stdio_debug(f"idle heartbeat failed: {exc!r}")
+                    raise
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(stdin_reader)
+            tg.start_soon(stdout_writer)
+            tg.start_soon(idle_monitor)
+            _stdio_debug("stdio transport ready")
+            try:
+                async for message in session.incoming_messages:
+                    last_activity_at = time.monotonic()
+                    tg.start_soon(handle_message, message)
+            except Exception as exc:
+                _stdio_debug(f"stdio server exception: {exc!r}")
+                _stdio_debug(traceback.format_exc())
+                raise
 
 
 def manager_url() -> str:
@@ -210,6 +274,7 @@ def _client_disconnect(client_id: str | None) -> dict[str, Any]:
             detached_session_id = _client_current_sessions.pop(client_id, None)
     detached_records = registry.detach_client(client_id)
     auto_closed: list[str] = []
+    auto_close_errors: list[dict[str, Any]] = []
     for record in detached_records:
         if record.status == "dead":
             continue
@@ -220,11 +285,18 @@ def _client_disconnect(client_id: str | None) -> dict[str, Any]:
             continue
         try:
             _terminate_session_record(closable, save=True, reason="last_client_detached")
-        except Exception:
+        except Exception as exc:
             registry.cancel_close(record.session_id)
-            raise
+            auto_close_errors.append({"session_id": record.session_id, "error": str(exc)})
+            continue
         auto_closed.append(record.session_id)
-    return {"ok": True, "client_id": client_id, "detached_session_id": detached_session_id, "auto_closed_session_ids": auto_closed}
+    return {
+        "ok": True,
+        "client_id": client_id,
+        "detached_session_id": detached_session_id,
+        "auto_closed_session_ids": auto_closed,
+        "auto_close_errors": auto_close_errors,
+    }
 
 
 def _client_get_current_session_id(client_id: str | None) -> str | None:
@@ -276,9 +348,24 @@ def _session_revision_payload(record, client_id: str | None) -> dict[str, Any]:
 
 def _session_to_client_dict(record, client_id: str | None) -> dict[str, Any]:
     data = record.to_dict()
+    for key in (
+        "txid",
+        "attached_client_count",
+        "last_writer_client_id",
+        "capabilities",
+        "endpoint",
+        "owner_pid",
+        "metadata",
+        "created_at",
+        "last_seen",
+        "last_write_at",
+        "active_ops",
+    ):
+        data.pop(key, None)
     data["current"] = bool(client_id and record.session_id == _client_get_current_session_id(client_id))
-    data.update(_client_session_refresh_state(record, client_id))
     data["revision"] = _session_revision_payload(record, client_id)
+    if client_id:
+        data["attached"] = bool(client_id in record.attached_clients)
     return data
 
 
@@ -505,6 +592,16 @@ def _merge_payload(arguments: Any = None, **explicit: Any) -> dict[str, Any]:
     return payload
 
 
+def _merge_detail_payload(arguments: Any = None, *, full: bool = False, detail: str = "", **explicit: Any) -> dict[str, Any]:
+    payload = _merge_payload(arguments, **explicit)
+    normalized_detail = str(detail or "").strip().lower()
+    if full:
+        payload["full"] = True
+    if normalized_detail:
+        payload["detail"] = normalized_detail
+    return payload
+
+
 def _resolve_output_path(path: str) -> Path:
     normalized = normalize_path(path)
     target = Path(normalized.wsl_path).expanduser()
@@ -603,11 +700,6 @@ def _augment_session_meta(result: dict[str, Any], record, *, client_id: str | No
     meta.update(
         {
             "session_id": record.session_id,
-            "session_txid": revision["txid"],
-            "attached_client_count": revision["attached_client_count"],
-            "client_snapshot_txid": revision["snapshot_txid"],
-            "requires_refresh": revision["requires_refresh"],
-            "last_writer_client_id": revision["last_writer_client_id"],
             "revision": revision,
         }
     )
@@ -620,6 +712,11 @@ def _augment_session_meta(result: dict[str, Any], record, *, client_id: str | No
 def _render_tool_result(result: dict[str, Any], output_format: str) -> str:
     if output_format == "json":
         return json.dumps(result, ensure_ascii=False, indent=2)
+    meta = result.get("meta")
+    if isinstance(meta, dict) and meta.get("content_mode") == "summary":
+        structured = result.get("structuredContent")
+        if structured is not None:
+            return json.dumps(structured, ensure_ascii=False, indent=2) + "\n"
     content = result.get("content")
     if isinstance(content, list):
         text_chunks = []
@@ -634,10 +731,55 @@ def _render_tool_result(result: dict[str, Any], output_format: str) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2) + "\n"
 
 
+def _trim_summary_text(text: str, limit: int = 120) -> str:
+    normalized = str(text or "").strip().replace("\n", " ")
+    if not normalized:
+        return "result"
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(1, limit - 3)] + "..."
+
+
+def _summary_text(payload: Any) -> str:
+    if isinstance(payload, dict):
+        session_id = str(payload.get("session_id") or "").strip()
+        engine = str(payload.get("engine") or "").strip()
+        status = str(payload.get("status") or "").strip()
+        if session_id and engine:
+            bits = [engine, session_id]
+            if status:
+                bits.append(status)
+            return _trim_summary_text(" ".join(bits))
+        if "session" in payload and isinstance(payload.get("session"), dict):
+            return _summary_text(payload.get("session") or {})
+        if "sessions" in payload and isinstance(payload.get("sessions"), list):
+            return _trim_summary_text(f"sessions={len(payload.get('sessions') or [])}")
+        if "matches" in payload and isinstance(payload.get("matches"), list):
+            return _trim_summary_text(f"matches={len(payload.get('matches') or [])}")
+        if "ok" in payload:
+            parts = [f"ok={bool(payload.get('ok'))}"]
+            if session_id:
+                parts.append(f"session_id={session_id}")
+            if status:
+                parts.append(f"status={status}")
+            if payload.get("error"):
+                parts.append(f"error={payload.get('error')}")
+            return _trim_summary_text(" ".join(parts))
+        keys = [key for key in payload.keys() if key not in {"content", "structuredContent", "meta"}]
+        preview = ", ".join(keys[:4])
+        return _trim_summary_text(f"result {{{preview}}}" if preview else "result")
+    if isinstance(payload, list):
+        return _trim_summary_text(f"results={len(payload)}")
+    if isinstance(payload, str):
+        return _trim_summary_text(payload)
+    return _trim_summary_text(str(payload))
+
+
 def _tool_result(payload: Any, *, is_error: bool = False) -> dict[str, Any]:
     return {
-        "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}],
+        "content": [{"type": "text", "text": _summary_text(payload)}],
         "structuredContent": payload,
+        "meta": {"content_mode": "summary"},
         "isError": is_error,
     }
 
@@ -647,6 +789,60 @@ def _tool_error(message: str, **extra: Any) -> dict[str, Any]:
     payload.update(extra)
     return _tool_result(payload, is_error=True)
 
+
+def _mcp_error_result(message: str, **payload: Any) -> mcp_types.CallToolResult:
+    body = {"ok": False, "error": message}
+    body.update(payload)
+    return mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text=_summary_text(body), _meta={"content_mode": "summary"})],
+        structuredContent=body,
+        isError=True,
+        _meta={"content_mode": "summary"},
+    )
+
+
+def _mcp_result(payload: Any) -> mcp_types.CallToolResult:
+    if isinstance(payload, mcp_types.CallToolResult):
+        return payload
+    if isinstance(payload, dict) and {"content", "structuredContent", "isError"} <= set(payload.keys()):
+        content_items: list[mcp_types.TextContent] = []
+        for item in payload.get("content") or []:
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            content_items.append(
+                mcp_types.TextContent(
+                    type="text",
+                    text=str(item.get("text") or ""),
+                    annotations=item.get("annotations"),
+                    _meta=item.get("meta"),
+                )
+            )
+        structured = payload.get("structuredContent")
+        if structured is None:
+            structured_payload: dict[str, Any] = {}
+        elif isinstance(structured, dict):
+            structured_payload = structured
+        else:
+            structured_payload = {"result": structured}
+        return mcp_types.CallToolResult(
+            content=content_items or [mcp_types.TextContent(type="text", text=_summary_text(structured_payload))],
+            structuredContent=structured_payload,
+            isError=bool(payload.get("isError")),
+            _meta=payload.get("meta"),
+        )
+    if isinstance(payload, dict):
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text=_summary_text(payload), _meta={"content_mode": "summary"})],
+            structuredContent=payload,
+            isError=False,
+            _meta={"content_mode": "summary"},
+        )
+    return mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text=_summary_text(payload), _meta={"content_mode": "summary"})],
+        structuredContent={"result": payload},
+        isError=False,
+        _meta={"content_mode": "summary"},
+    )
 
 def _backend_tool_is_error(result: dict[str, Any]) -> bool:
     if bool(result.get("isError")):
@@ -690,29 +886,6 @@ def _backend_mutation_changed_db(result: dict[str, Any]) -> bool:
         return not saw_status
     return False
 
-
-def _annotate_tool_result(result: dict[str, Any], *, session_txid: int | None = None, expected_txid: int | None = None, stale_warning: str | None = None) -> dict[str, Any]:
-    annotated = dict(result)
-    meta = dict(annotated.get("meta") or {})
-    if session_txid is not None:
-        meta["session_txid"] = session_txid
-    if expected_txid is not None:
-        meta["expected_txid"] = expected_txid
-    if stale_warning:
-        meta["stale_txid_warning"] = stale_warning
-    if meta:
-        annotated["meta"] = meta
-    structured = annotated.get("structuredContent")
-    if isinstance(structured, dict):
-        structured = dict(structured)
-        if session_txid is not None:
-            structured["session_txid"] = session_txid
-        if expected_txid is not None:
-            structured["expected_txid"] = expected_txid
-        if stale_warning:
-            structured["stale_txid_warning"] = stale_warning
-        annotated["structuredContent"] = structured
-    return annotated
 
 def _daemon_healthz_ok(timeout_sec: float = 2.0) -> bool:
     req = urllib.request.Request(f"{DAEMON_URL}/healthz", method="GET")
@@ -933,9 +1106,6 @@ def _local_open_binary(
                     "session_id": attached.session_id,
                     "engine": attached.engine,
                     "status": attached.status,
-                    "txid": attached.txid,
-                    "snapshot_txid": _session_revision_payload(attached, client_id)["snapshot_txid"],
-                    "requires_refresh": _session_revision_payload(attached, client_id)["requires_refresh"],
                     "revision": _session_revision_payload(attached, client_id),
                     "selected": True,
                     "reused": True,
@@ -1117,9 +1287,6 @@ def _local_open_binary(
             "session_id": attached.session_id,
             "engine": attached.engine,
             "status": "ready",
-            "txid": attached.txid,
-            "snapshot_txid": _session_revision_payload(attached, client_id)["snapshot_txid"],
-            "requires_refresh": _session_revision_payload(attached, client_id)["requires_refresh"],
             "revision": _session_revision_payload(attached, client_id),
             "selected": True,
             "reused": False,
@@ -1163,9 +1330,6 @@ def _local_load_idb(
                     "session_id": attached.session_id,
                     "engine": attached.engine,
                     "status": attached.status,
-                    "txid": attached.txid,
-                    "snapshot_txid": _session_revision_payload(attached, client_id)["snapshot_txid"],
-                    "requires_refresh": _session_revision_payload(attached, client_id)["requires_refresh"],
                     "revision": _session_revision_payload(attached, client_id),
                     "selected": True,
                     "reused": True,
@@ -1345,9 +1509,6 @@ def _local_load_idb(
             "session_id": attached.session_id,
             "engine": attached.engine,
             "status": "ready",
-            "txid": attached.txid,
-            "snapshot_txid": _session_revision_payload(attached, client_id)["snapshot_txid"],
-            "requires_refresh": _session_revision_payload(attached, client_id)["requires_refresh"],
             "revision": _session_revision_payload(attached, client_id),
             "selected": True,
             "reused": False,
@@ -1388,9 +1549,9 @@ def _local_close_session(session_id: str, save: bool = True, force: bool = False
         return error or {"ok": False, "error": f"Unknown session: {session_id}"}
     try:
         return _terminate_session_record(closable, save=save, reason="manager_close")
-    except Exception:
+    except Exception as exc:
         registry.cancel_close(session_id)
-        raise
+        return {"ok": False, "error": "close_session_failed", "detail": str(exc), "session_id": session_id}
 
 
 async def _local_list_session_tools(session_id: str = "", client_id: str | None = None) -> dict[str, Any]:
@@ -1518,25 +1679,48 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
         "call_session_tool": lambda **kwargs: _local_call_session_tool(kwargs["tool_name"], kwargs.get("arguments"), kwargs.get("session_id", ""), client_id=client_id),
         "inspect": lambda **kwargs: _local_call_session_tool(
             "inspect",
-            _merge_payload(kwargs.get("arguments"), addr=kwargs["addr"]),
+            _merge_detail_payload(
+                kwargs.get("arguments"),
+                full=bool(kwargs.get("full", False)),
+                detail=str(kwargs.get("detail", "")),
+                addr=kwargs["addr"],
+            ),
             kwargs.get("session_id", ""),
             client_id=client_id,
         ),
         "read": lambda **kwargs: _local_call_session_tool(
             "read",
-            _merge_payload(kwargs.get("arguments"), kind=kwargs["kind"], addr=kwargs.get("addr", "")),
+            _merge_detail_payload(
+                kwargs.get("arguments"),
+                full=bool(kwargs.get("full", False)),
+                detail=str(kwargs.get("detail", "")),
+                kind=kwargs["kind"],
+                addr=kwargs.get("addr", ""),
+            ),
             kwargs.get("session_id", ""),
             client_id=client_id,
         ),
         "search": lambda **kwargs: _local_call_session_tool(
             "search",
-            _merge_payload(kwargs.get("arguments"), kind=kwargs["kind"], query=kwargs.get("query", "")),
+            _merge_detail_payload(
+                kwargs.get("arguments"),
+                full=bool(kwargs.get("full", False)),
+                detail=str(kwargs.get("detail", "")),
+                kind=kwargs["kind"],
+                query=kwargs.get("query", ""),
+            ),
             kwargs.get("session_id", ""),
             client_id=client_id,
         ),
         "xrefs": lambda **kwargs: _local_call_session_tool(
             "xrefs",
-            _merge_payload(kwargs.get("arguments"), direction=kwargs.get("direction", "to"), addr=kwargs.get("addr", "")),
+            _merge_detail_payload(
+                kwargs.get("arguments"),
+                full=bool(kwargs.get("full", False)),
+                detail=str(kwargs.get("detail", "")),
+                direction=kwargs.get("direction", "to"),
+                addr=kwargs.get("addr", ""),
+            ),
             kwargs.get("session_id", ""),
             client_id=client_id,
         ),
@@ -1548,17 +1732,22 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
         ),
         "inspect_addr": lambda **kwargs: _local_call_session_tool("inspect_addr", {"addr": kwargs["addr"]}, kwargs.get("session_id", ""), client_id=client_id),
         "get_enclosing_function": lambda **kwargs: _local_call_session_tool("get_enclosing_function", {"addr": kwargs["addr"]}, kwargs.get("session_id", ""), client_id=client_id),
-        "decompile": lambda **kwargs: _local_call_session_tool("decompile", {"addr": kwargs["addr"]}, kwargs.get("session_id", ""), client_id=client_id),
+        "decompile": lambda **kwargs: _local_call_session_tool(
+            "decompile",
+            _merge_detail_payload(None, full=bool(kwargs.get("full", False)), detail=str(kwargs.get("detail", "")), addr=kwargs["addr"]),
+            kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
         "decompile_line_map": lambda **kwargs: _local_call_session_tool("get_decompile_line_map", {"addr": kwargs["addr"]}, kwargs.get("session_id", ""), client_id=client_id),
         "disasm_function": lambda **kwargs: _local_call_session_tool(
             "disasm_function",
-            {"addr": kwargs["addr"], "max_instructions": kwargs.get("max_instructions", 4000)},
+            _merge_detail_payload(None, full=bool(kwargs.get("full", False)), detail=str(kwargs.get("detail", "")), addr=kwargs["addr"], max_instructions=kwargs.get("max_instructions", 4000)),
             kwargs.get("session_id", ""),
             client_id=client_id,
         ),
         "apply_decl": lambda **kwargs: _local_call_session_tool(
             "apply_decl",
-            {"addr": kwargs.get("addr", ""), "symbol": kwargs.get("symbol", ""), "decl": kwargs["decl"]},
+            {"addr": kwargs.get("addr", ""), "symbol": kwargs.get("symbol", ""), "decl": kwargs["decl"], "supporting_decls": kwargs.get("supporting_decls")},
             kwargs.get("session_id", ""),
             client_id=client_id,
         ),
@@ -1586,102 +1775,99 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
     return result
 
 
-@mcp.tool(description="List alive IDA sessions discovered by the manager.")
-def list_alive_sessions() -> dict[str, Any]:
+@mcp.tool(description="List alive IDA sessions discovered by the manager.", structured_output=False)
+def list_alive_sessions() -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return _daemon_request_sync("list_alive_sessions", {"client_id": CLIENT_ID})
-    return _local_list_alive_sessions(CLIENT_ID)
+        return _mcp_result(_daemon_request_sync("list_alive_sessions", {"client_id": CLIENT_ID}))
+    return _mcp_result(_local_list_alive_sessions(CLIENT_ID))
 
 
-@mcp.tool(description="Return the currently selected IDA session.")
-def current_session() -> dict[str, Any]:
+@mcp.tool(description="Return the currently selected IDA session.", structured_output=False)
+def current_session() -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return _daemon_request_sync("current_session", {"client_id": CLIENT_ID})
-    return _local_current_session(CLIENT_ID)
+        return _mcp_result(_daemon_request_sync("current_session", {"client_id": CLIENT_ID}))
+    return _mcp_result(_local_current_session(CLIENT_ID))
 
 
-@mcp.tool(description="Select an alive IDA session by its session_id.")
-def select_session(session_id: str) -> dict[str, Any]:
+@mcp.tool(description="Select an alive IDA session by its session_id.", structured_output=False)
+def select_session(session_id: str) -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return _daemon_request_sync("select_session", {"session_id": session_id, "client_id": CLIENT_ID})
-    return _local_select_session(session_id, CLIENT_ID)
+        return _mcp_result(_daemon_request_sync("select_session", {"session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(_local_select_session(session_id, CLIENT_ID))
 
 
-@mcp.tool(description="Attach to an already-open GUI IDA session, optionally filtering by binary name or path.")
-def attach_to_gui(binary_name: str = "", binary_path: str = "") -> dict[str, Any]:
+@mcp.tool(description="Attach to an already-open GUI IDA session, optionally filtering by binary name or path.", structured_output=False)
+def attach_to_gui(binary_name: str = "", binary_path: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return _daemon_request_sync("attach_to_gui", {"binary_name": binary_name, "binary_path": binary_path, "client_id": CLIENT_ID})
-    return _local_attach_to_gui(binary_name=binary_name, binary_path=binary_path, client_id=CLIENT_ID)
+        return _mcp_result(_daemon_request_sync("attach_to_gui", {"binary_name": binary_name, "binary_path": binary_path, "client_id": CLIENT_ID}))
+    return _mcp_result(_local_attach_to_gui(binary_name=binary_name, binary_path=binary_path, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Inspect Windows IDA paths, plugin install state, and headless bootstrap availability.")
-def inspect_environment() -> dict[str, Any]:
+@mcp.tool(description="Inspect Windows IDA paths, plugin install state, and headless bootstrap availability.", structured_output=False)
+def inspect_environment() -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return _daemon_request_sync("inspect_environment", {"client_id": CLIENT_ID})
-    return _local_inspect_environment()
+        return _mcp_result(_daemon_request_sync("inspect_environment", {"client_id": CLIENT_ID}))
+    return _mcp_result(_local_inspect_environment())
 
 
-@mcp.tool(description="Open a binary in headless mode, GUI mode, or auto mode and select the resulting session. By default this reuses an existing live session when possible and reuses an adjacent .i64 when launching fresh. Set remove_previous_idb=true to force a fresh launch without reusing the adjacent .i64.")
-def open_binary(path: str, mode: str = "auto", reuse: bool = True, remove_previous_idb: bool = False) -> dict[str, Any]:
+@mcp.tool(description="Open a binary in headless mode, GUI mode, or auto mode and select the resulting session. By default this reuses an existing live session when possible and reuses an adjacent .i64 when launching fresh. Set remove_previous_idb=true to force a fresh launch without reusing the adjacent .i64.", structured_output=False)
+def open_binary(path: str, mode: str = "auto", reuse: bool = True, remove_previous_idb: bool = False) -> mcp_types.CallToolResult:
     if str(path or "").strip().lower().endswith(".i64"):
-        return {
-            "ok": False,
-            "error": "open_binary expects the original binary path. Use load_idb() to open an existing .i64 database.",
-        }
+        return _mcp_error_result("open_binary expects the original binary path. Use load_idb() to open an existing .i64 database.")
     if ACTIVE_BACKEND == "daemon":
-        return _daemon_request_sync(
+        return _mcp_result(_daemon_request_sync(
             "open_binary",
             {"path": path, "mode": mode, "reuse": reuse, "remove_previous_idb": remove_previous_idb, "client_id": CLIENT_ID},
-        )
-    return _local_open_binary(
+        ))
+    return _mcp_result(_local_open_binary(
         path=path,
         mode=mode,
         reuse=reuse,
         remove_previous_idb=remove_previous_idb,
         client_id=CLIENT_ID,
-    )
+    ))
 
 
-@mcp.tool(description="Load an existing .i64 database in headless or GUI mode and select the resulting session.")
-def load_idb(path: str, mode: str = "headless", reuse: bool = True) -> dict[str, Any]:
+@mcp.tool(description="Load an existing .i64 database in headless or GUI mode and select the resulting session.", structured_output=False)
+def load_idb(path: str, mode: str = "headless", reuse: bool = True) -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return _daemon_request_sync(
+        return _mcp_result(_daemon_request_sync(
             "load_idb",
             {"path": path, "mode": mode, "reuse": reuse, "client_id": CLIENT_ID},
-        )
-    return _local_load_idb(
+        ))
+    return _mcp_result(_local_load_idb(
         path=path,
         mode=mode,
         reuse=reuse,
         client_id=CLIENT_ID,
-    )
+    ))
 
 
-@mcp.tool(description="Close a manager-owned headless session.")
-def close_session(session_id: str, save: bool = True, force: bool = False) -> dict[str, Any]:
+@mcp.tool(description="Close a manager-owned headless session.", structured_output=False)
+def close_session(session_id: str, save: bool = True, force: bool = False) -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return _daemon_request_sync("close_session", {"session_id": session_id, "save": save, "force": force, "client_id": CLIENT_ID})
-    return _local_close_session(session_id=session_id, save=save, force=force, client_id=CLIENT_ID)
+        return _mcp_result(_daemon_request_sync("close_session", {"session_id": session_id, "save": save, "force": force, "client_id": CLIENT_ID}))
+    return _mcp_result(_local_close_session(session_id=session_id, save=save, force=force, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="List backend tools exposed by the explicit session_id, or by the current selected session when session_id is omitted.")
-async def list_session_tools(session_id: str = "") -> dict[str, Any]:
+@mcp.tool(description="List backend tools exposed by the explicit session_id, or by the current selected session when session_id is omitted.", structured_output=False)
+async def list_session_tools(session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("list_session_tools", {"session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_list_session_tools(session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("list_session_tools", {"session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_list_session_tools(session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Call any backend raw tool on the explicit session_id, or on the current selected session when session_id is omitted.")
-async def call_session_tool(tool_name: str, arguments: Any = None, session_id: str = "") -> dict[str, Any]:
+@mcp.tool(description="Call any backend raw tool on the explicit session_id, or on the current selected session when session_id is omitted.", structured_output=False)
+async def call_session_tool(tool_name: str, arguments: Any = None, session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async(
+        return _mcp_result(await _daemon_request_async(
             "call_session_tool",
             {"tool_name": tool_name, "arguments": arguments, "session_id": session_id, "client_id": CLIENT_ID},
-        )
-    return await _local_call_session_tool(tool_name=tool_name, arguments=arguments, session_id=session_id, client_id=CLIENT_ID)
+        ))
+    return _mcp_result(await _local_call_session_tool(tool_name=tool_name, arguments=arguments, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="High-level address inspection with optional decompile/disasm payloads.")
+@mcp.tool(description="High-level address inspection with optional decompile/disasm payloads.", structured_output=False)
 async def inspect(
     addr: str,
     session_id: str = "",
@@ -1689,10 +1875,14 @@ async def inspect(
     include_disasm: bool = False,
     include_line_map: bool = False,
     max_instructions: int = 200,
+    full: bool = False,
+    detail: str = "",
     arguments: Any = None,
-) -> dict[str, Any]:
-    payload = _merge_payload(
+) -> mcp_types.CallToolResult:
+    payload = _merge_detail_payload(
         arguments,
+        full=full,
+        detail=detail,
         addr=addr,
         include_decompile=include_decompile,
         include_disasm=include_disasm,
@@ -1700,57 +1890,57 @@ async def inspect(
         max_instructions=max_instructions,
     )
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("inspect", {"session_id": session_id, "client_id": CLIENT_ID, "arguments": payload, "addr": addr})
-    return await _local_call_session_tool("inspect", payload, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("inspect", {"session_id": session_id, "client_id": CLIENT_ID, "arguments": payload, "addr": addr}))
+    return _mcp_result(await _local_call_session_tool("inspect", payload, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="High-level read API for bytes/int/string/struct/array/global.")
-async def read(kind: str, addr: str = "", session_id: str = "", arguments: Any = None) -> dict[str, Any]:
+@mcp.tool(description="High-level read API for bytes/int/string/struct/array/global.", structured_output=False)
+async def read(kind: str, addr: str = "", session_id: str = "", full: bool = False, detail: str = "", arguments: Any = None) -> mcp_types.CallToolResult:
+    payload = _merge_detail_payload(arguments, full=full, detail=detail, kind=kind, addr=addr)
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(await _daemon_request_async("read", {"kind": kind, "addr": addr, "full": full, "detail": detail, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("read", payload, session_id=session_id, client_id=CLIENT_ID))
+
+
+@mcp.tool(description="High-level search API for text/regex/bytes/immediates/instructions.", structured_output=False)
+async def search(kind: str, query: str = "", session_id: str = "", full: bool = False, detail: str = "", arguments: Any = None) -> mcp_types.CallToolResult:
+    payload = _merge_detail_payload(arguments, full=full, detail=detail, kind=kind, query=query)
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(await _daemon_request_async("search", {"kind": kind, "query": query, "full": full, "detail": detail, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("search", payload, session_id=session_id, client_id=CLIENT_ID))
+
+
+@mcp.tool(description="High-level xref API for to/from or struct-field lookups.", structured_output=False)
+async def xrefs(direction: str = "to", addr: str = "", session_id: str = "", full: bool = False, detail: str = "", arguments: Any = None) -> mcp_types.CallToolResult:
+    payload = _merge_detail_payload(arguments, full=full, detail=detail, direction=direction, addr=addr)
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(await _daemon_request_async("xrefs", {"direction": direction, "addr": addr, "full": full, "detail": detail, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("xrefs", payload, session_id=session_id, client_id=CLIENT_ID))
+
+
+@mcp.tool(description="High-level define API for function/code/type/struct/array/stack/undefine.", structured_output=False)
+async def define(kind: str, addr: str = "", session_id: str = "", arguments: Any = None) -> mcp_types.CallToolResult:
     payload = _merge_payload(arguments, kind=kind, addr=addr)
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("read", {"kind": kind, "addr": addr, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("read", payload, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("define", {"kind": kind, "addr": addr, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("define", payload, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="High-level search API for text/regex/bytes/immediates/instructions.")
-async def search(kind: str, query: str = "", session_id: str = "", arguments: Any = None) -> dict[str, Any]:
-    payload = _merge_payload(arguments, kind=kind, query=query)
+@mcp.tool(description="Inspect an address and return code/data/function context.", structured_output=False)
+async def inspect_addr(addr: str, session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("search", {"kind": kind, "query": query, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("search", payload, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("inspect_addr", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("inspect_addr", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="High-level xref API for to/from or struct-field lookups.")
-async def xrefs(direction: str = "to", addr: str = "", session_id: str = "", arguments: Any = None) -> dict[str, Any]:
-    payload = _merge_payload(arguments, direction=direction, addr=addr)
+@mcp.tool(description="Return the function containing the queried address.", structured_output=False)
+async def get_enclosing_function(addr: str, session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("xrefs", {"direction": direction, "addr": addr, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("xrefs", payload, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("get_enclosing_function", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("get_enclosing_function", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="High-level define API for function/code/type/struct/array/stack/undefine.")
-async def define(kind: str, addr: str = "", session_id: str = "", arguments: Any = None) -> dict[str, Any]:
-    payload = _merge_payload(arguments, kind=kind, addr=addr)
-    if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("define", {"kind": kind, "addr": addr, "arguments": payload, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("define", payload, session_id=session_id, client_id=CLIENT_ID)
-
-
-@mcp.tool(description="Inspect an address and return code/data/function context.")
-async def inspect_addr(addr: str, session_id: str = "") -> dict[str, Any]:
-    if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("inspect_addr", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("inspect_addr", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID)
-
-
-@mcp.tool(description="Return the function containing the queried address.")
-async def get_enclosing_function(addr: str, session_id: str = "") -> dict[str, Any]:
-    if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("get_enclosing_function", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("get_enclosing_function", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID)
-
-
-@mcp.tool(description="Run any backend tool and write the result to a WSL-accessible file path.")
+@mcp.tool(description="Run any backend tool and write the result to a WSL-accessible file path.", structured_output=False)
 async def write_session_tool_output(
     path: str,
     tool_name: str,
@@ -1758,9 +1948,9 @@ async def write_session_tool_output(
     session_id: str = "",
     output_format: str = "text",
     overwrite: bool = True,
-) -> dict[str, Any]:
+) -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async(
+        return _mcp_result(await _daemon_request_async(
             "write_session_tool_output",
             {
                 "path": path,
@@ -1771,8 +1961,8 @@ async def write_session_tool_output(
                 "overwrite": overwrite,
                 "client_id": CLIENT_ID,
             },
-        )
-    return await _local_write_session_tool_output(
+        ))
+    return _mcp_result(await _local_write_session_tool_output(
         path=path,
         tool_name=tool_name,
         arguments=arguments,
@@ -1780,86 +1970,94 @@ async def write_session_tool_output(
         output_format=output_format,
         overwrite=overwrite,
         client_id=CLIENT_ID,
-    )
+    ))
 
 
-@mcp.tool(description="Decompile a function in the explicit session_id, or in the current selected session when session_id is omitted.")
-async def decompile(addr: str, session_id: str = "") -> dict[str, Any]:
+@mcp.tool(description="Decompile a function in the explicit session_id, or in the current selected session when session_id is omitted.", structured_output=False)
+async def decompile(addr: str, session_id: str = "", full: bool = False, detail: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("decompile", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("decompile", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("decompile", {"addr": addr, "full": full, "detail": detail, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("decompile", _merge_detail_payload(None, full=full, detail=detail, addr=addr), session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Return pseudocode lines with best-effort disassembly address mapping from the explicit session_id, or from the current selected session when session_id is omitted.")
-async def decompile_line_map(addr: str, session_id: str = "") -> dict[str, Any]:
+@mcp.tool(description="Return pseudocode lines with best-effort disassembly address mapping from the explicit session_id, or from the current selected session when session_id is omitted.", structured_output=False)
+async def decompile_line_map(addr: str, session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("decompile_line_map", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("get_decompile_line_map", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("decompile_line_map", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("get_decompile_line_map", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Disassemble the full containing function for an address in the explicit session_id, or in the current selected session when session_id is omitted.")
-async def disasm_function(addr: str, session_id: str = "", max_instructions: int = 4000) -> dict[str, Any]:
+@mcp.tool(description="Disassemble the full containing function for an address in the explicit session_id, or in the current selected session when session_id is omitted.", structured_output=False)
+async def disasm_function(addr: str, session_id: str = "", max_instructions: int = 4000, full: bool = False, detail: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async(
+        return _mcp_result(await _daemon_request_async(
             "disasm_function",
-            {"addr": addr, "session_id": session_id, "max_instructions": max_instructions, "client_id": CLIENT_ID},
-        )
-    return await _local_call_session_tool(
+            {"addr": addr, "session_id": session_id, "max_instructions": max_instructions, "full": full, "detail": detail, "client_id": CLIENT_ID},
+        ))
+    return _mcp_result(await _local_call_session_tool(
         "disasm_function",
-        {"addr": addr, "max_instructions": max_instructions},
+        _merge_detail_payload(None, full=full, detail=detail, addr=addr, max_instructions=max_instructions),
         session_id=session_id,
         client_id=CLIENT_ID,
-    )
+    ))
 
 
-@mcp.tool(description="Apply a C declaration to a symbol or address like the GUI Y command.")
-async def apply_decl(decl: str, session_id: str = "", addr: str = "", symbol: str = "") -> dict[str, Any]:
+@mcp.tool(description="Apply a C declaration to a symbol or address like the GUI Y command.", structured_output=False)
+async def apply_decl(
+    decl: str,
+    session_id: str = "",
+    addr: str = "",
+    symbol: str = "",
+    supporting_decls: list[str] | str | None = None,
+) -> mcp_types.CallToolResult:
     payload = {"decl": decl, "session_id": session_id, "client_id": CLIENT_ID}
     if addr:
         payload["addr"] = addr
     if symbol:
         payload["symbol"] = symbol
+    if supporting_decls:
+        payload["supporting_decls"] = supporting_decls
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("apply_decl", payload)
-    return await _local_call_session_tool("apply_decl", payload, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("apply_decl", payload))
+    return _mcp_result(await _local_call_session_tool("apply_decl", payload, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Create or reanalyze the function containing an address.")
-async def reanalyze_function(addr: str, session_id: str = "") -> dict[str, Any]:
+@mcp.tool(description="Create or reanalyze the function containing an address.", structured_output=False)
+async def reanalyze_function(addr: str, session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("reanalyze_function", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("reanalyze_function", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("reanalyze_function", {"addr": addr, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("reanalyze_function", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Lookup one or more functions in the explicit session_id, or in the current selected session when session_id is omitted.")
-async def lookup_funcs(queries: list[str] | str, session_id: str = "") -> dict[str, Any]:
+@mcp.tool(description="Lookup one or more functions in the explicit session_id, or in the current selected session when session_id is omitted.", structured_output=False)
+async def lookup_funcs(queries: list[str] | str, session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("lookup_funcs", {"queries": queries, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("lookup_funcs", {"queries": queries}, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("lookup_funcs", {"queries": queries, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("lookup_funcs", {"queries": queries}, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Find xrefs to one or more addresses in the explicit session_id, or in the current selected session when session_id is omitted.")
-async def xrefs_to(addrs: list[str] | str, limit: int = 100, session_id: str = "") -> dict[str, Any]:
+@mcp.tool(description="Find xrefs to one or more addresses in the explicit session_id, or in the current selected session when session_id is omitted.", structured_output=False)
+async def xrefs_to(addrs: list[str] | str, limit: int = 100, session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async(
+        return _mcp_result(await _daemon_request_async(
             "xrefs_to",
             {"addrs": addrs, "limit": limit, "session_id": session_id, "client_id": CLIENT_ID},
-        )
-    return await _local_call_session_tool("xrefs_to", {"addrs": addrs, "limit": limit}, session_id=session_id, client_id=CLIENT_ID)
+        ))
+    return _mcp_result(await _local_call_session_tool("xrefs_to", {"addrs": addrs, "limit": limit}, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Rename functions, globals, local variables, or stack variables in the explicit session_id, or in the current selected session when session_id is omitted.")
-async def rename(batch: dict[str, Any], session_id: str = "") -> dict[str, Any]:
+@mcp.tool(description="Rename functions, globals, local variables, or stack variables in the explicit session_id, or in the current selected session when session_id is omitted.", structured_output=False)
+async def rename(batch: dict[str, Any], session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("rename", {"batch": batch, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("rename", {"batch": batch}, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("rename", {"batch": batch, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("rename", {"batch": batch}, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Set comments in the explicit session_id, or in the current selected session when session_id is omitted.")
-async def set_comments(items: dict[str, Any] | list[dict[str, Any]], session_id: str = "") -> dict[str, Any]:
+@mcp.tool(description="Set comments in the explicit session_id, or in the current selected session when session_id is omitted.", structured_output=False)
+async def set_comments(items: dict[str, Any] | list[dict[str, Any]], session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return await _daemon_request_async("set_comments", {"items": items, "session_id": session_id, "client_id": CLIENT_ID})
-    return await _local_call_session_tool("set_comments", {"items": items}, session_id=session_id, client_id=CLIENT_ID)
+        return _mcp_result(await _daemon_request_async("set_comments", {"items": items, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("set_comments", {"items": items}, session_id=session_id, client_id=CLIENT_ID))
 
 
 def _run_daemon() -> None:

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import shutil
 import socket
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -560,6 +562,11 @@ class IdaLauncher:
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"failed to kill pid {pid}")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not self.is_process_alive(pid):
+                return
+            time.sleep(0.1)
 
     def is_process_alive(self, pid: int | None) -> bool:
         if pid is None:
@@ -593,8 +600,21 @@ class IdaLauncher:
         path = Path(staged_dir)
         if not path.exists():
             return False
-        try:
-            shutil.rmtree(path)
-            return True
-        except FileNotFoundError:
-            return False
+        def _retry_readonly(func, target, exc_info):
+            try:
+                os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+                func(target)
+            except FileNotFoundError:
+                return
+
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                shutil.rmtree(path, onerror=_retry_readonly)
+                return True
+            except FileNotFoundError:
+                return False
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)

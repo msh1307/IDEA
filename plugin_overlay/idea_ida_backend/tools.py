@@ -78,10 +78,70 @@ def _json_text(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _trim_summary_text(text: str, limit: int = 120) -> str:
+    normalized = str(text or "").strip().replace("\n", " ")
+    if not normalized:
+        return "result"
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(1, limit - 3)] + "..."
+
+
+def _summary_text(payload: Any) -> str:
+    if isinstance(payload, dict):
+        mode = str(payload.get("mode") or "").strip()
+        addr = str(payload.get("addr") or payload.get("address") or "").strip()
+        name = str(
+            payload.get("name")
+            or payload.get("display_name")
+            or payload.get("struct_name")
+            or payload.get("function")
+            or payload.get("imported_name")
+            or ""
+        ).strip()
+        if mode == "decompile":
+            target = name or addr or "<unknown>"
+            return _trim_summary_text(f"decompile {target}")
+        if mode == "disasm":
+            target = name or addr or "<unknown>"
+            return _trim_summary_text(f"disasm {target}")
+        if "items" in payload and isinstance(payload.get("items"), list):
+            label = name or mode or "result"
+            return _trim_summary_text(f"{label} items={len(payload.get('items') or [])}")
+        if "matches" in payload and isinstance(payload.get("matches"), list):
+            return _trim_summary_text(f"matches={len(payload.get('matches') or [])}")
+        if "members" in payload and isinstance(payload.get("members"), list):
+            target = name or str(payload.get("struct_name") or addr or "struct")
+            return _trim_summary_text(f"{target} members={len(payload.get('members') or [])}")
+        if "code" in payload and isinstance(payload.get("code"), str):
+            target = name or addr or mode or "result"
+            return _trim_summary_text(f"{target} code")
+        if "ok" in payload:
+            parts = [f"ok={bool(payload.get('ok'))}"]
+            if name:
+                parts.append(f"name={name}")
+            elif addr:
+                parts.append(f"addr={addr}")
+            elif mode:
+                parts.append(f"mode={mode}")
+            if payload.get("error"):
+                parts.append(f"error={payload.get('error')}")
+            return _trim_summary_text(" ".join(parts))
+        keys = [key for key in payload.keys() if key not in {"content", "structuredContent", "meta"}]
+        preview = ", ".join(keys[:4])
+        return _trim_summary_text(f"result {{{preview}}}" if preview else "result")
+    if isinstance(payload, list):
+        return _trim_summary_text(f"results={len(payload)}")
+    if isinstance(payload, str):
+        return _trim_summary_text(payload)
+    return _trim_summary_text(str(payload))
+
+
 def _tool_result(payload: Any, *, is_error: bool = False) -> dict[str, Any]:
     return {
-        "content": [{"type": "text", "text": _json_text(payload)}],
+        "content": [{"type": "text", "text": _summary_text(payload)}],
         "structuredContent": payload,
+        "meta": {"content_mode": "summary"},
         "isError": is_error,
     }
 
@@ -97,6 +157,23 @@ def _bool_argument(arguments: dict[str, Any] | None, key: str, default: bool = F
     if value is None:
         return False
     return bool(value)
+
+
+def _detail_value(arguments: dict[str, Any] | None, default: str = "slim") -> str:
+    if not isinstance(arguments, dict):
+        return default
+    detail = str(arguments.get("detail") or "").strip().lower()
+    if detail in {"", "default"}:
+        return default
+    if detail in {"full", "verbose"}:
+        return "full"
+    if detail in {"slim", "compact", "summary"}:
+        return "slim"
+    return default
+
+
+def _detail_is_full(arguments: dict[str, Any] | None, default: str = "slim") -> bool:
+    return _bool_argument(arguments, "full", False) or _detail_value(arguments, default=default) == "full"
 
 
 def _pick_fields(entry: dict[str, Any], fields: list[str]) -> dict[str, Any]:
@@ -448,6 +525,13 @@ def _split_string_list(value: Any) -> list[str]:
     if value is None:
         return []
     return [str(value).strip()] if str(value).strip() else []
+
+
+def _coerce_decl_list(value: Any) -> list[str]:
+    decls = _split_string_list(value)
+    if not decls and isinstance(value, str) and value.strip():
+        decls = [value.strip()]
+    return [item.strip() for item in decls if str(item).strip()]
 
 
 def _disasm_window(ea: int, max_instructions: int) -> list[dict[str, Any]]:
@@ -998,9 +1082,10 @@ def get_metadata(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 def inspect(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
     ea = _parse_ea(arguments.get("addr"))
-    include_decompile = bool(arguments.get("include_decompile", False))
-    include_disasm = bool(arguments.get("include_disasm", False))
-    include_line_map = bool(arguments.get("include_line_map", False))
+    full = _detail_is_full(arguments)
+    include_decompile = bool(arguments.get("include_decompile", False)) or full
+    include_disasm = bool(arguments.get("include_disasm", False)) or full
+    include_line_map = bool(arguments.get("include_line_map", False)) or full
     max_instructions = min(max(1, int(arguments.get("max_instructions", 200))), 4000)
 
     payload = inspect_addr({"addr": ea})
@@ -1244,23 +1329,33 @@ def get_enclosing_function(arguments: dict[str, Any] | None = None) -> dict[str,
 def decompile(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
     ea = _parse_ea(arguments.get("addr"))
+    full = _detail_is_full(arguments)
     func = idaapi.get_func(ea)
     fallback = str(arguments.get("fallback") or "disasm").strip().lower()
     if func is None:
         if fallback not in {"disasm", "asm"}:
             raise ValueError(f"No function found at {_hex(ea)}")
-        return {
+        payload = {
             "addr": _hex(ea),
             "name": "",
             "mode": "disasm",
             "decompile_error": f"No function found at {_hex(ea)}",
             "instructions": _disasm_window(ea, min(max(1, int(arguments.get('max_instructions', 200))), 2000)),
         }
+        if full:
+            payload["line_map"] = {"items": [], "count": 0, "error": payload["decompile_error"]}
+        return payload
     start_ea = func.start_ea
     name = ida_funcs.get_func_name(start_ea) or ""
     try:
         _func, cfunc = _decompile_cfunc(start_ea)
-        return {"addr": _hex(start_ea), "name": name, "mode": "decompile", "code": str(cfunc)}
+        payload = {"addr": _hex(start_ea), "name": name, "mode": "decompile", "code": str(cfunc)}
+        if full:
+            try:
+                payload["line_map"] = _decompile_line_map_payload(start_ea)
+            except Exception as exc:
+                payload["line_map_error"] = str(exc)
+        return payload
     except Exception as exc:
         if fallback not in {"disasm", "asm"}:
             raise
@@ -1270,13 +1365,16 @@ def decompile(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
                 break
             line = ida_lines.generate_disasm_line(item_ea, 0)
             instructions.append({"address": _hex(item_ea), "text": ida_lines.tag_remove(line or "")})
-        return {
+        payload = {
             "addr": _hex(start_ea),
             "name": name,
             "mode": "disasm",
             "decompile_error": str(exc),
             "instructions": instructions,
         }
+        if full:
+            payload["line_map_error"] = str(exc)
+        return payload
 
 
 @idasync
@@ -1515,7 +1613,7 @@ def xrefs_to_field(arguments: dict[str, Any] | None = None) -> list[dict[str, An
 @idasync
 def list_strings(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
-    full = _bool_argument(arguments, "full", False)
+    full = _detail_is_full(arguments)
     offset = max(0, int(arguments.get("offset", 0)))
     count = max(0, int(arguments.get("count", 100)))
     filt = str(arguments.get("filter", "") or "").lower()
@@ -1543,7 +1641,7 @@ def list_strings(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 @idasync
 def find_bytes(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     arguments = arguments or {}
-    full = _bool_argument(arguments, "full", False)
+    full = _detail_is_full(arguments)
     patterns = arguments.get("patterns", arguments.get("pattern", []))
     if isinstance(patterns, str):
         patterns = [patterns]
@@ -1589,7 +1687,7 @@ def find_bytes(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
 @idasync
 def find_text(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
-    full = _bool_argument(arguments, "full", False)
+    full = _detail_is_full(arguments)
     query = str(arguments.get("query") or arguments.get("text") or arguments.get("needle") or "").strip()
     if not query:
         raise ValueError("query is required")
@@ -1673,7 +1771,7 @@ def find_text(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 @idasync
 def find_regex(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
-    full = _bool_argument(arguments, "full", False)
+    full = _detail_is_full(arguments)
     pattern = str(arguments.get("pattern") or "").strip()
     if not pattern:
         raise ValueError("pattern is required")
@@ -1715,7 +1813,7 @@ def find_regex(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 @idasync
 def find_immediates(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     arguments = arguments or {}
-    full = _bool_argument(arguments, "full", False)
+    full = _detail_is_full(arguments)
     values = arguments.get("values", arguments.get("value", []))
     if isinstance(values, (str, int)):
         values = [values]
@@ -1789,7 +1887,7 @@ def find_immediates(arguments: dict[str, Any] | None = None) -> list[dict[str, A
 @idasync
 def find_insns(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     arguments = arguments or {}
-    full = _bool_argument(arguments, "full", False)
+    full = _detail_is_full(arguments)
     sequences = arguments.get("sequences", arguments.get("sequence", []))
     if isinstance(sequences, str):
         sequences = [sequences]
@@ -2052,6 +2150,7 @@ def read_qword(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 @idasync
 def read_array(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
+    full = _detail_is_full(arguments)
     ea = _parse_ea(arguments.get("addr"))
     elem_type = str(arguments.get("elem_type", "byte") or "byte").lower()
     count = max(0, int(arguments.get("count", 0)))
@@ -2061,7 +2160,8 @@ def read_array(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         for idx in range(count):
             current = ea + idx * elem_size
             data = _read_bytes_raw(current, elem_size)
-            items.append({"index": idx, "addr": _hex(current), "value": unpacker(data), "hex": data.hex()})
+            entry = {"index": idx, "addr": _hex(current), "value": unpacker(data), "hex": data.hex()}
+            items.append(entry if full else _pick_fields(entry, ["index", "addr", "value"]))
         return {"addr": _hex(ea), "elem_type": elem_type, "count": count, "items": items}
 
     tif = ida_typeinf.tinfo_t()
@@ -2073,7 +2173,8 @@ def read_array(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     for idx in range(count):
         current = ea + idx * elem_size
         data = _read_bytes_raw(current, elem_size)
-        items.append({"index": idx, "addr": _hex(current), "size": elem_size, "hex": data.hex()})
+        entry = {"index": idx, "addr": _hex(current), "size": elem_size, "hex": data.hex()}
+        items.append(entry if full else _pick_fields(entry, ["index", "addr", "size"]))
     return {"addr": _hex(ea), "elem_type": elem_type, "count": count, "items": items}
 
 
@@ -2096,6 +2197,7 @@ def hex_dump(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 @idasync
 def read_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
+    full = _detail_is_full(arguments)
     ea = _parse_ea(arguments.get("addr"))
     struct_name = str(arguments.get("struct_name") or arguments.get("name") or "").strip()
 
@@ -2131,7 +2233,7 @@ def read_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
             "bytes": _read_bytes_raw(member_ea, size).hex() if size > 0 else "",
             "value": _read_display_value(member_ea, size, member_type),
         }
-        members.append(item)
+        members.append(item if full else _pick_fields(item, ["name", "offset", "address", "size", "type", "value"]))
 
     return {
         "address": _hex(ea),
@@ -2256,9 +2358,7 @@ def delete_stack(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]
 def declare_type(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     arguments = arguments or {}
     decls_raw = arguments.get("decls", arguments.get("decl", arguments.get("type", "")))
-    decls = _split_string_list(decls_raw)
-    if not decls and isinstance(decls_raw, str) and decls_raw.strip():
-        decls = [decls_raw.strip()]
+    decls = _coerce_decl_list(decls_raw)
     if not decls:
         raise ValueError("decl/decls is required")
 
@@ -2561,6 +2661,22 @@ def apply_decl(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     decl = str(arguments.get("decl") or arguments.get("type") or arguments.get("signature") or "").strip()
     if not decl:
         raise ValueError("decl is required")
+    supporting_decls = _coerce_decl_list(
+        arguments.get("supporting_decls", arguments.get("supporting_decl", arguments.get("decls", [])))
+    )
+    supporting_results: list[dict[str, Any]] = []
+    if supporting_decls:
+        supporting_results = declare_type({"decls": supporting_decls})
+        if not all(bool(item.get("ok")) for item in supporting_results):
+            return {
+                "addr": _hex(ea),
+                "name": resolved_name,
+                "decl": decl,
+                "ok": False,
+                "error": "Failed to parse supporting declarations",
+                "supporting_decls": supporting_results,
+                "applied_type": _type_at(ea),
+            }
     ok = bool(idc.SetType(ea, decl))
     if ok:
         _refresh_decompiler(ea)
@@ -2569,6 +2685,7 @@ def apply_decl(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         "name": resolved_name,
         "decl": decl,
         "ok": ok,
+        "supporting_decls": supporting_results,
         "applied_type": _type_at(ea),
     }
 
