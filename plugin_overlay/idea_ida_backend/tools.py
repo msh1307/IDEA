@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import os
 from pathlib import Path
 import re
 import struct
@@ -189,13 +190,22 @@ def _normalize_export_path(path: str) -> Path:
         raise ValueError("path is required")
     match = _WSL_DRIVE_RE.match(raw)
     if match:
+        if os.name != "nt":
+            return Path(raw).expanduser()
         rest = match.group("rest").replace("/", "\\")
         return Path(f"{match.group('drive').upper()}:\\{rest}")
     match = _WINDOWS_DRIVE_RE.match(raw)
     if match:
+        if os.name != "nt":
+            rest = match.group("rest").replace("\\", "/")
+            return Path(f"/mnt/{match.group('drive').lower()}/{rest}").expanduser()
         rest = match.group("rest").replace("/", "\\")
         return Path(f"{match.group('drive').upper()}:\\{rest}")
     return Path(raw).expanduser()
+
+
+def _c_comment_text(value: Any) -> str:
+    return str(value or "").replace("*/", "* /")
 
 
 def _read_bytes_raw(ea: int, size: int) -> bytes:
@@ -3006,6 +3016,10 @@ def typed_decompile_export(arguments: dict[str, Any] | None = None) -> dict[str,
         "mode": decomp.get("mode"),
         "code": decomp.get("code") or "",
     }
+    if decomp.get("decompile_error"):
+        payload["decompile_error"] = decomp.get("decompile_error")
+    if decomp.get("instructions"):
+        payload["instructions"] = decomp.get("instructions")
     if include_line_map:
         payload["line_map"] = _decompile_line_map_payload(ea)
     if path:
@@ -3013,12 +3027,132 @@ def typed_decompile_export(arguments: dict[str, Any] | None = None) -> dict[str,
         target.parent.mkdir(parents=True, exist_ok=True)
         if output_format in {"txt", "text", "c"}:
             text = str(payload.get("code") or "")
+            if not text and payload.get("decompile_error"):
+                text = f"/* Hex-Rays failed: {_c_comment_text(payload.get('decompile_error'))} */"
             if include_line_map:
                 text += "\n\n/* line_map */\n" + json.dumps(payload["line_map"], ensure_ascii=False, indent=2)
             target.write_text(text + "\n", encoding="utf-8")
         else:
             target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         payload["path"] = str(target)
+    return payload
+
+
+@idasync
+def export_decompiled_c(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    include_extern = bool(arguments.get("include_extern", False))
+    include_thunks = bool(arguments.get("include_thunks", False))
+    filt = str(arguments.get("filter", "") or "").lower()
+    fallback = str(arguments.get("fallback") or "comment").strip().lower()
+    if fallback not in {"comment", "none", "disasm", "asm"}:
+        raise ValueError("fallback must be one of: comment, none, disasm, asm")
+    max_functions = max(0, int(arguments.get("max_functions", 0) or 0))
+    return_code = _bool_argument(arguments, "return_code", False)
+    max_return_bytes = max(0, int(arguments.get("max_return_bytes", 256 * 1024) or 0))
+    path = str(arguments.get("path") or "").strip()
+    if not path:
+        idb_path = idc.get_idb_path() or "ida_export.i64"
+        path = str(Path(idb_path).with_suffix(".c"))
+
+    functions: list[tuple[int, dict[str, Any]]] = []
+    for ea in idautils.Functions():
+        func = idaapi.get_func(ea)
+        if func is None:
+            continue
+        item = _function_summary(func)
+        if not include_extern and item["segment"].lower() == "extern":
+            continue
+        flags = idc.get_func_flags(func.start_ea)
+        if not include_thunks and flags != -1 and (flags & idc.FUNC_THUNK):
+            continue
+        if filt and filt not in item["name"].lower() and filt not in item["address"].lower():
+            continue
+        functions.append((int(func.start_ea), item))
+    functions.sort(key=lambda pair: (pair[1]["segment"].lower() == "extern", pair[0]))
+    selected_pairs = functions[:max_functions] if max_functions else functions
+    selected = [item for _ea, item in selected_pairs]
+
+    exported: list[dict[str, Any]] = []
+    fallbacks: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    target = _normalize_export_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    code_parts: list[str] = []
+    returned_bytes = 0
+
+    def emit(handle, line: str = "") -> None:
+        nonlocal returned_bytes
+        text = line + "\n"
+        handle.write(text)
+        if return_code and (max_return_bytes <= 0 or returned_bytes < max_return_bytes):
+            encoded_len = len(text.encode("utf-8"))
+            if max_return_bytes <= 0 or returned_bytes + encoded_len <= max_return_bytes:
+                code_parts.append(text)
+                returned_bytes += encoded_len
+
+    with target.open("w", encoding="utf-8", newline="\n") as handle:
+        emit(handle, "/*")
+        emit(handle, " * IDA decompiled C export")
+        emit(handle, f" * input: {_c_comment_text(ida_nalt.get_root_filename() or '')}")
+        emit(handle, f" * idb: {_c_comment_text(idc.get_idb_path() or '')}")
+        emit(handle, f" * functions: {len(selected)} / {len(functions)}")
+        emit(handle, " */")
+        emit(handle)
+
+        for item in selected:
+            addr = item["address"]
+            name = item["name"]
+            emit(handle, f"/* ===== {_c_comment_text(name or '<unnamed>')} @ {addr} ===== */")
+            try:
+                decomp = decompile({"addr": addr, "fallback": "disasm" if fallback in {"disasm", "asm"} else "none"})
+                if decomp.get("mode") == "decompile" and decomp.get("code"):
+                    emit(handle, str(decomp["code"]).rstrip())
+                    exported.append({"addr": addr, "name": name, "mode": "decompile"})
+                elif fallback in {"disasm", "asm"}:
+                    emit(handle, "/*")
+                    emit(handle, f" * Hex-Rays failed: {_c_comment_text(decomp.get('decompile_error') or 'unavailable')}")
+                    for insn in decomp.get("instructions") or []:
+                        emit(handle, f" * {insn.get('address', '')}: {_c_comment_text(insn.get('text', ''))}")
+                    emit(handle, " */")
+                    fallbacks.append({"addr": addr, "name": name, "mode": "disasm", "error": str(decomp.get("decompile_error") or "")})
+                else:
+                    error = str(decomp.get("decompile_error") or "Hex-Rays decompile failed")
+                    emit(handle, f"/* Hex-Rays failed: {_c_comment_text(error)} */")
+                    failed.append({"addr": addr, "name": name, "error": error})
+            except Exception as exc:
+                error = str(exc)
+                emit(handle, f"/* export failed: {_c_comment_text(error)} */")
+                failed.append({"addr": addr, "name": name, "error": error})
+            emit(handle)
+
+    file_size = target.stat().st_size
+    payload = {
+        "ok": bool(not selected or exported),
+        "complete": bool(len(failed) == 0 and len(fallbacks) == 0),
+        "mode": "export_decompiled_c",
+        "path": str(target),
+        "bytes_written": file_size,
+        "function_total": len(functions),
+        "selected_count": len(selected),
+        "decompiled_count": len(exported),
+        "fallback_count": len(fallbacks),
+        "failed_count": len(failed),
+        "exported_count": len(exported) + len(fallbacks),
+        "fallbacks": fallbacks[:100],
+        "failed": failed[:100],
+        "truncated_fallbacks": max(0, len(fallbacks) - 100),
+        "truncated_failures": max(0, len(failed) - 100),
+        "include_extern": include_extern,
+        "include_thunks": include_thunks,
+        "filter": filt,
+        "fallback": fallback,
+        "max_functions": max_functions,
+    }
+    if return_code:
+        payload["code"] = "".join(code_parts)
+        payload["code_truncated"] = max_return_bytes > 0 and returned_bytes < file_size
+        payload["max_return_bytes"] = max_return_bytes
     return payload
 
 
@@ -3203,6 +3337,7 @@ TOOL_DEFINITIONS = [
     {"name": "export_struct", "description": "Export a named struct as canonical header text or json."},
     {"name": "field_xrefs_for_struct", "description": "Return per-field xrefs for a struct with contextual disassembly."},
     {"name": "typed_decompile_export", "description": "Export decompiled code for a function under the current typed DB state."},
+    {"name": "export_decompiled_c", "description": "Export all selected functions from the current IDB as one .c file."},
     {"name": "type_workflow", "description": "LLM-friendly high-level workflow for declaring types, upserting structs, applying them, exporting them, and exporting typed decompilation."},
     {"name": "make_array", "description": "Convert the current item into an array."},
     {"name": "save_database", "description": "Save the current database."},
@@ -3276,6 +3411,7 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any] | None], Any]] = {
     "export_struct": export_struct,
     "field_xrefs_for_struct": field_xrefs_for_struct,
     "typed_decompile_export": typed_decompile_export,
+    "export_decompiled_c": export_decompiled_c,
     "type_workflow": type_workflow,
     "make_array": make_array,
     "save_database": save_database,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, contextmanager
 import fcntl
 import hashlib
 from io import TextIOWrapper
@@ -58,6 +58,7 @@ ACTIVE_BACKEND = "local"
 CLIENT_ID: str | None = None
 _client_lock = threading.RLock()
 _client_current_sessions: dict[str, str | None] = {}
+_client_last_seen: dict[str, float] = {}
 _launcher: IdaLauncher | None = None
 _open_binary_lock = threading.RLock()
 MUTATING_BACKEND_TOOLS = {
@@ -131,7 +132,43 @@ def _compute_daemon_build_token() -> str:
 DAEMON_BUILD_TOKEN = _compute_daemon_build_token()
 STDIO_IDLE_TIMEOUT_SEC = max(0, int(os.getenv("IDA_MCP_STDIO_IDLE_TIMEOUT_SEC", "600") or 0))
 STDIO_PING_TIMEOUT_SEC = max(1.0, float(os.getenv("IDA_MCP_STDIO_PING_TIMEOUT_SEC", "10") or 10.0))
+STDIO_PING_FAILURES_BEFORE_EXIT = max(1, int(os.getenv("IDA_MCP_STDIO_PING_FAILURES_BEFORE_EXIT", "3") or 3))
 STDIO_IDLE_CHECK_INTERVAL_SEC = max(5.0, min(60.0, float(os.getenv("IDA_MCP_STDIO_IDLE_CHECK_INTERVAL_SEC", "30") or 30.0)))
+STDIO_DISCONNECT_TIMEOUT_SEC = max(1.0, float(os.getenv("IDA_MCP_STDIO_DISCONNECT_TIMEOUT_SEC", "60") or 60.0))
+CLIENT_LEASE_TIMEOUT_SEC = max(60.0, float(os.getenv("IDA_MCP_CLIENT_LEASE_TIMEOUT_SEC", str(max(900, STDIO_IDLE_TIMEOUT_SEC * 2))) or 900.0))
+CLIENT_LEASE_SWEEP_INTERVAL_SEC = max(10.0, min(120.0, float(os.getenv("IDA_MCP_CLIENT_LEASE_SWEEP_INTERVAL_SEC", "30") or 30.0)))
+DAEMON_REQUEST_TIMEOUT_SEC = max(30.0, float(os.getenv("IDA_MCP_DAEMON_REQUEST_TIMEOUT_SEC", "120") or 120.0))
+LONG_DAEMON_REQUEST_TIMEOUT_SEC = max(
+    DAEMON_REQUEST_TIMEOUT_SEC,
+    float(os.getenv("IDA_MCP_LONG_DAEMON_REQUEST_TIMEOUT_SEC", "1800") or 1800.0),
+)
+EXPORT_BACKEND_TIMEOUT_SEC = max(60.0, float(os.getenv("IDA_MCP_EXPORT_BACKEND_TIMEOUT_SEC", "3600") or 3600.0))
+SAVE_BACKEND_TIMEOUT_SEC = max(30.0, float(os.getenv("IDA_MCP_SAVE_BACKEND_TIMEOUT_SEC", "180") or 180.0))
+
+
+def _disconnect_stdio_client(reason: str) -> None:
+    global CLIENT_ID
+    client_id = CLIENT_ID
+    CLIENT_ID = None
+    if not client_id:
+        return
+    try:
+        _stdio_debug(f"disconnect_client start reason={reason} client_id={client_id}")
+        _daemon_request_sync(
+            "disconnect_client",
+            {"client_id": client_id},
+            timeout_sec=STDIO_DISCONNECT_TIMEOUT_SEC,
+        )
+        _stdio_debug(f"disconnect_client ok reason={reason} client_id={client_id}")
+    except Exception as exc:
+        _stdio_debug(f"disconnect_client failed reason={reason}: {exc!r}")
+
+
+async def _force_exit_stdio(reason: str) -> None:
+    _stdio_debug(f"stdio forced exit start reason={reason}")
+    await anyio.to_thread.run_sync(_disconnect_stdio_client, reason)
+    _stdio_debug(f"stdio forced exit now reason={reason}")
+    os._exit(0)
 
 
 async def _run_stdio_server() -> None:
@@ -216,26 +253,44 @@ async def _run_stdio_server() -> None:
 
         async def idle_monitor() -> None:
             nonlocal last_activity_at
+            ping_failures = 0
+            _stdio_debug(
+                "idle monitor start "
+                f"timeout={STDIO_IDLE_TIMEOUT_SEC}s ping_timeout={STDIO_PING_TIMEOUT_SEC}s "
+                f"interval={STDIO_IDLE_CHECK_INTERVAL_SEC}s failures_before_exit={STDIO_PING_FAILURES_BEFORE_EXIT}"
+            )
             if STDIO_IDLE_TIMEOUT_SEC <= 0:
                 return
             while True:
                 await anyio.sleep(STDIO_IDLE_CHECK_INTERVAL_SEC)
                 if active_requests > 0:
                     continue
-                if session.client_params is None:
-                    continue
                 idle_for = time.monotonic() - last_activity_at
                 if idle_for < STDIO_IDLE_TIMEOUT_SEC:
                     continue
+                if session.client_params is None:
+                    _stdio_debug(f"idle pre-initialize timeout idle_sec={idle_for:.1f}")
+                    await _force_exit_stdio("pre_initialize_idle_timeout")
                 _stdio_debug(f"idle heartbeat start idle_sec={idle_for:.1f}")
                 try:
                     with anyio.fail_after(STDIO_PING_TIMEOUT_SEC):
                         await session.send_ping()
+                    if CLIENT_ID:
+                        await anyio.to_thread.run_sync(
+                            lambda: _daemon_request_sync(
+                                "heartbeat_client",
+                                {"client_id": CLIENT_ID},
+                                timeout_sec=STDIO_DISCONNECT_TIMEOUT_SEC,
+                            )
+                        )
+                    ping_failures = 0
                     last_activity_at = time.monotonic()
                     _stdio_debug("idle heartbeat ok")
                 except Exception as exc:
-                    _stdio_debug(f"idle heartbeat failed: {exc!r}")
-                    raise
+                    ping_failures += 1
+                    _stdio_debug(f"idle heartbeat failed count={ping_failures}: {exc!r}")
+                    if ping_failures >= STDIO_PING_FAILURES_BEFORE_EXIT:
+                        await _force_exit_stdio("heartbeat_failed")
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(stdin_reader)
@@ -264,7 +319,74 @@ def _client_connect(client_name: str = "", client_pid: int | None = None) -> dic
     client_id = f"client-{uuid.uuid4().hex[:12]}"
     with _client_lock:
         _client_current_sessions[client_id] = None
+        _client_last_seen[client_id] = time.monotonic()
     return {"client_id": client_id, "client_name": client_name, "client_pid": client_pid}
+
+
+def _client_touch(client_id: str | None) -> bool:
+    if not client_id:
+        return False
+    with _client_lock:
+        if client_id in _client_current_sessions:
+            _client_last_seen[client_id] = time.monotonic()
+            return True
+    return False
+
+
+@contextmanager
+def _client_lease_renewal(client_id: str | None):
+    if not client_id or not _client_is_connected(client_id):
+        yield
+        return
+    stop = threading.Event()
+
+    def renew() -> None:
+        interval = max(5.0, min(30.0, CLIENT_LEASE_TIMEOUT_SEC / 3.0))
+        while not stop.wait(interval):
+            if not _client_touch(client_id):
+                return
+
+    thread = threading.Thread(target=renew, name=f"ida-client-lease-{client_id}", daemon=True)
+    thread.start()
+    try:
+        _client_touch(client_id)
+        yield
+    finally:
+        _client_touch(client_id)
+        stop.set()
+        thread.join(timeout=1.0)
+
+
+def _client_is_connected(client_id: str | None) -> bool:
+    if not client_id:
+        return False
+    with _client_lock:
+        return client_id in _client_current_sessions
+
+
+def _mark_pending_owner(pending: PendingLaunch, client_id: str | None) -> None:
+    if client_id:
+        pending.metadata["owner_client_id"] = client_id
+
+
+def _on_session_registered(record) -> None:
+    owner_client_id = str(record.metadata.get("owner_client_id") or "")
+    if not owner_client_id:
+        return
+    if _client_is_connected(owner_client_id):
+        registry.attach_client(record.session_id, owner_client_id, refresh_snapshot=True)
+        return
+    if record.engine != "headless" or record.source != "manager_created" or not record.closable:
+        return
+    closable, error = registry.begin_close(record.session_id, force=True)
+    if error is not None or closable is None:
+        _daemon_debug(f"registered session owner disconnected but close failed session_id={record.session_id} error={error}")
+        return
+    try:
+        _terminate_session_record(closable, save=True, reason="owner_client_disconnected_before_register")
+    except Exception as exc:
+        registry.cancel_close(record.session_id)
+        _daemon_debug(f"registered session owner disconnected cleanup failed session_id={record.session_id}: {exc!r}")
 
 
 def _client_disconnect(client_id: str | None) -> dict[str, Any]:
@@ -272,6 +394,7 @@ def _client_disconnect(client_id: str | None) -> dict[str, Any]:
     with _client_lock:
         if client_id:
             detached_session_id = _client_current_sessions.pop(client_id, None)
+            _client_last_seen.pop(client_id, None)
     detached_records = registry.detach_client(client_id)
     auto_closed: list[str] = []
     auto_close_errors: list[dict[str, Any]] = []
@@ -299,6 +422,56 @@ def _client_disconnect(client_id: str | None) -> dict[str, Any]:
     }
 
 
+def _sweep_stale_clients() -> dict[str, Any]:
+    now = time.monotonic()
+    stale: list[str] = []
+    with _client_lock:
+        for client_id, last_seen in list(_client_last_seen.items()):
+            if now - last_seen >= CLIENT_LEASE_TIMEOUT_SEC:
+                stale.append(client_id)
+    closed: list[str] = []
+    errors: list[dict[str, Any]] = []
+    for client_id in stale:
+        result = _client_disconnect(client_id)
+        closed.extend(result.get("auto_closed_session_ids") or [])
+        errors.extend(result.get("auto_close_errors") or [])
+    return {"stale_client_ids": stale, "auto_closed_session_ids": closed, "auto_close_errors": errors}
+
+
+def _close_detached_inactive_headless_session(session_id: str, *, reason: str) -> dict[str, Any] | None:
+    record = registry.get_session(session_id)
+    if record is None:
+        return None
+    if record.engine != "headless" or record.source != "manager_created" or not record.closable:
+        return None
+    if record.status == "dead" or record.closing:
+        return None
+    if record.attached_clients or record.active_ops > 0:
+        return None
+    closable, error = registry.begin_close(record.session_id)
+    if error is not None or closable is None:
+        _daemon_debug(f"detached inactive close skipped session_id={session_id} error={error}")
+        return None
+    try:
+        return _terminate_session_record(closable, save=True, reason=reason)
+    except Exception as exc:
+        registry.cancel_close(session_id)
+        _daemon_debug(f"detached inactive close failed session_id={session_id}: {exc!r}")
+        return None
+
+
+@contextmanager
+def _track_session_operation(session_id: str):
+    try:
+        with registry.track_operation(session_id) as record:
+            yield record
+    finally:
+        _close_detached_inactive_headless_session(
+            session_id,
+            reason="last_client_detached_after_operation",
+        )
+
+
 def _client_get_current_session_id(client_id: str | None) -> str | None:
     if not client_id:
         return None
@@ -311,7 +484,7 @@ def _client_set_current_session(client_id: str | None, session_id: str | None) -
         return
     with _client_lock:
         if client_id not in _client_current_sessions:
-            _client_current_sessions[client_id] = None
+            return
         _client_current_sessions[client_id] = session_id
 
 
@@ -384,6 +557,10 @@ def _tracked_headless_pids() -> set[int]:
     return tracked
 
 
+def _cleanup_untracked_headless_before_launch_enabled() -> bool:
+    return os.getenv("IDA_MCP_CLEAN_UNTRACKED_HEADLESS_BEFORE_LAUNCH", "0").strip().lower() in {"1", "true", "yes"}
+
+
 def _wait_for_session(pending: PendingLaunch, timeout_sec: float = 90.0):
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
@@ -399,6 +576,8 @@ def _wait_for_session(pending: PendingLaunch, timeout_sec: float = 90.0):
 
 def _current_or_explicit(session_id: str | None, client_id: str | None = None):
     _sweep_unreachable_sessions()
+    if client_id and not _client_is_connected(client_id):
+        raise ValueError(f"Unknown client_id: {client_id}")
     if session_id is None:
         session_id = _client_get_current_session_id(client_id)
     record = registry.get_session(session_id)
@@ -428,6 +607,21 @@ def _backend_candidates(record) -> list[dict[str, str]]:
     return [{"transport": transport, "url": url} for url in urls]
 
 
+def _backend_tool_timeout_sec(tool_name: str) -> float:
+    if tool_name == "export_decompiled_c":
+        return EXPORT_BACKEND_TIMEOUT_SEC
+    if tool_name == "save_database":
+        return SAVE_BACKEND_TIMEOUT_SEC
+    return 30.0
+
+
+def _normalize_export_fallback(value: str) -> str:
+    fallback = str(value or "comment").strip().lower()
+    if fallback not in {"comment", "none", "disasm", "asm"}:
+        raise ValueError("fallback must be one of: comment, none, disasm, asm")
+    return fallback
+
+
 def _backend_ready(record, timeout_sec: float = 20.0) -> bool:
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
@@ -450,6 +644,47 @@ def _backend_ready(record, timeout_sec: float = 20.0) -> bool:
 
 def _owner_pid_alive(pid: int | None) -> bool:
     return _get_launcher().is_process_alive(pid)
+
+
+def _terminate_managed_pid(pid: int | None, *, launch_token: str, errors: list[dict[str, Any]], step: str) -> bool:
+    if pid is None:
+        return False
+    launcher = _get_launcher()
+    if not launcher.is_managed_headless_process(int(pid), launch_token=launch_token):
+        errors.append({"step": step, "pid": int(pid), "error": "pid does not match managed headless launch token"})
+        return False
+    try:
+        launcher.terminate_process(int(pid))
+        return True
+    except Exception as exc:
+        errors.append({"step": step, "pid": int(pid), "error": str(exc)})
+        return False
+
+
+def _terminate_pending_launch(pending: PendingLaunch | None, *, step: str) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    if pending is not None:
+        _terminate_managed_pid(pending.pid, launch_token=str(pending.launch_token or ""), errors=errors, step=step)
+    return errors
+
+
+def _terminate_session_owner_if_managed(record, *, step: str) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    if not record.closable or record.owner_pid is None:
+        return errors
+    if record.engine == "headless" and record.source == "manager_created":
+        _terminate_managed_pid(
+            int(record.owner_pid),
+            launch_token=str(record.metadata.get("launch_token") or ""),
+            errors=errors,
+            step=step,
+        )
+    else:
+        try:
+            _get_launcher().terminate_process(int(record.owner_pid))
+        except Exception as exc:
+            errors.append({"step": step, "pid": int(record.owner_pid), "error": str(exc)})
+    return errors
 
 
 def _sweep_unreachable_sessions(probe_timeout_sec: float = 1.0, max_failures: int = 3) -> None:
@@ -994,7 +1229,15 @@ def _ensure_shared_daemon(timeout_sec: float = 20.0) -> None:
     raise RuntimeError(f"Timed out waiting for ida-hybrid-manager daemon at {DAEMON_URL}")
 
 
-def _daemon_request_sync(op_name: str, payload: dict[str, Any]) -> Any:
+def _daemon_operation_timeout_sec(op_name: str) -> float:
+    if op_name in {"open_binary", "load_idb", "export_decompiled_c"}:
+        return LONG_DAEMON_REQUEST_TIMEOUT_SEC
+    return DAEMON_REQUEST_TIMEOUT_SEC
+
+
+def _daemon_request_sync(op_name: str, payload: dict[str, Any], *, timeout_sec: float | None = None) -> Any:
+    if timeout_sec is None:
+        timeout_sec = _daemon_operation_timeout_sec(op_name)
     req = urllib.request.Request(
         f"{DAEMON_URL}/api/ops/{quote(op_name)}",
         data=json.dumps(payload).encode("utf-8"),
@@ -1002,7 +1245,7 @@ def _daemon_request_sync(op_name: str, payload: dict[str, Any]) -> Any:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             response = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
@@ -1017,7 +1260,7 @@ def _daemon_request_sync(op_name: str, payload: dict[str, Any]) -> Any:
 
 
 async def _daemon_request_async(op_name: str, payload: dict[str, Any]) -> Any:
-    return await asyncio.to_thread(_daemon_request_sync, op_name, payload)
+    return await asyncio.to_thread(_daemon_request_sync, op_name, payload, timeout_sec=_daemon_operation_timeout_sec(op_name))
 
 
 def _local_list_alive_sessions(client_id: str | None = None) -> dict[str, Any]:
@@ -1131,6 +1374,7 @@ def _local_open_binary(
                     "error": f"Failed to launch GUI IDA: {exc}",
                     "environment": environment,
                 }
+            _mark_pending_owner(pending, client_id)
             registry.register_pending_launch(pending)
             _daemon_debug(f"open_binary launched gui launch_token={pending.launch_token} pid={pending.pid}")
             record = _wait_for_session(pending)
@@ -1149,7 +1393,8 @@ def _local_open_binary(
             record = None
             pending = None
             for attempt in range(1, attempts + 1):
-                launcher.terminate_untracked_idat(_tracked_headless_pids())
+                if _cleanup_untracked_headless_before_launch_enabled():
+                    launcher.terminate_untracked_idat(_tracked_headless_pids())
                 try:
                     pending = launcher.launch_headless(path, manager_url(), allow_existing_idb=not remove_previous_idb)
                 except Exception as exc:
@@ -1164,6 +1409,7 @@ def _local_open_binary(
                         return last_failure
                     continue
 
+                _mark_pending_owner(pending, client_id)
                 registry.register_pending_launch(pending)
                 _daemon_debug(
                     "open_binary launched headless "
@@ -1175,17 +1421,14 @@ def _local_open_binary(
                         "open_binary wait timeout "
                         f"launch_token={pending.launch_token} attempt={attempt}/{attempts}"
                     )
-                    if pending.pid is not None:
-                        try:
-                            launcher.terminate_process(pending.pid)
-                        except Exception:
-                            pass
+                    cleanup_errors = _terminate_pending_launch(pending, step="open_binary_timeout_terminate")
                     last_failure = {
                         "ok": False,
                         "error": f"Timed out waiting for {pending.engine} session",
                         "pending": pending.to_dict(),
                         "environment": launcher.inspect_environment(),
                         "logs": _pending_log_summary(pending),
+                        "cleanup_errors": cleanup_errors,
                         "attempt": attempt,
                         "attempts": attempts,
                     }
@@ -1201,11 +1444,8 @@ def _local_open_binary(
                     break
 
                 _daemon_debug(f"open_binary backend_unreachable session_id={record.session_id} attempt={attempt}/{attempts}")
+                cleanup_errors = _terminate_session_owner_if_managed(record, step="open_binary_backend_unreachable_terminate")
                 if record.closable and record.owner_pid is not None:
-                    try:
-                        _get_launcher().terminate_process(record.owner_pid)
-                    except Exception:
-                        pass
                     registry.unregister(record.session_id, "backend_unreachable")
                 last_failure = {
                     "ok": False,
@@ -1214,6 +1454,7 @@ def _local_open_binary(
                     "endpoint_candidates": _backend_candidates(record),
                     "environment": _get_launcher().inspect_environment(),
                     "logs": _pending_log_summary(pending),
+                    "cleanup_errors": cleanup_errors,
                     "attempt": attempt,
                     "attempts": attempts,
                 }
@@ -1230,11 +1471,8 @@ def _local_open_binary(
             _daemon_debug(f"open_binary session-linked session_id={record.session_id} status={record.status} endpoint={record.endpoint}")
         if mode == "gui" and not _backend_ready(record):
             _daemon_debug(f"open_binary backend_unreachable session_id={record.session_id}")
+            cleanup_errors = _terminate_session_owner_if_managed(record, step="open_binary_gui_backend_unreachable_terminate")
             if record.closable and record.owner_pid is not None:
-                try:
-                    _get_launcher().terminate_process(record.owner_pid)
-                except Exception:
-                    pass
                 registry.unregister(record.session_id, "backend_unreachable")
             return {
                 "ok": False,
@@ -1243,6 +1481,7 @@ def _local_open_binary(
                 "endpoint_candidates": _backend_candidates(record),
                 "environment": _get_launcher().inspect_environment(),
                 "logs": _pending_log_summary(pending) if record.engine == "headless" else {},
+                "cleanup_errors": cleanup_errors,
             }
         if record.engine == "headless":
             try:
@@ -1353,6 +1592,7 @@ def _local_load_idb(
                     "error": f"Failed to load GUI IDA database: {exc}",
                     "environment": environment,
                 }
+            _mark_pending_owner(pending, client_id)
             registry.register_pending_launch(pending)
             _daemon_debug(f"load_idb launched gui launch_token={pending.launch_token} pid={pending.pid}")
             record = _wait_for_session(pending)
@@ -1370,7 +1610,8 @@ def _local_load_idb(
             record = None
             pending = None
             for attempt in range(1, attempts + 1):
-                launcher.terminate_untracked_idat(_tracked_headless_pids())
+                if _cleanup_untracked_headless_before_launch_enabled():
+                    launcher.terminate_untracked_idat(_tracked_headless_pids())
                 try:
                     pending = launcher.launch_headless_idb(path, manager_url())
                 except Exception as exc:
@@ -1385,6 +1626,7 @@ def _local_load_idb(
                         return last_failure
                     continue
 
+                _mark_pending_owner(pending, client_id)
                 registry.register_pending_launch(pending)
                 _daemon_debug(
                     "load_idb launched headless "
@@ -1396,17 +1638,14 @@ def _local_load_idb(
                         "load_idb wait timeout "
                         f"launch_token={pending.launch_token} attempt={attempt}/{attempts}"
                     )
-                    if pending.pid is not None:
-                        try:
-                            launcher.terminate_process(pending.pid)
-                        except Exception:
-                            pass
+                    cleanup_errors = _terminate_pending_launch(pending, step="load_idb_timeout_terminate")
                     last_failure = {
                         "ok": False,
                         "error": f"Timed out waiting for {pending.engine} session",
                         "pending": pending.to_dict(),
                         "environment": launcher.inspect_environment(),
                         "logs": _pending_log_summary(pending),
+                        "cleanup_errors": cleanup_errors,
                         "attempt": attempt,
                         "attempts": attempts,
                     }
@@ -1422,11 +1661,8 @@ def _local_load_idb(
                     break
 
                 _daemon_debug(f"load_idb backend_unreachable session_id={record.session_id} attempt={attempt}/{attempts}")
+                cleanup_errors = _terminate_session_owner_if_managed(record, step="load_idb_backend_unreachable_terminate")
                 if record.closable and record.owner_pid is not None:
-                    try:
-                        _get_launcher().terminate_process(record.owner_pid)
-                    except Exception:
-                        pass
                     registry.unregister(record.session_id, "backend_unreachable")
                 last_failure = {
                     "ok": False,
@@ -1435,6 +1671,7 @@ def _local_load_idb(
                     "endpoint_candidates": _backend_candidates(record),
                     "environment": _get_launcher().inspect_environment(),
                     "logs": _pending_log_summary(pending),
+                    "cleanup_errors": cleanup_errors,
                     "attempt": attempt,
                     "attempts": attempts,
                 }
@@ -1452,11 +1689,8 @@ def _local_load_idb(
             _daemon_debug(f"load_idb session-linked session_id={record.session_id} status={record.status} endpoint={record.endpoint}")
         if mode == "gui" and not _backend_ready(record):
             _daemon_debug(f"load_idb backend_unreachable session_id={record.session_id}")
+            cleanup_errors = _terminate_session_owner_if_managed(record, step="load_idb_gui_backend_unreachable_terminate")
             if record.closable and record.owner_pid is not None:
-                try:
-                    _get_launcher().terminate_process(record.owner_pid)
-                except Exception:
-                    pass
                 registry.unregister(record.session_id, "backend_unreachable")
             return {
                 "ok": False,
@@ -1465,6 +1699,7 @@ def _local_load_idb(
                 "endpoint_candidates": _backend_candidates(record),
                 "environment": _get_launcher().inspect_environment(),
                 "logs": _pending_log_summary(pending) if record.engine == "headless" else {},
+                "cleanup_errors": cleanup_errors,
             }
         if record.engine == "headless":
             try:
@@ -1516,21 +1751,62 @@ def _local_load_idb(
         }
 
 
-def _terminate_session_record(record, *, save: bool, reason: str) -> dict[str, Any]:
+def _terminate_session_record(record, *, save: bool, reason: str, force: bool = False) -> dict[str, Any]:
+    cleanup: dict[str, Any] = {}
+    errors: list[dict[str, Any]] = []
+    launch_token = str(record.metadata.get("launch_token") or "")
     if save and "save_database" in record.capabilities:
-        asyncio.run(call_backend_tool_any(_backend_candidates(record), "save_database", {}))
+        try:
+            save_result = asyncio.run(
+                call_backend_tool_any(_backend_candidates(record), "save_database", {}, timeout_sec=SAVE_BACKEND_TIMEOUT_SEC)
+            )
+            cleanup["save_database"] = save_result
+            if isinstance(save_result, dict) and save_result.get("ok") is False:
+                errors.append({"step": "save_database", "error": str(save_result.get("error") or "save_database returned ok=false")})
+        except Exception as exc:
+            errors.append({"step": "save_database", "error": str(exc)})
+        if errors and not force:
+            raise RuntimeError(f"save_database failed; close aborted to avoid data loss: {errors[-1]['error']}")
+
+    launcher = _get_launcher()
+    kill_pids: list[int] = []
     if record.owner_pid is not None:
-        _get_launcher().terminate_process(record.owner_pid)
-    cleanup = {}
+        kill_pids.append(int(record.owner_pid))
+    listener_pid = launcher.lookup_listener_pid(record.endpoint.get("url", ""))
+    if listener_pid is not None and listener_pid not in kill_pids:
+        kill_pids.append(listener_pid)
+    validated_kill_pids: list[int] = []
+    for pid in kill_pids:
+        if record.engine == "headless" and record.source == "manager_created":
+            if not launcher.is_managed_headless_process(pid, launch_token=launch_token):
+                errors.append({"step": "validate_process_owner", "pid": pid, "error": "pid does not match managed headless launch token"})
+                continue
+        validated_kill_pids.append(pid)
+    cleanup["kill_pids"] = validated_kill_pids
+    cleanup["owner_pid"] = record.owner_pid
+    cleanup["listener_pid"] = listener_pid
+    for pid in validated_kill_pids:
+        try:
+            launcher.terminate_process(pid)
+        except Exception as exc:
+            errors.append({"step": "terminate_process", "pid": pid, "error": str(exc)})
+
     if save:
-        cleanup["idb_persist"] = _persist_staged_idb(record)
+        try:
+            cleanup["idb_persist"] = _persist_staged_idb(record)
+        except Exception as exc:
+            errors.append({"step": "idb_persist", "error": str(exc)})
     staged_dir = str(record.metadata.get("staged_dir") or "")
     if staged_dir:
         cleanup["staged_dir"] = staged_dir
-        cleanup["deleted"] = _get_launcher().cleanup_staged_dir(staged_dir)
+        try:
+            cleanup["deleted"] = launcher.cleanup_staged_dir(staged_dir)
+        except Exception as exc:
+            cleanup["deleted"] = False
+            errors.append({"step": "cleanup_staged_dir", "error": str(exc)})
     registry.unregister(record.session_id, reason)
     _client_clear_session_references(record.session_id)
-    return {"ok": True, "closed_session_id": record.session_id, "cleanup": cleanup}
+    return {"ok": True, "closed_session_id": record.session_id, "cleanup": cleanup, "cleanup_errors": errors}
 
 
 def _local_close_session(session_id: str, save: bool = True, force: bool = False, client_id: str | None = None) -> dict[str, Any]:
@@ -1548,7 +1824,7 @@ def _local_close_session(session_id: str, save: bool = True, force: bool = False
     if error is not None or closable is None:
         return error or {"ok": False, "error": f"Unknown session: {session_id}"}
     try:
-        return _terminate_session_record(closable, save=save, reason="manager_close")
+        return _terminate_session_record(closable, save=save, reason="manager_close", force=force)
     except Exception as exc:
         registry.cancel_close(session_id)
         return {"ok": False, "error": "close_session_failed", "detail": str(exc), "session_id": session_id}
@@ -1556,7 +1832,7 @@ def _local_close_session(session_id: str, save: bool = True, force: bool = False
 
 async def _local_list_session_tools(session_id: str = "", client_id: str | None = None) -> dict[str, Any]:
     record = _current_or_explicit(session_id or None, client_id=client_id)
-    with registry.track_operation(record.session_id):
+    with _track_session_operation(record.session_id):
         with record.write_lock:
             latest = registry.get_session(record.session_id)
             if latest is None:
@@ -1570,7 +1846,7 @@ async def _local_list_session_tools(session_id: str = "", client_id: str | None 
 
 async def _local_call_session_tool(tool_name: str, arguments: Any = None, session_id: str = "", client_id: str | None = None) -> dict[str, Any]:
     record = _current_or_explicit(session_id or None, client_id=client_id)
-    with registry.track_operation(record.session_id):
+    with _track_session_operation(record.session_id):
         payload = _normalize_tool_arguments(tool_name, arguments)
         attachment = registry.get_client_attachment(record.session_id, client_id) or {}
         expected_txid = payload.get("expected_txid")
@@ -1601,11 +1877,14 @@ async def _local_call_session_tool(tool_name: str, arguments: Any = None, sessio
                 if expected_txid is None and seen_txid is not None and seen_txid != current_txid and not force_write:
                     warning = f"session_txid changed from {seen_txid} to {current_txid} before {tool_name}"
                 try:
-                    result = await call_backend_tool_any(_backend_candidates(latest), tool_name, backend_payload)
+                    result = await call_backend_tool_any(
+                        _backend_candidates(latest),
+                        tool_name,
+                        backend_payload,
+                        timeout_sec=_backend_tool_timeout_sec(tool_name),
+                    )
                 except BackendUnavailableError:
-                    if latest.engine == "headless" and latest.source == "manager_created":
-                        registry.unregister(latest.session_id, "backend_unreachable")
-                        _client_clear_session_references(latest.session_id)
+                    _daemon_debug(f"backend unavailable during mutating tool session_id={latest.session_id} tool={tool_name}")
                     raise
                 if not _backend_mutation_changed_db(result):
                     touched = registry.touch_client(latest.session_id, client_id) or latest
@@ -1613,13 +1892,16 @@ async def _local_call_session_tool(tool_name: str, arguments: Any = None, sessio
                 updated = registry.bump_txid(latest.session_id, client_id, tool_name) or latest
                 return _augment_session_meta(result, updated, client_id=client_id, warning=warning)
             try:
-                result = await call_backend_tool_any(_backend_candidates(latest), tool_name, backend_payload)
+                result = await call_backend_tool_any(
+                    _backend_candidates(latest),
+                    tool_name,
+                    backend_payload,
+                    timeout_sec=_backend_tool_timeout_sec(tool_name),
+                )
                 touched = registry.touch_client(latest.session_id, client_id) or latest
                 return _augment_session_meta(result, touched, client_id=client_id)
             except BackendUnavailableError:
-                if latest.engine == "headless" and latest.source == "manager_created":
-                    registry.unregister(latest.session_id, "backend_unreachable")
-                    _client_clear_session_references(latest.session_id)
+                _daemon_debug(f"backend unavailable during read-only tool session_id={latest.session_id} tool={tool_name}")
                 raise
 
 
@@ -1653,8 +1935,11 @@ async def _local_write_session_tool_output(
 
 def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
     client_id = payload.get("client_id")
+    if client_id and op_name not in {"connect_client", "disconnect_client"} and not _client_touch(client_id):
+        raise ValueError(f"Unknown client_id: {client_id}")
     op_map = {
         "connect_client": lambda **kwargs: _client_connect(**kwargs),
+        "heartbeat_client": lambda **kwargs: {"ok": bool(_client_touch(kwargs.get("client_id"))), "client_id": kwargs.get("client_id")},
         "disconnect_client": lambda **kwargs: _client_disconnect(kwargs.get("client_id")),
         "inspect_environment": lambda **kwargs: _local_inspect_environment(),
         "list_alive_sessions": lambda **kwargs: _local_list_alive_sessions(client_id=client_id),
@@ -1738,6 +2023,21 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
             kwargs.get("session_id", ""),
             client_id=client_id,
         ),
+        "export_decompiled_c": lambda **kwargs: _local_call_session_tool(
+            "export_decompiled_c",
+            {
+                "path": kwargs.get("path", ""),
+                "include_extern": kwargs.get("include_extern", False),
+                "include_thunks": kwargs.get("include_thunks", False),
+                "filter": kwargs.get("filter", ""),
+                "fallback": _normalize_export_fallback(kwargs.get("fallback", "comment")),
+                "max_functions": kwargs.get("max_functions", 0),
+                "return_code": kwargs.get("return_code", False),
+                "max_return_bytes": kwargs.get("max_return_bytes", 256 * 1024),
+            },
+            kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
         "decompile_line_map": lambda **kwargs: _local_call_session_tool("get_decompile_line_map", {"addr": kwargs["addr"]}, kwargs.get("session_id", ""), client_id=client_id),
         "disasm_function": lambda **kwargs: _local_call_session_tool(
             "disasm_function",
@@ -1769,10 +2069,11 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
     operation = op_map.get(op_name)
     if operation is None:
         raise ValueError(f"Unknown operation: {op_name}")
-    result = operation(**payload)
-    if asyncio.iscoroutine(result):
-        return asyncio.run(result)
-    return result
+    with _client_lease_renewal(client_id):
+        result = operation(**payload)
+        if asyncio.iscoroutine(result):
+            return asyncio.run(result)
+        return result
 
 
 @mcp.tool(description="List alive IDA sessions discovered by the manager.", structured_output=False)
@@ -1980,6 +2281,33 @@ async def decompile(addr: str, session_id: str = "", full: bool = False, detail:
     return _mcp_result(await _local_call_session_tool("decompile", _merge_detail_payload(None, full=full, detail=detail, addr=addr), session_id=session_id, client_id=CLIENT_ID))
 
 
+@mcp.tool(description="Export selected or all functions from the current IDB as one .c file. fallback must be one of: comment, none, disasm, asm.", structured_output=False)
+async def export_decompiled_c(
+    path: str = "",
+    session_id: str = "",
+    include_extern: bool = False,
+    include_thunks: bool = False,
+    filter: str = "",
+    fallback: str = "comment",
+    max_functions: int = 0,
+    return_code: bool = False,
+    max_return_bytes: int = 262144,
+) -> mcp_types.CallToolResult:
+    payload = {
+        "path": path,
+        "include_extern": include_extern,
+        "include_thunks": include_thunks,
+        "filter": filter,
+        "fallback": _normalize_export_fallback(fallback),
+        "max_functions": max_functions,
+        "return_code": return_code,
+        "max_return_bytes": max_return_bytes,
+    }
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(await _daemon_request_async("export_decompiled_c", {**payload, "session_id": session_id, "client_id": CLIENT_ID}))
+    return _mcp_result(await _local_call_session_tool("export_decompiled_c", payload, session_id=session_id, client_id=CLIENT_ID))
+
+
 @mcp.tool(description="Return pseudocode lines with best-effort disassembly address mapping from the explicit session_id, or from the current selected session when session_id is omitted.", structured_output=False)
 async def decompile_line_map(addr: str, session_id: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
@@ -2061,6 +2389,16 @@ async def set_comments(items: dict[str, Any] | list[dict[str, Any]], session_id:
 
 
 def _run_daemon() -> None:
+    stop_maintenance = threading.Event()
+
+    def maintenance_loop() -> None:
+        while not stop_maintenance.wait(CLIENT_LEASE_SWEEP_INTERVAL_SEC):
+            result = _sweep_stale_clients()
+            if result["stale_client_ids"] or result["auto_close_errors"]:
+                _daemon_debug(f"client lease sweep result={result}")
+
+    maintenance_thread = threading.Thread(target=maintenance_loop, name="ida-hybrid-manager-client-lease", daemon=True)
+    maintenance_thread.start()
     manager_api = ManagerApiServer(
         registry=registry,
         host=DAEMON_HOST,
@@ -2068,6 +2406,7 @@ def _run_daemon() -> None:
         api_version=DAEMON_API_VERSION,
         build_token=DAEMON_BUILD_TOKEN,
         op_dispatcher=_dispatch_operation,
+        session_registered_callback=_on_session_registered,
     )
     manager_api.start()
     try:
@@ -2076,7 +2415,9 @@ def _run_daemon() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        stop_maintenance.set()
         manager_api.stop()
+        maintenance_thread.join(timeout=2.0)
 
 
 def main() -> None:
@@ -2108,11 +2449,7 @@ def main() -> None:
         try:
             anyio.run(_run_stdio_server)
         finally:
-            if CLIENT_ID:
-                try:
-                    _daemon_request_sync("disconnect_client", {"client_id": CLIENT_ID})
-                except Exception as exc:
-                    _stdio_debug(f"disconnect_client failed: {exc!r}")
+            _disconnect_stdio_client("stdio_shutdown")
         return
 
     ACTIVE_BACKEND = "local"
@@ -2122,6 +2459,7 @@ def main() -> None:
         port=DAEMON_PORT,
         build_token=DAEMON_BUILD_TOKEN,
         op_dispatcher=_dispatch_operation,
+        session_registered_callback=_on_session_registered,
     )
     manager_api.start()
     try:

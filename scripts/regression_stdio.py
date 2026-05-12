@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import re
 import sys
 import time
@@ -31,6 +32,7 @@ REQUIRED_MANAGER_TOOLS = {
     "open_binary",
     "load_idb",
     "close_session",
+    "export_decompiled_c",
 }
 
 REQUIRED_BACKEND_TOOLS = {
@@ -40,6 +42,7 @@ REQUIRED_BACKEND_TOOLS = {
     "list_functions",
     "list_strings",
     "imports",
+    "export_decompiled_c",
 }
 
 
@@ -820,6 +823,33 @@ async def main(target: str) -> int:
                         _assert("line_map" in typed_export, f"typed_decompile_export missing line_map: {_json(typed_export)}")
                         print("TYPED_DECOMPILE_EXPORT ok")
 
+                        full_c_path = f"/mnt/c/Windows/Temp/regression_full_decompile_{int(time.time())}.c"
+                        full_c_resp = await call_tool(
+                            session,
+                            "export_decompiled_c",
+                            {
+                                "session_id": session_id,
+                                "path": full_c_path,
+                                "max_functions": 2,
+                                "fallback": "comment",
+                            },
+                        )
+                        full_c_export = _outer_structured(full_c_resp) or {}
+                        full_c_meta = _outer_meta(full_c_resp)
+                        full_c_text_summary = _content_text(full_c_resp)
+                        full_c_export_path = str(full_c_export.get("path") or "")
+                        _assert(full_c_export.get("ok") is True, f"export_decompiled_c failed: {_json(full_c_export)}")
+                        _assert(full_c_export.get("selected_count") == 2, f"export_decompiled_c selected_count mismatch: {_json(full_c_export)}")
+                        _assert(full_c_export_path.endswith(".c"), f"export_decompiled_c path missing .c: {_json(full_c_export)}")
+                        _assert(full_c_meta.get("content_mode") == "summary", f"export_decompiled_c missing summary mode: {_json(full_c_resp)}")
+                        _assert("code" not in full_c_export, f"export_decompiled_c default leaked code payload: {_json(full_c_export)}")
+                        _assert(full_c_text_summary and len(full_c_text_summary) < 160, f"export_decompiled_c content is not slim: {_json(full_c_resp)}")
+                        with open(_normalize_test_path(full_c_export_path), "r", encoding="utf-8") as handle:
+                            full_c_text = handle.read()
+                        _assert("IDA decompiled C export" in full_c_text, "export_decompiled_c file missing header")
+                        _assert("=====" in full_c_text, "export_decompiled_c file missing function separator")
+                        print("EXPORT_DECOMPILED_C ok")
+
                         write_output_path = f"/mnt/c/Windows/Temp/regression_decompile_{int(time.time())}.txt"
                         write_output_resp = await call_tool(
                             session,
@@ -980,7 +1010,9 @@ async def main(target: str) -> int:
                     _assert(close_data.get("ok") is True, f"close_session failed: {_json(close_data)}")
                     print("CLOSE ok")
 
-            if idb_target:
+            if idb_target and not Path(_normalize_test_path(idb_target)).exists():
+                print(f"LOAD_IDB skip missing target={idb_target}")
+            elif idb_target:
                 load_idb_resp = await call_tool(session, "load_idb", {"path": idb_target, "mode": "headless", "reuse": False})
                 load_idb_data = _outer_structured(load_idb_resp) or {}
                 _assert(load_idb_data.get("ok") is True, f"load_idb failed: {_json(load_idb_data)}")

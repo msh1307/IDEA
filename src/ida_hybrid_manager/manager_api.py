@@ -18,6 +18,7 @@ class ManagerApiServer:
         api_version: int = 3,
         build_token: str = "",
         op_dispatcher=None,
+        session_registered_callback=None,
     ) -> None:
         self.registry = registry
         self.host = host
@@ -25,12 +26,14 @@ class ManagerApiServer:
         self.api_version = api_version
         self.build_token = build_token
         self.op_dispatcher = op_dispatcher
+        self.session_registered_callback = session_registered_callback
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         registry = self.registry
         op_dispatcher = self.op_dispatcher
+        session_registered_callback = self.session_registered_callback
 
         class Handler(BaseHTTPRequestHandler):
             def _json(self, status: int, payload: dict[str, Any]) -> None:
@@ -65,6 +68,8 @@ class ManagerApiServer:
 
                 if self.path == "/api/sessions/register":
                     record = registry.register_session(payload)
+                    if session_registered_callback is not None:
+                        session_registered_callback(record)
                     self._json(200, {"ok": True, "session_id": record.session_id, "heartbeat_interval_sec": 10})
                     return
                 if self.path == "/api/sessions/heartbeat":

@@ -399,7 +399,7 @@ class IdaLauncher:
         stdout_log_path = to_windows_path(str(self.wsl_temp / f"{launch_token}.stdout.log"))
         stderr_log_path = to_windows_path(str(self.wsl_temp / f"{launch_token}.stderr.log"))
         headless_mode = (os.getenv("IDA_HEADLESS_MODE", "idat").strip() or "idat").lower()
-        use_gui_hidden = existing_idb or headless_mode in {"gui", "gui-hidden", "ida", "auto"}
+        use_gui_hidden = headless_mode in {"gui", "gui-hidden", "ida", "auto"}
         idat_log_path = to_windows_path(str(self.wsl_temp / f"{launch_token}.idat.log"))
         bootstrap_path = self._write_headless_bootstrap(
             port=port,
@@ -506,9 +506,36 @@ class IdaLauncher:
                 pids.append(int(line))
         return pids
 
+    def list_managed_headless_pids(self) -> list[int]:
+        result = self._powershell(
+            "Get-CimInstance -Query \"SELECT ProcessId,CommandLine FROM Win32_Process WHERE Name='idat.exe' OR Name='ida.exe'\" | "
+            "Where-Object { $_.CommandLine -like '*ida-hybrid-manager*headless-launch-*' } | "
+            "Select-Object -ExpandProperty ProcessId"
+        )
+        if result.returncode != 0:
+            return []
+        pids: list[int] = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+        return pids
+
+    def is_managed_headless_process(self, pid: int, *, launch_token: str = "") -> bool:
+        result = self._powershell(
+            f"Get-CimInstance -Query \"SELECT ProcessId,CommandLine FROM Win32_Process WHERE ProcessId={int(pid)}\" | "
+            "Select-Object -ExpandProperty CommandLine"
+        )
+        if result.returncode != 0:
+            return False
+        cmdline = result.stdout.strip()
+        if "ida-hybrid-manager" not in cmdline or "headless-launch-" not in cmdline:
+            return False
+        return not launch_token or launch_token in cmdline
+
     def terminate_untracked_idat(self, tracked_pids: set[int]) -> list[int]:
         terminated: list[int] = []
-        for pid in self.list_idat_pids():
+        for pid in self.list_managed_headless_pids():
             if pid in tracked_pids:
                 continue
             try:
@@ -567,6 +594,7 @@ class IdaLauncher:
             if not self.is_process_alive(pid):
                 return
             time.sleep(0.1)
+        raise RuntimeError(f"process {pid} did not exit after Stop-Process")
 
     def is_process_alive(self, pid: int | None) -> bool:
         if pid is None:
