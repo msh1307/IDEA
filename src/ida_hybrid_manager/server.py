@@ -658,6 +658,28 @@ def _request_timeout_value(value: Any = None, *, default: float) -> float:
     return max(1.0, numeric)
 
 
+def _run_coroutine_sync(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=runner, name="ida-sync-async-runner", daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
 def _maybe_wait_for_autoanalysis(record, *, operation: str, wait_for_analysis: bool, analysis_timeout_sec: Any = None) -> dict[str, Any]:
     if record.engine != "headless":
         return {"waited": False, "reason": "not_headless"}
@@ -666,7 +688,7 @@ def _maybe_wait_for_autoanalysis(record, *, operation: str, wait_for_analysis: b
     timeout_sec = _analysis_timeout_value(analysis_timeout_sec)
     try:
         _daemon_debug(f"{operation} wait_for_autoanalysis start session_id={record.session_id} timeout_sec={timeout_sec}")
-        analysis_result = asyncio.run(
+        analysis_result = _run_coroutine_sync(
             call_backend_tool_any(
                 _backend_candidates(record),
                 "wait_for_autoanalysis",
@@ -1826,7 +1848,7 @@ def _terminate_session_record(record, *, save: bool, reason: str, force: bool = 
     launch_token = str(record.metadata.get("launch_token") or "")
     if save and "save_database" in record.capabilities:
         try:
-            save_result = asyncio.run(
+            save_result = _run_coroutine_sync(
                 call_backend_tool_any(_backend_candidates(record), "save_database", {}, timeout_sec=SAVE_BACKEND_TIMEOUT_SEC)
             )
             cleanup["save_database"] = save_result
