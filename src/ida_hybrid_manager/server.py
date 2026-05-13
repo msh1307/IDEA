@@ -622,6 +622,38 @@ def _normalize_export_fallback(value: str) -> str:
     return fallback
 
 
+def _analysis_timeout_value(value: Any = None) -> float:
+    if value is None or value == "":
+        value = os.getenv("IDA_AUTOANALYSIS_TIMEOUT_SEC", "120")
+    return max(1.0, float(value))
+
+
+def _maybe_wait_for_autoanalysis(record, *, operation: str, wait_for_analysis: bool, analysis_timeout_sec: Any = None) -> dict[str, Any]:
+    if record.engine != "headless":
+        return {"waited": False, "reason": "not_headless"}
+    if not wait_for_analysis:
+        return {"waited": False, "reason": "disabled"}
+    timeout_sec = _analysis_timeout_value(analysis_timeout_sec)
+    try:
+        _daemon_debug(f"{operation} wait_for_autoanalysis start session_id={record.session_id} timeout_sec={timeout_sec}")
+        analysis_result = asyncio.run(
+            call_backend_tool_any(
+                _backend_candidates(record),
+                "wait_for_autoanalysis",
+                {"timeout_sec": timeout_sec},
+                timeout_sec=timeout_sec + 10.0,
+            )
+        )
+        _daemon_debug(
+            f"{operation} wait_for_autoanalysis done "
+            f"session_id={record.session_id} result={analysis_result.get('structuredContent', analysis_result)}"
+        )
+        return {"waited": True, "ok": True, "timeout_sec": timeout_sec}
+    except Exception as exc:
+        _daemon_debug(f"{operation} wait_for_autoanalysis failed session_id={record.session_id}: {exc!r}")
+        return {"waited": True, "ok": False, "timeout_sec": timeout_sec, "error": str(exc)}
+
+
 def _backend_ready(record, timeout_sec: float = 20.0) -> bool:
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
@@ -1314,6 +1346,8 @@ def _local_open_binary(
     mode: str = "auto",
     reuse: bool = True,
     remove_previous_idb: bool = False,
+    wait_for_analysis: bool = False,
+    analysis_timeout_sec: Any = None,
     client_id: str | None = None,
 ) -> dict[str, Any]:
     with _open_binary_lock:
@@ -1326,7 +1360,8 @@ def _local_open_binary(
         removed_idb = _remove_adjacent_idb(normalized) if remove_previous_idb else None
         _daemon_debug(
             "open_binary start "
-            f"path={path!r} mode={mode} reuse={reuse} remove_previous_idb={remove_previous_idb} client_id={client_id}"
+            f"path={path!r} mode={mode} reuse={reuse} remove_previous_idb={remove_previous_idb} "
+            f"wait_for_analysis={wait_for_analysis} client_id={client_id}"
         )
         if reuse:
             preferred_engine = None if mode == "auto" else mode
@@ -1483,23 +1518,13 @@ def _local_open_binary(
                 "logs": _pending_log_summary(pending) if record.engine == "headless" else {},
                 "cleanup_errors": cleanup_errors,
             }
+        analysis_wait = _maybe_wait_for_autoanalysis(
+            record,
+            operation="open_binary",
+            wait_for_analysis=wait_for_analysis,
+            analysis_timeout_sec=analysis_timeout_sec,
+        )
         if record.engine == "headless":
-            try:
-                _daemon_debug(f"open_binary wait_for_autoanalysis start session_id={record.session_id}")
-                analysis_result = asyncio.run(
-                    call_backend_tool_any(
-                        _backend_candidates(record),
-                        "wait_for_autoanalysis",
-                        {"timeout_sec": float(os.getenv("IDA_AUTOANALYSIS_TIMEOUT_SEC", "120"))},
-                        timeout_sec=float(os.getenv("IDA_AUTOANALYSIS_TIMEOUT_SEC", "120")) + 10.0,
-                    )
-                )
-                _daemon_debug(
-                    "open_binary wait_for_autoanalysis done "
-                    f"session_id={record.session_id} result={analysis_result.get('structuredContent', analysis_result)}"
-                )
-            except Exception:
-                _daemon_debug(f"open_binary wait_for_autoanalysis failed session_id={record.session_id}")
             try:
                 _daemon_debug(f"open_binary list_backend_tools start session_id={record.session_id}")
                 tools_info = asyncio.run(list_backend_tools_any(_backend_candidates(record)))
@@ -1531,6 +1556,7 @@ def _local_open_binary(
             "reused": False,
             "remove_previous_idb": remove_previous_idb,
             "removed_previous_idb": removed_idb,
+            "analysis": analysis_wait,
             **_session_idb_status(attached),
         }
 
@@ -1539,6 +1565,8 @@ def _local_load_idb(
     path: str,
     mode: str = "headless",
     reuse: bool = True,
+    wait_for_analysis: bool = False,
+    analysis_timeout_sec: Any = None,
     client_id: str | None = None,
 ) -> dict[str, Any]:
     with _open_binary_lock:
@@ -1549,7 +1577,7 @@ def _local_load_idb(
         candidate_paths = {normalized.input_path, normalized.windows_path, normalized.wsl_path}
         _daemon_debug(
             "load_idb start "
-            f"path={path!r} mode={mode} reuse={reuse} client_id={client_id}"
+            f"path={path!r} mode={mode} reuse={reuse} wait_for_analysis={wait_for_analysis} client_id={client_id}"
         )
         if reuse:
             preferred_engine = None if mode == "auto" else mode
@@ -1701,23 +1729,13 @@ def _local_load_idb(
                 "logs": _pending_log_summary(pending) if record.engine == "headless" else {},
                 "cleanup_errors": cleanup_errors,
             }
+        analysis_wait = _maybe_wait_for_autoanalysis(
+            record,
+            operation="load_idb",
+            wait_for_analysis=wait_for_analysis,
+            analysis_timeout_sec=analysis_timeout_sec,
+        )
         if record.engine == "headless":
-            try:
-                _daemon_debug(f"load_idb wait_for_autoanalysis start session_id={record.session_id}")
-                analysis_result = asyncio.run(
-                    call_backend_tool_any(
-                        _backend_candidates(record),
-                        "wait_for_autoanalysis",
-                        {"timeout_sec": float(os.getenv("IDA_AUTOANALYSIS_TIMEOUT_SEC", "120"))},
-                        timeout_sec=float(os.getenv("IDA_AUTOANALYSIS_TIMEOUT_SEC", "120")) + 10.0,
-                    )
-                )
-                _daemon_debug(
-                    "load_idb wait_for_autoanalysis done "
-                    f"session_id={record.session_id} result={analysis_result.get('structuredContent', analysis_result)}"
-                )
-            except Exception:
-                _daemon_debug(f"load_idb wait_for_autoanalysis failed session_id={record.session_id}")
             try:
                 _daemon_debug(f"load_idb list_backend_tools start session_id={record.session_id}")
                 tools_info = asyncio.run(list_backend_tools_any(_backend_candidates(record)))
@@ -1747,6 +1765,7 @@ def _local_load_idb(
             "revision": _session_revision_payload(attached, client_id),
             "selected": True,
             "reused": False,
+            "analysis": analysis_wait,
             **_session_idb_status(attached),
         }
 
@@ -1951,12 +1970,16 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
             kwargs.get("mode", "auto"),
             kwargs.get("reuse", True),
             kwargs.get("remove_previous_idb", False),
+            kwargs.get("wait_for_analysis", False),
+            kwargs.get("analysis_timeout_sec"),
             client_id=client_id,
         ),
         "load_idb": lambda **kwargs: _local_load_idb(
             kwargs["path"],
             kwargs.get("mode", "headless"),
             kwargs.get("reuse", True),
+            kwargs.get("wait_for_analysis", False),
+            kwargs.get("analysis_timeout_sec"),
             client_id=client_id,
         ),
         "close_session": lambda **kwargs: _local_close_session(kwargs["session_id"], kwargs.get("save", True), kwargs.get("force", False), client_id=client_id),
@@ -2111,35 +2134,67 @@ def inspect_environment() -> mcp_types.CallToolResult:
     return _mcp_result(_local_inspect_environment())
 
 
-@mcp.tool(description="Open a binary in headless mode, GUI mode, or auto mode and select the resulting session. By default this reuses an existing live session when possible and reuses an adjacent .i64 when launching fresh. Set remove_previous_idb=true to force a fresh launch without reusing the adjacent .i64.", structured_output=False)
-def open_binary(path: str, mode: str = "auto", reuse: bool = True, remove_previous_idb: bool = False) -> mcp_types.CallToolResult:
+@mcp.tool(description="Open a binary in headless mode, GUI mode, or auto mode and select the resulting session. By default this returns once the backend is reachable; set wait_for_analysis=true to also wait for IDA autoanalysis.", structured_output=False)
+def open_binary(
+    path: str,
+    mode: str = "auto",
+    reuse: bool = True,
+    remove_previous_idb: bool = False,
+    wait_for_analysis: bool = False,
+    analysis_timeout_sec: float = 120.0,
+) -> mcp_types.CallToolResult:
     if str(path or "").strip().lower().endswith(".i64"):
         return _mcp_error_result("open_binary expects the original binary path. Use load_idb() to open an existing .i64 database.")
     if ACTIVE_BACKEND == "daemon":
         return _mcp_result(_daemon_request_sync(
             "open_binary",
-            {"path": path, "mode": mode, "reuse": reuse, "remove_previous_idb": remove_previous_idb, "client_id": CLIENT_ID},
+            {
+                "path": path,
+                "mode": mode,
+                "reuse": reuse,
+                "remove_previous_idb": remove_previous_idb,
+                "wait_for_analysis": wait_for_analysis,
+                "analysis_timeout_sec": analysis_timeout_sec,
+                "client_id": CLIENT_ID,
+            },
         ))
     return _mcp_result(_local_open_binary(
         path=path,
         mode=mode,
         reuse=reuse,
         remove_previous_idb=remove_previous_idb,
+        wait_for_analysis=wait_for_analysis,
+        analysis_timeout_sec=analysis_timeout_sec,
         client_id=CLIENT_ID,
     ))
 
 
-@mcp.tool(description="Load an existing .i64 database in headless or GUI mode and select the resulting session.", structured_output=False)
-def load_idb(path: str, mode: str = "headless", reuse: bool = True) -> mcp_types.CallToolResult:
+@mcp.tool(description="Load an existing .i64 database in headless or GUI mode and select the resulting session. By default this returns once the backend is reachable; set wait_for_analysis=true to also wait for IDA autoanalysis.", structured_output=False)
+def load_idb(
+    path: str,
+    mode: str = "headless",
+    reuse: bool = True,
+    wait_for_analysis: bool = False,
+    analysis_timeout_sec: float = 120.0,
+) -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
         return _mcp_result(_daemon_request_sync(
             "load_idb",
-            {"path": path, "mode": mode, "reuse": reuse, "client_id": CLIENT_ID},
+            {
+                "path": path,
+                "mode": mode,
+                "reuse": reuse,
+                "wait_for_analysis": wait_for_analysis,
+                "analysis_timeout_sec": analysis_timeout_sec,
+                "client_id": CLIENT_ID,
+            },
         ))
     return _mcp_result(_local_load_idb(
         path=path,
         mode=mode,
         reuse=reuse,
+        wait_for_analysis=wait_for_analysis,
+        analysis_timeout_sec=analysis_timeout_sec,
         client_id=CLIENT_ID,
     ))
 

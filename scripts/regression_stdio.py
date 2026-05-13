@@ -189,7 +189,11 @@ async def main(target: str) -> int:
             _assert(misuse_data.get("ok") is False and "load_idb" in str(misuse_data.get("error") or ""), f"open_binary(.i64) error payload unexpected: {_json(misuse_resp)}")
             print("OPEN misuse error ok")
 
-            opened = await call_tool(session, "open_binary", {"path": target, "mode": "headless", "reuse": False})
+            opened = await call_tool(
+                session,
+                "open_binary",
+                {"path": target, "mode": "headless", "reuse": False, "wait_for_analysis": True, "analysis_timeout_sec": 120},
+            )
             open_data = _outer_structured(opened) or {}
             open_text = _content_text(opened)
             open_meta = _outer_meta(opened)
@@ -1013,7 +1017,11 @@ async def main(target: str) -> int:
             if idb_target and not Path(_normalize_test_path(idb_target)).exists():
                 print(f"LOAD_IDB skip missing target={idb_target}")
             elif idb_target:
-                load_idb_resp = await call_tool(session, "load_idb", {"path": idb_target, "mode": "headless", "reuse": False})
+                load_idb_resp = await call_tool(
+                    session,
+                    "load_idb",
+                    {"path": idb_target, "mode": "headless", "reuse": False, "wait_for_analysis": True, "analysis_timeout_sec": 120},
+                )
                 load_idb_data = _outer_structured(load_idb_resp) or {}
                 _assert(load_idb_data.get("ok") is True, f"load_idb failed: {_json(load_idb_data)}")
                 _assert(bool(load_idb_data.get("idb_loaded")), f"load_idb did not mark idb_loaded: {_json(load_idb_data)}")
