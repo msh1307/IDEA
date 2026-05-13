@@ -625,7 +625,37 @@ def _normalize_export_fallback(value: str) -> str:
 def _analysis_timeout_value(value: Any = None) -> float:
     if value is None or value == "":
         value = os.getenv("IDA_AUTOANALYSIS_TIMEOUT_SEC", "120")
-    return max(1.0, float(value))
+    numeric = float(value)
+    if numeric <= 0:
+        numeric = float(os.getenv("IDA_AUTOANALYSIS_TIMEOUT_SEC", "120") or 120.0)
+    return max(1.0, numeric)
+
+
+def _launch_timeout_value(value: Any = None) -> float:
+    if value is None or value == "":
+        value = os.getenv("IDA_SESSION_LAUNCH_TIMEOUT_SEC", "90")
+    numeric = float(value)
+    if numeric <= 0:
+        numeric = float(os.getenv("IDA_SESSION_LAUNCH_TIMEOUT_SEC", "90") or 90.0)
+    return max(1.0, numeric)
+
+
+def _backend_ready_timeout_value(value: Any = None) -> float:
+    if value is None or value == "":
+        value = os.getenv("IDA_BACKEND_READY_TIMEOUT_SEC", "20")
+    numeric = float(value)
+    if numeric <= 0:
+        numeric = float(os.getenv("IDA_BACKEND_READY_TIMEOUT_SEC", "20") or 20.0)
+    return max(1.0, numeric)
+
+
+def _request_timeout_value(value: Any = None, *, default: float) -> float:
+    if value is None or value == "":
+        return default
+    numeric = float(value)
+    if numeric <= 0:
+        return default
+    return max(1.0, numeric)
 
 
 def _maybe_wait_for_autoanalysis(record, *, operation: str, wait_for_analysis: bool, analysis_timeout_sec: Any = None) -> dict[str, Any]:
@@ -1348,9 +1378,13 @@ def _local_open_binary(
     remove_previous_idb: bool = False,
     wait_for_analysis: bool = False,
     analysis_timeout_sec: Any = None,
+    launch_timeout_sec: Any = None,
+    backend_ready_timeout_sec: Any = None,
     client_id: str | None = None,
 ) -> dict[str, Any]:
     with _open_binary_lock:
+        launch_timeout = _launch_timeout_value(launch_timeout_sec)
+        backend_ready_timeout = _backend_ready_timeout_value(backend_ready_timeout_sec)
         _sweep_unreachable_sessions()
         normalized = normalize_path(path)
         candidate_paths = {normalized.input_path, normalized.windows_path, normalized.wsl_path}
@@ -1361,7 +1395,8 @@ def _local_open_binary(
         _daemon_debug(
             "open_binary start "
             f"path={path!r} mode={mode} reuse={reuse} remove_previous_idb={remove_previous_idb} "
-            f"wait_for_analysis={wait_for_analysis} client_id={client_id}"
+            f"wait_for_analysis={wait_for_analysis} launch_timeout_sec={launch_timeout} "
+            f"backend_ready_timeout_sec={backend_ready_timeout} client_id={client_id}"
         )
         if reuse:
             preferred_engine = None if mode == "auto" else mode
@@ -1412,7 +1447,7 @@ def _local_open_binary(
             _mark_pending_owner(pending, client_id)
             registry.register_pending_launch(pending)
             _daemon_debug(f"open_binary launched gui launch_token={pending.launch_token} pid={pending.pid}")
-            record = _wait_for_session(pending)
+            record = _wait_for_session(pending, timeout_sec=launch_timeout)
             if record is None:
                 _daemon_debug(f"open_binary wait timeout launch_token={pending.launch_token}")
                 return {
@@ -1450,7 +1485,7 @@ def _local_open_binary(
                     "open_binary launched headless "
                     f"launch_token={pending.launch_token} pid={pending.pid} port={pending.port} attempt={attempt}/{attempts}"
                 )
-                record = _wait_for_session(pending)
+                record = _wait_for_session(pending, timeout_sec=launch_timeout)
                 if record is None:
                     _daemon_debug(
                         "open_binary wait timeout "
@@ -1475,7 +1510,7 @@ def _local_open_binary(
                     "open_binary session-linked "
                     f"session_id={record.session_id} status={record.status} endpoint={record.endpoint} attempt={attempt}/{attempts}"
                 )
-                if _backend_ready(record):
+                if _backend_ready(record, timeout_sec=backend_ready_timeout):
                     break
 
                 _daemon_debug(f"open_binary backend_unreachable session_id={record.session_id} attempt={attempt}/{attempts}")
@@ -1504,7 +1539,7 @@ def _local_open_binary(
                 }
         if mode == "gui":
             _daemon_debug(f"open_binary session-linked session_id={record.session_id} status={record.status} endpoint={record.endpoint}")
-        if mode == "gui" and not _backend_ready(record):
+        if mode == "gui" and not _backend_ready(record, timeout_sec=backend_ready_timeout):
             _daemon_debug(f"open_binary backend_unreachable session_id={record.session_id}")
             cleanup_errors = _terminate_session_owner_if_managed(record, step="open_binary_gui_backend_unreachable_terminate")
             if record.closable and record.owner_pid is not None:
@@ -1557,6 +1592,11 @@ def _local_open_binary(
             "remove_previous_idb": remove_previous_idb,
             "removed_previous_idb": removed_idb,
             "analysis": analysis_wait,
+            "timeouts": {
+                "launch_timeout_sec": launch_timeout,
+                "backend_ready_timeout_sec": backend_ready_timeout,
+                "analysis_timeout_sec": _analysis_timeout_value(analysis_timeout_sec) if wait_for_analysis else None,
+            },
             **_session_idb_status(attached),
         }
 
@@ -1567,9 +1607,13 @@ def _local_load_idb(
     reuse: bool = True,
     wait_for_analysis: bool = False,
     analysis_timeout_sec: Any = None,
+    launch_timeout_sec: Any = None,
+    backend_ready_timeout_sec: Any = None,
     client_id: str | None = None,
 ) -> dict[str, Any]:
     with _open_binary_lock:
+        launch_timeout = _launch_timeout_value(launch_timeout_sec)
+        backend_ready_timeout = _backend_ready_timeout_value(backend_ready_timeout_sec)
         _sweep_unreachable_sessions()
         normalized = normalize_path(path)
         if not str(normalized.wsl_path).lower().endswith(".i64"):
@@ -1577,7 +1621,8 @@ def _local_load_idb(
         candidate_paths = {normalized.input_path, normalized.windows_path, normalized.wsl_path}
         _daemon_debug(
             "load_idb start "
-            f"path={path!r} mode={mode} reuse={reuse} wait_for_analysis={wait_for_analysis} client_id={client_id}"
+            f"path={path!r} mode={mode} reuse={reuse} wait_for_analysis={wait_for_analysis} "
+            f"launch_timeout_sec={launch_timeout} backend_ready_timeout_sec={backend_ready_timeout} client_id={client_id}"
         )
         if reuse:
             preferred_engine = None if mode == "auto" else mode
@@ -1623,7 +1668,7 @@ def _local_load_idb(
             _mark_pending_owner(pending, client_id)
             registry.register_pending_launch(pending)
             _daemon_debug(f"load_idb launched gui launch_token={pending.launch_token} pid={pending.pid}")
-            record = _wait_for_session(pending)
+            record = _wait_for_session(pending, timeout_sec=launch_timeout)
             if record is None:
                 _daemon_debug(f"load_idb wait timeout launch_token={pending.launch_token}")
                 return {
@@ -1660,7 +1705,7 @@ def _local_load_idb(
                     "load_idb launched headless "
                     f"launch_token={pending.launch_token} pid={pending.pid} port={pending.port} attempt={attempt}/{attempts}"
                 )
-                record = _wait_for_session(pending)
+                record = _wait_for_session(pending, timeout_sec=launch_timeout)
                 if record is None:
                     _daemon_debug(
                         "load_idb wait timeout "
@@ -1685,7 +1730,7 @@ def _local_load_idb(
                     "load_idb session-linked "
                     f"session_id={record.session_id} status={record.status} endpoint={record.endpoint} attempt={attempt}/{attempts}"
                 )
-                if _backend_ready(record):
+                if _backend_ready(record, timeout_sec=backend_ready_timeout):
                     break
 
                 _daemon_debug(f"load_idb backend_unreachable session_id={record.session_id} attempt={attempt}/{attempts}")
@@ -1715,7 +1760,7 @@ def _local_load_idb(
 
         if mode == "gui":
             _daemon_debug(f"load_idb session-linked session_id={record.session_id} status={record.status} endpoint={record.endpoint}")
-        if mode == "gui" and not _backend_ready(record):
+        if mode == "gui" and not _backend_ready(record, timeout_sec=backend_ready_timeout):
             _daemon_debug(f"load_idb backend_unreachable session_id={record.session_id}")
             cleanup_errors = _terminate_session_owner_if_managed(record, step="load_idb_gui_backend_unreachable_terminate")
             if record.closable and record.owner_pid is not None:
@@ -1766,6 +1811,11 @@ def _local_load_idb(
             "selected": True,
             "reused": False,
             "analysis": analysis_wait,
+            "timeouts": {
+                "launch_timeout_sec": launch_timeout,
+                "backend_ready_timeout_sec": backend_ready_timeout,
+                "analysis_timeout_sec": _analysis_timeout_value(analysis_timeout_sec) if wait_for_analysis else None,
+            },
             **_session_idb_status(attached),
         }
 
@@ -1972,6 +2022,8 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
             kwargs.get("remove_previous_idb", False),
             kwargs.get("wait_for_analysis", False),
             kwargs.get("analysis_timeout_sec"),
+            kwargs.get("launch_timeout_sec"),
+            kwargs.get("backend_ready_timeout_sec"),
             client_id=client_id,
         ),
         "load_idb": lambda **kwargs: _local_load_idb(
@@ -1980,6 +2032,8 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
             kwargs.get("reuse", True),
             kwargs.get("wait_for_analysis", False),
             kwargs.get("analysis_timeout_sec"),
+            kwargs.get("launch_timeout_sec"),
+            kwargs.get("backend_ready_timeout_sec"),
             client_id=client_id,
         ),
         "close_session": lambda **kwargs: _local_close_session(kwargs["session_id"], kwargs.get("save", True), kwargs.get("force", False), client_id=client_id),
@@ -2142,6 +2196,9 @@ def open_binary(
     remove_previous_idb: bool = False,
     wait_for_analysis: bool = False,
     analysis_timeout_sec: float = 120.0,
+    launch_timeout_sec: float = 90.0,
+    backend_ready_timeout_sec: float = 20.0,
+    request_timeout_sec: float = 0.0,
 ) -> mcp_types.CallToolResult:
     if str(path or "").strip().lower().endswith(".i64"):
         return _mcp_error_result("open_binary expects the original binary path. Use load_idb() to open an existing .i64 database.")
@@ -2155,8 +2212,11 @@ def open_binary(
                 "remove_previous_idb": remove_previous_idb,
                 "wait_for_analysis": wait_for_analysis,
                 "analysis_timeout_sec": analysis_timeout_sec,
+                "launch_timeout_sec": launch_timeout_sec,
+                "backend_ready_timeout_sec": backend_ready_timeout_sec,
                 "client_id": CLIENT_ID,
             },
+            timeout_sec=_request_timeout_value(request_timeout_sec, default=_daemon_operation_timeout_sec("open_binary")),
         ))
     return _mcp_result(_local_open_binary(
         path=path,
@@ -2165,6 +2225,8 @@ def open_binary(
         remove_previous_idb=remove_previous_idb,
         wait_for_analysis=wait_for_analysis,
         analysis_timeout_sec=analysis_timeout_sec,
+        launch_timeout_sec=launch_timeout_sec,
+        backend_ready_timeout_sec=backend_ready_timeout_sec,
         client_id=CLIENT_ID,
     ))
 
@@ -2176,6 +2238,9 @@ def load_idb(
     reuse: bool = True,
     wait_for_analysis: bool = False,
     analysis_timeout_sec: float = 120.0,
+    launch_timeout_sec: float = 90.0,
+    backend_ready_timeout_sec: float = 20.0,
+    request_timeout_sec: float = 0.0,
 ) -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
         return _mcp_result(_daemon_request_sync(
@@ -2186,8 +2251,11 @@ def load_idb(
                 "reuse": reuse,
                 "wait_for_analysis": wait_for_analysis,
                 "analysis_timeout_sec": analysis_timeout_sec,
+                "launch_timeout_sec": launch_timeout_sec,
+                "backend_ready_timeout_sec": backend_ready_timeout_sec,
                 "client_id": CLIENT_ID,
             },
+            timeout_sec=_request_timeout_value(request_timeout_sec, default=_daemon_operation_timeout_sec("load_idb")),
         ))
     return _mcp_result(_local_load_idb(
         path=path,
@@ -2195,6 +2263,8 @@ def load_idb(
         reuse=reuse,
         wait_for_analysis=wait_for_analysis,
         analysis_timeout_sec=analysis_timeout_sec,
+        launch_timeout_sec=launch_timeout_sec,
+        backend_ready_timeout_sec=backend_ready_timeout_sec,
         client_id=CLIENT_ID,
     ))
 
