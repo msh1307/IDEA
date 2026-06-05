@@ -135,6 +135,7 @@ STDIO_PING_TIMEOUT_SEC = max(1.0, float(os.getenv("IDA_MCP_STDIO_PING_TIMEOUT_SE
 STDIO_PING_FAILURES_BEFORE_EXIT = max(1, int(os.getenv("IDA_MCP_STDIO_PING_FAILURES_BEFORE_EXIT", "3") or 3))
 STDIO_IDLE_CHECK_INTERVAL_SEC = max(5.0, min(60.0, float(os.getenv("IDA_MCP_STDIO_IDLE_CHECK_INTERVAL_SEC", "30") or 30.0)))
 STDIO_DISCONNECT_TIMEOUT_SEC = max(1.0, float(os.getenv("IDA_MCP_STDIO_DISCONNECT_TIMEOUT_SEC", "60") or 60.0))
+STDIO_PARENT_CHECK_INTERVAL_SEC = max(1.0, min(30.0, float(os.getenv("IDA_MCP_STDIO_PARENT_CHECK_INTERVAL_SEC", "5") or 5.0)))
 CLIENT_LEASE_TIMEOUT_SEC = max(60.0, float(os.getenv("IDA_MCP_CLIENT_LEASE_TIMEOUT_SEC", str(max(900, STDIO_IDLE_TIMEOUT_SEC * 2))) or 900.0))
 CLIENT_LEASE_SWEEP_INTERVAL_SEC = max(10.0, min(120.0, float(os.getenv("IDA_MCP_CLIENT_LEASE_SWEEP_INTERVAL_SEC", "30") or 30.0)))
 DAEMON_REQUEST_TIMEOUT_SEC = max(30.0, float(os.getenv("IDA_MCP_DAEMON_REQUEST_TIMEOUT_SEC", "120") or 120.0))
@@ -173,6 +174,7 @@ async def _force_exit_stdio(reason: str) -> None:
 
 async def _run_stdio_server() -> None:
     _stdio_debug("stdio bootstrap start")
+    initial_parent_pid = os.getppid()
     stdin = anyio.wrap_file(TextIOWrapper(sys.stdin.buffer, encoding="utf-8"))
     stdout = anyio.wrap_file(TextIOWrapper(sys.stdout.buffer, encoding="utf-8"))
     read_stream_writer, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](0)
@@ -195,12 +197,14 @@ async def _run_stdio_server() -> None:
                         await read_stream_writer.send(exc)
                         continue
                     await read_stream_writer.send(SessionMessage(message))
+                _stdio_debug("stdin_reader eof")
         except Exception as exc:
             _stdio_debug(f"stdin_reader exception: {exc!r}")
             _stdio_debug(traceback.format_exc())
             raise
         finally:
             _stdio_debug("stdin_reader stop")
+            await _force_exit_stdio("stdin_eof")
 
     async def stdout_writer() -> None:
         _stdio_debug("stdout_writer start")
@@ -292,10 +296,25 @@ async def _run_stdio_server() -> None:
                     if ping_failures >= STDIO_PING_FAILURES_BEFORE_EXIT:
                         await _force_exit_stdio("heartbeat_failed")
 
+        async def parent_monitor() -> None:
+            _stdio_debug(f"parent monitor start initial_parent_pid={initial_parent_pid}")
+            if initial_parent_pid <= 1:
+                return
+            while True:
+                await anyio.sleep(STDIO_PARENT_CHECK_INTERVAL_SEC)
+                current_parent_pid = os.getppid()
+                if current_parent_pid != initial_parent_pid:
+                    _stdio_debug(
+                        "parent changed; exiting stdio "
+                        f"initial_parent_pid={initial_parent_pid} current_parent_pid={current_parent_pid}"
+                    )
+                    await _force_exit_stdio("parent_process_exited")
+
         async with anyio.create_task_group() as tg:
             tg.start_soon(stdin_reader)
             tg.start_soon(stdout_writer)
             tg.start_soon(idle_monitor)
+            tg.start_soon(parent_monitor)
             _stdio_debug("stdio transport ready")
             try:
                 async for message in session.incoming_messages:
