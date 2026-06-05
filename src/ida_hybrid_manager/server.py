@@ -135,6 +135,7 @@ STDIO_PING_TIMEOUT_SEC = max(1.0, float(os.getenv("IDA_MCP_STDIO_PING_TIMEOUT_SE
 STDIO_PING_FAILURES_BEFORE_EXIT = max(1, int(os.getenv("IDA_MCP_STDIO_PING_FAILURES_BEFORE_EXIT", "3") or 3))
 STDIO_IDLE_CHECK_INTERVAL_SEC = max(5.0, min(60.0, float(os.getenv("IDA_MCP_STDIO_IDLE_CHECK_INTERVAL_SEC", "30") or 30.0)))
 STDIO_DISCONNECT_TIMEOUT_SEC = max(1.0, float(os.getenv("IDA_MCP_STDIO_DISCONNECT_TIMEOUT_SEC", "60") or 60.0))
+STDIO_FORCE_EXIT_GRACE_SEC = max(0.1, float(os.getenv("IDA_MCP_STDIO_FORCE_EXIT_GRACE_SEC", "3") or 3.0))
 STDIO_PARENT_CHECK_INTERVAL_SEC = max(1.0, min(30.0, float(os.getenv("IDA_MCP_STDIO_PARENT_CHECK_INTERVAL_SEC", "5") or 5.0)))
 CLIENT_LEASE_TIMEOUT_SEC = max(60.0, float(os.getenv("IDA_MCP_CLIENT_LEASE_TIMEOUT_SEC", str(max(900, STDIO_IDLE_TIMEOUT_SEC * 2))) or 900.0))
 CLIENT_LEASE_SWEEP_INTERVAL_SEC = max(10.0, min(120.0, float(os.getenv("IDA_MCP_CLIENT_LEASE_SWEEP_INTERVAL_SEC", "30") or 30.0)))
@@ -167,7 +168,13 @@ def _disconnect_stdio_client(reason: str) -> None:
 
 async def _force_exit_stdio(reason: str) -> None:
     _stdio_debug(f"stdio forced exit start reason={reason}")
-    await anyio.to_thread.run_sync(_disconnect_stdio_client, reason)
+    try:
+        with anyio.move_on_after(STDIO_FORCE_EXIT_GRACE_SEC) as scope:
+            await anyio.to_thread.run_sync(_disconnect_stdio_client, reason, abandon_on_cancel=True)
+        if scope.cancel_called:
+            _stdio_debug(f"disconnect_client grace timeout reason={reason} grace_sec={STDIO_FORCE_EXIT_GRACE_SEC}")
+    except Exception as exc:
+        _stdio_debug(f"disconnect_client grace failed reason={reason}: {exc!r}")
     _stdio_debug(f"stdio forced exit now reason={reason}")
     os._exit(0)
 
@@ -299,6 +306,8 @@ async def _run_stdio_server() -> None:
         async def parent_monitor() -> None:
             _stdio_debug(f"parent monitor start initial_parent_pid={initial_parent_pid}")
             if initial_parent_pid <= 1:
+                _stdio_debug(f"stdio started orphaned initial_parent_pid={initial_parent_pid}")
+                await _force_exit_stdio("orphaned_at_start")
                 return
             while True:
                 await anyio.sleep(STDIO_PARENT_CHECK_INTERVAL_SEC)
