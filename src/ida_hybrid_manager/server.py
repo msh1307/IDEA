@@ -61,6 +61,7 @@ _client_lock = threading.RLock()
 _client_current_sessions: dict[str, str | None] = {}
 _client_last_seen: dict[str, float] = {}
 _client_cwds: dict[str, str] = {}
+_client_infos: dict[str, dict[str, Any]] = {}
 _launcher: IdaLauncher | None = None
 _open_binary_lock = threading.RLock()
 MUTATING_BACKEND_TOOLS = {
@@ -347,14 +348,40 @@ def _serialize_sessions(records) -> list[dict[str, Any]]:
     return [record.to_dict() for record in records]
 
 
-def _client_connect(client_name: str = "", client_pid: int | None = None, client_cwd: str = "") -> dict[str, Any]:
+def _normalize_agent_scope(client_name: str = "", client_pid: int | None = None, client_scope: str = "") -> str:
+    scope = str(client_scope or "").strip()
+    if scope:
+        return scope
+    name = str(client_name or "").strip()
+    if name and name != "codex-stdio":
+        return f"name:{name}"
+    if client_pid is not None:
+        return f"pid:{client_pid}"
+    return "unknown"
+
+
+def _client_connect(
+    client_name: str = "",
+    client_pid: int | None = None,
+    client_cwd: str = "",
+    client_scope: str = "",
+) -> dict[str, Any]:
     client_id = f"client-{uuid.uuid4().hex[:12]}"
+    normalized_scope = _normalize_agent_scope(client_name, client_pid, client_scope)
+    info = {
+        "client_id": client_id,
+        "client_name": client_name,
+        "client_pid": client_pid,
+        "client_cwd": client_cwd,
+        "client_scope": normalized_scope,
+    }
     with _client_lock:
         _client_current_sessions[client_id] = None
         _client_last_seen[client_id] = time.monotonic()
+        _client_infos[client_id] = info
         if client_cwd:
             _client_cwds[client_id] = client_cwd
-    return {"client_id": client_id, "client_name": client_name, "client_pid": client_pid, "client_cwd": client_cwd}
+    return info
 
 
 def _client_touch(client_id: str | None) -> bool:
@@ -405,10 +432,24 @@ def _client_get_cwd(client_id: str | None) -> str:
         return _client_cwds.get(client_id, "")
 
 
+def _client_get_info(client_id: str | None) -> dict[str, Any]:
+    if not client_id:
+        return {}
+    with _client_lock:
+        return dict(_client_infos.get(client_id, {}))
+
+
 def _mark_pending_owner(pending: PendingLaunch, client_id: str | None) -> None:
     if client_id:
+        client_info = _client_get_info(client_id)
         pending.metadata["owner_client_id"] = client_id
-        client_cwd = _client_get_cwd(client_id)
+        if client_info.get("client_scope"):
+            pending.metadata["owner_agent_scope"] = client_info["client_scope"]
+        if client_info.get("client_name"):
+            pending.metadata["owner_client_name"] = client_info["client_name"]
+        if client_info.get("client_pid") is not None:
+            pending.metadata["owner_client_pid"] = client_info["client_pid"]
+        client_cwd = str(client_info.get("client_cwd") or _client_get_cwd(client_id))
         if client_cwd:
             pending.metadata["owner_agent_cwd"] = client_cwd
 
@@ -435,10 +476,12 @@ def _on_session_registered(record) -> None:
 
 def _client_disconnect(client_id: str | None) -> dict[str, Any]:
     detached_session_id = None
+    client_info: dict[str, Any] = {}
     with _client_lock:
         if client_id:
             detached_session_id = _client_current_sessions.pop(client_id, None)
             _client_last_seen.pop(client_id, None)
+            client_info = _client_infos.pop(client_id, {})
             _client_cwds.pop(client_id, None)
     detached_records = registry.detach_client(client_id)
     auto_closed: list[str] = []
@@ -451,8 +494,20 @@ def _client_disconnect(client_id: str | None) -> dict[str, Any]:
         closable, error = registry.begin_close(record.session_id)
         if error is not None or closable is None:
             continue
+        record_agent_cwd = str(
+            client_info.get("client_cwd")
+            or record.metadata.get("owner_agent_cwd")
+            or ""
+        )
+        idb_output_dir = str(_resolve_agent_output_dir("", record_agent_cwd)) if record_agent_cwd else None
         try:
-            _terminate_session_record(closable, save=True, reason="last_client_detached")
+            _terminate_session_record(
+                closable,
+                save=True,
+                reason="last_client_detached",
+                idb_output_dir=idb_output_dir,
+                agent_cwd=record_agent_cwd,
+            )
         except Exception as exc:
             registry.cancel_close(record.session_id)
             auto_close_errors.append({"session_id": record.session_id, "error": str(exc)})
@@ -2000,6 +2055,31 @@ def _session_recency_key(record) -> tuple[float, float, str]:
     return (newest, record.created_at.timestamp(), record.session_id)
 
 
+def _session_agent_scope(record) -> str:
+    metadata = getattr(record, "metadata", {}) or {}
+    scope = str(metadata.get("owner_agent_scope") or "").strip()
+    if scope:
+        return scope
+    client_name = str(metadata.get("owner_client_name") or "").strip()
+    if client_name and client_name != "codex-stdio":
+        return f"name:{client_name}"
+    client_pid = metadata.get("owner_client_pid")
+    if client_pid is not None:
+        return f"pid:{client_pid}"
+    client_id = str(metadata.get("owner_client_id") or "").strip()
+    if client_id:
+        return f"client:{client_id}"
+    return "unowned"
+
+
+def _prune_session_summary(record, agent_scope: str) -> dict[str, Any]:
+    return {
+        "session_id": record.session_id,
+        "display_name": record.display_name,
+        "agent_scope": agent_scope,
+    }
+
+
 def _local_prune_alive_sessions(
     keep: int = 3,
     output_dir: str = "",
@@ -2007,6 +2087,8 @@ def _local_prune_alive_sessions(
     force: bool = False,
     client_id: str | None = None,
     agent_cwd: str | None = None,
+    per_agent: bool = True,
+    agent_scope: str = "",
 ) -> dict[str, Any]:
     keep = max(0, int(keep))
     _sweep_unreachable_sessions()
@@ -2018,42 +2100,75 @@ def _local_prune_alive_sessions(
         and record.closable
         and record.status in {"ready", "busy", "starting"}
     ]
-    records.sort(key=_session_recency_key, reverse=True)
-    kept = records[:keep]
-    targets = records[keep:]
+    requested_scope = str(agent_scope or "").strip()
+    grouped: dict[str, list[Any]] = {}
+    if per_agent:
+        for record in records:
+            scope = _session_agent_scope(record)
+            if requested_scope and scope != requested_scope:
+                continue
+            grouped.setdefault(scope, []).append(record)
+    else:
+        grouped["all"] = records
     closed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    for record in targets:
-        record_agent_cwd = agent_cwd or str(record.metadata.get("owner_agent_cwd") or "")
-        target_output_dir = str(_resolve_agent_output_dir(output_dir, record_agent_cwd))
-        closable, error = registry.begin_close(record.session_id, client_id=client_id, force=force)
-        if error is not None or closable is None:
-            skipped.append({"session_id": record.session_id, "display_name": record.display_name, "reason": error or "begin_close_failed"})
-            continue
-        try:
-            result = _terminate_session_record(
-                closable,
-                save=save,
-                reason="prune_alive_sessions",
-                force=force,
-                idb_output_dir=target_output_dir,
-                agent_cwd=record_agent_cwd,
-            )
-        except Exception as exc:
-            registry.cancel_close(record.session_id)
-            skipped.append({"session_id": record.session_id, "display_name": record.display_name, "reason": str(exc)})
-            continue
-        closed.append({"session_id": record.session_id, "display_name": record.display_name, "output_dir": target_output_dir, **result})
+    kept: list[dict[str, Any]] = []
+    groups: list[dict[str, Any]] = []
+    for scope, group_records in sorted(grouped.items()):
+        group_records.sort(key=_session_recency_key, reverse=True)
+        group_kept = group_records[:keep]
+        targets = group_records[keep:]
+        kept.extend(_prune_session_summary(record, scope) for record in group_kept)
+        group_closed_before = len(closed)
+        group_skipped_before = len(skipped)
+        for record in targets:
+            record_agent_cwd = agent_cwd or str(record.metadata.get("owner_agent_cwd") or "")
+            target_output_dir = str(_resolve_agent_output_dir(output_dir, record_agent_cwd))
+            closable, error = registry.begin_close(record.session_id, client_id=client_id, force=force)
+            if error is not None or closable is None:
+                skipped.append({
+                    **_prune_session_summary(record, scope),
+                    "reason": error or "begin_close_failed",
+                })
+                continue
+            try:
+                result = _terminate_session_record(
+                    closable,
+                    save=save,
+                    reason="prune_alive_sessions",
+                    force=force,
+                    idb_output_dir=target_output_dir,
+                    agent_cwd=record_agent_cwd,
+                )
+            except Exception as exc:
+                registry.cancel_close(record.session_id)
+                skipped.append({**_prune_session_summary(record, scope), "reason": str(exc)})
+                continue
+            closed.append({
+                **_prune_session_summary(record, scope),
+                "output_dir": target_output_dir,
+                **result,
+            })
+        groups.append({
+            "agent_scope": scope,
+            "candidate_count": len(group_records),
+            "kept_count": len(group_kept),
+            "closed_count": len(closed) - group_closed_before,
+            "skipped_count": len(skipped) - group_skipped_before,
+        })
     return {
         "ok": True,
         "mode": "prune_alive_sessions",
         "keep": keep,
+        "per_agent": bool(per_agent),
+        "agent_scope": requested_scope,
         "output_dir": str(_resolve_agent_output_dir(output_dir, agent_cwd)) if output_dir or agent_cwd else "per_session_owner_cwd",
         "candidate_count": len(records),
         "kept_count": len(kept),
         "closed_count": len(closed),
         "skipped_count": len(skipped),
-        "kept": [{"session_id": record.session_id, "display_name": record.display_name} for record in kept],
+        "groups": groups,
+        "kept": kept,
         "closed": closed,
         "skipped": skipped,
     }
@@ -2069,6 +2184,7 @@ def _auto_prune_headless_sessions() -> dict[str, Any]:
         force=False,
         client_id=None,
         agent_cwd=None,
+        per_agent=True,
     )
 
 
@@ -2259,6 +2375,8 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
             kwargs.get("force", False),
             client_id=client_id,
             agent_cwd=kwargs.get("agent_cwd"),
+            per_agent=kwargs.get("per_agent", True),
+            agent_scope=kwargs.get("agent_scope", ""),
         ),
         "list_session_tools": lambda **kwargs: _local_list_session_tools(kwargs.get("session_id", ""), client_id=client_id),
         "call_session_tool": lambda **kwargs: _local_call_session_tool(kwargs["tool_name"], kwargs.get("arguments"), kwargs.get("session_id", ""), client_id=client_id),
@@ -2516,12 +2634,28 @@ def close_session(session_id: str, save: bool = True, force: bool = False, idb_o
     ))
 
 
-@mcp.tool(description="Keep only the most recent manager-owned headless sessions alive; save and close older sessions. Saved .i64 files are written to output_dir. When output_dir is omitted, the daemon uses the stdio MCP process startup cwd reported by the client; pass output_dir for an exact destination.", structured_output=False)
-def prune_alive_sessions(keep: int = 3, output_dir: str = "", save: bool = True, force: bool = False) -> mcp_types.CallToolResult:
+@mcp.tool(description="Keep only the most recent manager-owned headless sessions alive per agent scope by default; save and close older sessions. Set per_agent=false for a global cap. Saved .i64 files are written to output_dir. When output_dir is omitted, the daemon uses the stdio MCP process startup cwd reported by the owning client; pass output_dir for an exact destination.", structured_output=False)
+def prune_alive_sessions(
+    keep: int = 3,
+    output_dir: str = "",
+    save: bool = True,
+    force: bool = False,
+    per_agent: bool = True,
+    agent_scope: str = "",
+) -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
         return _mcp_result(_daemon_request_sync(
             "prune_alive_sessions",
-            {"keep": keep, "output_dir": output_dir, "save": save, "force": force, "agent_cwd": os.getcwd(), "client_id": CLIENT_ID},
+            {
+                "keep": keep,
+                "output_dir": output_dir,
+                "save": save,
+                "force": force,
+                "per_agent": per_agent,
+                "agent_scope": agent_scope,
+                "agent_cwd": os.getcwd(),
+                "client_id": CLIENT_ID,
+            },
         ))
     return _mcp_result(_local_prune_alive_sessions(
         keep=keep,
@@ -2530,6 +2664,8 @@ def prune_alive_sessions(keep: int = 3, output_dir: str = "", save: bool = True,
         force=force,
         client_id=CLIENT_ID,
         agent_cwd=os.getcwd(),
+        per_agent=per_agent,
+        agent_scope=agent_scope,
     ))
 
 
@@ -2828,6 +2964,7 @@ def main() -> None:
                 "client_name": os.getenv("CODEX_AGENT_NAME", "codex-stdio"),
                 "client_pid": os.getpid(),
                 "client_cwd": os.getcwd(),
+                "client_scope": os.getenv("IDA_MCP_AGENT_SCOPE") or os.getenv("CODEX_AGENT_NAME") or f"pid:{os.getpid()}",
             },
         )
         CLIENT_ID = connect_info.get("client_id")
