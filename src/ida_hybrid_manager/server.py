@@ -60,6 +60,7 @@ CLIENT_ID: str | None = None
 _client_lock = threading.RLock()
 _client_current_sessions: dict[str, str | None] = {}
 _client_last_seen: dict[str, float] = {}
+_client_cwds: dict[str, str] = {}
 _launcher: IdaLauncher | None = None
 _open_binary_lock = threading.RLock()
 MUTATING_BACKEND_TOOLS = {
@@ -140,6 +141,8 @@ STDIO_FORCE_EXIT_GRACE_SEC = max(0.1, float(os.getenv("IDA_MCP_STDIO_FORCE_EXIT_
 STDIO_PARENT_CHECK_INTERVAL_SEC = max(1.0, min(30.0, float(os.getenv("IDA_MCP_STDIO_PARENT_CHECK_INTERVAL_SEC", "5") or 5.0)))
 CLIENT_LEASE_TIMEOUT_SEC = max(60.0, float(os.getenv("IDA_MCP_CLIENT_LEASE_TIMEOUT_SEC", str(max(900, STDIO_IDLE_TIMEOUT_SEC * 2))) or 900.0))
 CLIENT_LEASE_SWEEP_INTERVAL_SEC = max(10.0, min(120.0, float(os.getenv("IDA_MCP_CLIENT_LEASE_SWEEP_INTERVAL_SEC", "30") or 30.0)))
+AUTO_PRUNE_HEADLESS_ENABLED = os.getenv("IDA_MCP_AUTO_PRUNE_HEADLESS", "1").strip().lower() not in {"0", "false", "no", "off"}
+AUTO_PRUNE_HEADLESS_KEEP = max(1, int(os.getenv("IDA_MCP_AUTO_PRUNE_HEADLESS_KEEP", "3") or 3))
 DAEMON_REQUEST_TIMEOUT_SEC = max(30.0, float(os.getenv("IDA_MCP_DAEMON_REQUEST_TIMEOUT_SEC", "120") or 120.0))
 LONG_DAEMON_REQUEST_TIMEOUT_SEC = max(
     DAEMON_REQUEST_TIMEOUT_SEC,
@@ -344,12 +347,14 @@ def _serialize_sessions(records) -> list[dict[str, Any]]:
     return [record.to_dict() for record in records]
 
 
-def _client_connect(client_name: str = "", client_pid: int | None = None) -> dict[str, Any]:
+def _client_connect(client_name: str = "", client_pid: int | None = None, client_cwd: str = "") -> dict[str, Any]:
     client_id = f"client-{uuid.uuid4().hex[:12]}"
     with _client_lock:
         _client_current_sessions[client_id] = None
         _client_last_seen[client_id] = time.monotonic()
-    return {"client_id": client_id, "client_name": client_name, "client_pid": client_pid}
+        if client_cwd:
+            _client_cwds[client_id] = client_cwd
+    return {"client_id": client_id, "client_name": client_name, "client_pid": client_pid, "client_cwd": client_cwd}
 
 
 def _client_touch(client_id: str | None) -> bool:
@@ -393,9 +398,19 @@ def _client_is_connected(client_id: str | None) -> bool:
         return client_id in _client_current_sessions
 
 
+def _client_get_cwd(client_id: str | None) -> str:
+    if not client_id:
+        return ""
+    with _client_lock:
+        return _client_cwds.get(client_id, "")
+
+
 def _mark_pending_owner(pending: PendingLaunch, client_id: str | None) -> None:
     if client_id:
         pending.metadata["owner_client_id"] = client_id
+        client_cwd = _client_get_cwd(client_id)
+        if client_cwd:
+            pending.metadata["owner_agent_cwd"] = client_cwd
 
 
 def _on_session_registered(record) -> None:
@@ -424,6 +439,7 @@ def _client_disconnect(client_id: str | None) -> dict[str, Any]:
         if client_id:
             detached_session_id = _client_current_sessions.pop(client_id, None)
             _client_last_seen.pop(client_id, None)
+            _client_cwds.pop(client_id, None)
     detached_records = registry.detach_client(client_id)
     auto_closed: list[str] = []
     auto_close_errors: list[dict[str, Any]] = []
@@ -2005,10 +2021,11 @@ def _local_prune_alive_sessions(
     records.sort(key=_session_recency_key, reverse=True)
     kept = records[:keep]
     targets = records[keep:]
-    target_output_dir = str(_resolve_agent_output_dir(output_dir, agent_cwd))
     closed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for record in targets:
+        record_agent_cwd = agent_cwd or str(record.metadata.get("owner_agent_cwd") or "")
+        target_output_dir = str(_resolve_agent_output_dir(output_dir, record_agent_cwd))
         closable, error = registry.begin_close(record.session_id, client_id=client_id, force=force)
         if error is not None or closable is None:
             skipped.append({"session_id": record.session_id, "display_name": record.display_name, "reason": error or "begin_close_failed"})
@@ -2020,18 +2037,18 @@ def _local_prune_alive_sessions(
                 reason="prune_alive_sessions",
                 force=force,
                 idb_output_dir=target_output_dir,
-                agent_cwd=agent_cwd,
+                agent_cwd=record_agent_cwd,
             )
         except Exception as exc:
             registry.cancel_close(record.session_id)
             skipped.append({"session_id": record.session_id, "display_name": record.display_name, "reason": str(exc)})
             continue
-        closed.append({"session_id": record.session_id, "display_name": record.display_name, **result})
+        closed.append({"session_id": record.session_id, "display_name": record.display_name, "output_dir": target_output_dir, **result})
     return {
         "ok": True,
         "mode": "prune_alive_sessions",
         "keep": keep,
-        "output_dir": target_output_dir,
+        "output_dir": str(_resolve_agent_output_dir(output_dir, agent_cwd)) if output_dir or agent_cwd else "per_session_owner_cwd",
         "candidate_count": len(records),
         "kept_count": len(kept),
         "closed_count": len(closed),
@@ -2040,6 +2057,19 @@ def _local_prune_alive_sessions(
         "closed": closed,
         "skipped": skipped,
     }
+
+
+def _auto_prune_headless_sessions() -> dict[str, Any]:
+    if not AUTO_PRUNE_HEADLESS_ENABLED:
+        return {"ok": True, "enabled": False}
+    return _local_prune_alive_sessions(
+        keep=AUTO_PRUNE_HEADLESS_KEEP,
+        output_dir="",
+        save=True,
+        force=False,
+        client_id=None,
+        agent_cwd=None,
+    )
 
 
 def _local_close_session(
@@ -2748,6 +2778,9 @@ def _run_daemon() -> None:
             result = _sweep_stale_clients()
             if result["stale_client_ids"] or result["auto_close_errors"]:
                 _daemon_debug(f"client lease sweep result={result}")
+            prune_result = _auto_prune_headless_sessions()
+            if prune_result.get("closed_count") or prune_result.get("skipped_count"):
+                _daemon_debug(f"auto prune result={prune_result}")
 
     maintenance_thread = threading.Thread(target=maintenance_loop, name="ida-hybrid-manager-client-lease", daemon=True)
     maintenance_thread.start()
@@ -2794,6 +2827,7 @@ def main() -> None:
             {
                 "client_name": os.getenv("CODEX_AGENT_NAME", "codex-stdio"),
                 "client_pid": os.getpid(),
+                "client_cwd": os.getcwd(),
             },
         )
         CLIENT_ID = connect_info.get("client_id")
