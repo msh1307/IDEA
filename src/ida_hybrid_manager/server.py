@@ -1919,7 +1919,7 @@ def _terminate_session_record(
     cleanup: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
     launch_token = str(record.metadata.get("launch_token") or "")
-    if save and "save_database" in record.capabilities:
+    if save:
         try:
             save_result = _run_coroutine_sync(
                 call_backend_tool_any(_backend_candidates(record), "save_database", {}, timeout_sec=SAVE_BACKEND_TIMEOUT_SEC)
