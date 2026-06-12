@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import AsyncExitStack, contextmanager
+from datetime import datetime
 import fcntl
 import hashlib
 from io import TextIOWrapper
@@ -2048,11 +2049,30 @@ def _terminate_session_record(
     return {"ok": True, "closed_session_id": record.session_id, "cleanup": cleanup, "cleanup_errors": errors}
 
 
+def _timestamp_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    if hasattr(value, "timestamp"):
+        return float(value.timestamp())
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 def _session_recency_key(record) -> tuple[float, float, str]:
-    candidates = [record.last_write_at, record.last_seen, record.created_at]
-    timestamps = [item.timestamp() for item in candidates if item is not None]
+    # record.last_seen is liveness state and is touched by backend probes; keep
+    # pruning order tied to actual client access/write activity.
+    candidates = [record.last_write_at, record.created_at]
+    for attachment in getattr(record, "attached_clients", {}).values():
+        if isinstance(attachment, dict):
+            candidates.append(attachment.get("last_seen"))
+    timestamps = [timestamp for item in candidates if (timestamp := _timestamp_or_none(item)) is not None]
     newest = max(timestamps) if timestamps else 0.0
-    return (newest, record.created_at.timestamp(), record.session_id)
+    created_at = _timestamp_or_none(record.created_at) or 0.0
+    return (newest, created_at, record.session_id)
 
 
 def _session_agent_scope(record) -> str:
@@ -2070,6 +2090,15 @@ def _session_agent_scope(record) -> str:
     if client_id:
         return f"client:{client_id}"
     return "unowned"
+
+
+def _attached_clients_for_agent_scope(record, agent_scope: str) -> set[str]:
+    allowed: set[str] = set()
+    for attached_client_id in record.attached_clients:
+        client_info = _client_get_info(attached_client_id)
+        if str(client_info.get("client_scope") or "") == agent_scope:
+            allowed.add(attached_client_id)
+    return allowed
 
 
 def _prune_session_summary(record, agent_scope: str) -> dict[str, Any]:
@@ -2124,7 +2153,13 @@ def _local_prune_alive_sessions(
         for record in targets:
             record_agent_cwd = agent_cwd or str(record.metadata.get("owner_agent_cwd") or "")
             target_output_dir = str(_resolve_agent_output_dir(output_dir, record_agent_cwd))
-            closable, error = registry.begin_close(record.session_id, client_id=client_id, force=force)
+            allowed_client_ids = _attached_clients_for_agent_scope(record, scope) if per_agent else None
+            closable, error = registry.begin_close(
+                record.session_id,
+                client_id=client_id,
+                allowed_client_ids=allowed_client_ids,
+                force=force,
+            )
             if error is not None or closable is None:
                 skipped.append({
                     **_prune_session_summary(record, scope),

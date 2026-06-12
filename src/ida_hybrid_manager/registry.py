@@ -331,6 +331,7 @@ class SessionRegistry:
         session_id: str,
         *,
         client_id: str | None = None,
+        allowed_client_ids: set[str] | None = None,
         force: bool = False,
         require_client_attached: bool = False,
     ) -> tuple[SessionRecord | None, dict[str, Any] | None]:
@@ -342,7 +343,10 @@ class SessionRegistry:
                 return None, {"ok": False, "error": f"Session {session_id} is already closing"}
             if require_client_attached and client_id and client_id not in record.attached_clients:
                 return None, {"ok": False, "error": f"Client {client_id} is not attached to session {session_id}"}
-            other_clients = [attached for attached in record.attached_clients if attached != client_id]
+            allowed_clients = set(allowed_client_ids or set())
+            if client_id:
+                allowed_clients.add(client_id)
+            other_clients = [attached for attached in record.attached_clients if attached not in allowed_clients]
             if other_clients and not force:
                 return None, {
                     "ok": False,
