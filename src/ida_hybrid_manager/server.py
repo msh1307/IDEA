@@ -8,6 +8,7 @@ import hashlib
 from io import TextIOWrapper
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -957,6 +958,19 @@ def _resolve_output_path(path: str) -> Path:
     return target
 
 
+def _resolve_agent_output_dir(output_dir: str | None = None, agent_cwd: str | None = None) -> Path:
+    base = Path(str(agent_cwd or Path.cwd())).expanduser()
+    if not base.is_absolute():
+        base = (Path.cwd() / base).resolve()
+    if not output_dir:
+        return base
+    normalized = normalize_path(str(output_dir))
+    target = Path(normalized.wsl_path).expanduser()
+    if not target.is_absolute():
+        target = (base / target).resolve()
+    return target
+
+
 def _session_persistent_idb_target(record: Any) -> Path | None:
     source_kind = str(record.metadata.get("source_input_kind") or "").strip().lower()
     if source_kind == "idb":
@@ -981,6 +995,29 @@ def _session_staged_idb_path(record: Any) -> Path | None:
     return staged_path.with_name(f"{staged_path.name}.i64")
 
 
+def _safe_output_stem(value: str) -> str:
+    stem = Path(str(value or "")).stem or "ida_session"
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._")
+    return cleaned or "ida_session"
+
+
+def _session_output_idb_target(record: Any, output_dir: str | None = None, agent_cwd: str | None = None) -> Path:
+    root = _resolve_agent_output_dir(output_dir, agent_cwd)
+    persistent = _session_persistent_idb_target(record)
+    staged = _session_staged_idb_path(record)
+    source_name = ""
+    if persistent is not None:
+        source_name = persistent.name
+    elif staged is not None:
+        source_name = staged.name
+    elif record.idb_path:
+        source_name = Path(str(normalize_path(record.idb_path).wsl_path)).name
+    else:
+        source_name = f"{record.display_name or record.session_id}.i64"
+    stem = _safe_output_stem(source_name)
+    return root / f"{stem}_{record.session_id}.i64"
+
+
 def _session_idb_status(record: Any) -> dict[str, Any]:
     source_kind = str(record.metadata.get("source_input_kind") or "").strip().lower()
     source_idb_path = str(record.metadata.get("source_idb_wsl_path") or "").strip()
@@ -1000,9 +1037,9 @@ def _session_idb_status(record: Any) -> dict[str, Any]:
     }
 
 
-def _persist_staged_idb(record: Any) -> dict[str, Any]:
+def _persist_staged_idb(record: Any, output_dir: str | None = None, agent_cwd: str | None = None) -> dict[str, Any]:
     staged_idb = _session_staged_idb_path(record)
-    persistent_idb = _session_persistent_idb_target(record)
+    persistent_idb = _session_output_idb_target(record, output_dir, agent_cwd) if output_dir or agent_cwd else _session_persistent_idb_target(record)
     if staged_idb is None or persistent_idb is None:
         return {"copied": False, "reason": "no_staged_or_source_path"}
     if not staged_idb.exists():
@@ -1870,7 +1907,15 @@ def _local_load_idb(
         }
 
 
-def _terminate_session_record(record, *, save: bool, reason: str, force: bool = False) -> dict[str, Any]:
+def _terminate_session_record(
+    record,
+    *,
+    save: bool,
+    reason: str,
+    force: bool = False,
+    idb_output_dir: str | None = None,
+    agent_cwd: str | None = None,
+) -> dict[str, Any]:
     cleanup: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
     launch_token = str(record.metadata.get("launch_token") or "")
@@ -1912,7 +1957,11 @@ def _terminate_session_record(record, *, save: bool, reason: str, force: bool = 
 
     if save:
         try:
-            cleanup["idb_persist"] = _persist_staged_idb(record)
+            cleanup["idb_persist"] = _persist_staged_idb(
+                record,
+                output_dir=idb_output_dir,
+                agent_cwd=agent_cwd if idb_output_dir else None,
+            )
         except Exception as exc:
             errors.append({"step": "idb_persist", "error": str(exc)})
     staged_dir = str(record.metadata.get("staged_dir") or "")
@@ -1928,7 +1977,79 @@ def _terminate_session_record(record, *, save: bool, reason: str, force: bool = 
     return {"ok": True, "closed_session_id": record.session_id, "cleanup": cleanup, "cleanup_errors": errors}
 
 
-def _local_close_session(session_id: str, save: bool = True, force: bool = False, client_id: str | None = None) -> dict[str, Any]:
+def _session_recency_key(record) -> tuple[float, float, str]:
+    candidates = [record.last_write_at, record.last_seen, record.created_at]
+    timestamps = [item.timestamp() for item in candidates if item is not None]
+    newest = max(timestamps) if timestamps else 0.0
+    return (newest, record.created_at.timestamp(), record.session_id)
+
+
+def _local_prune_alive_sessions(
+    keep: int = 3,
+    output_dir: str = "",
+    save: bool = True,
+    force: bool = False,
+    client_id: str | None = None,
+    agent_cwd: str | None = None,
+) -> dict[str, Any]:
+    keep = max(0, int(keep))
+    _sweep_unreachable_sessions()
+    records = [
+        record
+        for record in registry.list_sessions(include_dead=False)
+        if record.engine == "headless"
+        and record.source == "manager_created"
+        and record.closable
+        and record.status in {"ready", "busy", "starting"}
+    ]
+    records.sort(key=_session_recency_key, reverse=True)
+    kept = records[:keep]
+    targets = records[keep:]
+    target_output_dir = str(_resolve_agent_output_dir(output_dir, agent_cwd))
+    closed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for record in targets:
+        closable, error = registry.begin_close(record.session_id, client_id=client_id, force=force)
+        if error is not None or closable is None:
+            skipped.append({"session_id": record.session_id, "display_name": record.display_name, "reason": error or "begin_close_failed"})
+            continue
+        try:
+            result = _terminate_session_record(
+                closable,
+                save=save,
+                reason="prune_alive_sessions",
+                force=force,
+                idb_output_dir=target_output_dir,
+                agent_cwd=agent_cwd,
+            )
+        except Exception as exc:
+            registry.cancel_close(record.session_id)
+            skipped.append({"session_id": record.session_id, "display_name": record.display_name, "reason": str(exc)})
+            continue
+        closed.append({"session_id": record.session_id, "display_name": record.display_name, **result})
+    return {
+        "ok": True,
+        "mode": "prune_alive_sessions",
+        "keep": keep,
+        "output_dir": target_output_dir,
+        "candidate_count": len(records),
+        "kept_count": len(kept),
+        "closed_count": len(closed),
+        "skipped_count": len(skipped),
+        "kept": [{"session_id": record.session_id, "display_name": record.display_name} for record in kept],
+        "closed": closed,
+        "skipped": skipped,
+    }
+
+
+def _local_close_session(
+    session_id: str,
+    save: bool = True,
+    force: bool = False,
+    client_id: str | None = None,
+    idb_output_dir: str | None = None,
+    agent_cwd: str | None = None,
+) -> dict[str, Any]:
     record = registry.get_session(session_id)
     if record is None:
         return {"ok": False, "error": f"Unknown session: {session_id}"}
@@ -1943,7 +2064,14 @@ def _local_close_session(session_id: str, save: bool = True, force: bool = False
     if error is not None or closable is None:
         return error or {"ok": False, "error": f"Unknown session: {session_id}"}
     try:
-        return _terminate_session_record(closable, save=save, reason="manager_close", force=force)
+        return _terminate_session_record(
+            closable,
+            save=save,
+            reason="manager_close",
+            force=force,
+            idb_output_dir=idb_output_dir,
+            agent_cwd=agent_cwd,
+        )
     except Exception as exc:
         registry.cancel_close(session_id)
         return {"ok": False, "error": "close_session_failed", "detail": str(exc), "session_id": session_id}
@@ -2086,7 +2214,22 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
             kwargs.get("backend_ready_timeout_sec"),
             client_id=client_id,
         ),
-        "close_session": lambda **kwargs: _local_close_session(kwargs["session_id"], kwargs.get("save", True), kwargs.get("force", False), client_id=client_id),
+        "close_session": lambda **kwargs: _local_close_session(
+            kwargs["session_id"],
+            kwargs.get("save", True),
+            kwargs.get("force", False),
+            client_id=client_id,
+            idb_output_dir=kwargs.get("idb_output_dir") or kwargs.get("output_dir"),
+            agent_cwd=kwargs.get("agent_cwd"),
+        ),
+        "prune_alive_sessions": lambda **kwargs: _local_prune_alive_sessions(
+            kwargs.get("keep", 3),
+            kwargs.get("output_dir", ""),
+            kwargs.get("save", True),
+            kwargs.get("force", False),
+            client_id=client_id,
+            agent_cwd=kwargs.get("agent_cwd"),
+        ),
         "list_session_tools": lambda **kwargs: _local_list_session_tools(kwargs.get("session_id", ""), client_id=client_id),
         "call_session_tool": lambda **kwargs: _local_call_session_tool(kwargs["tool_name"], kwargs.get("arguments"), kwargs.get("session_id", ""), client_id=client_id),
         "inspect": lambda **kwargs: _local_call_session_tool(
@@ -2320,10 +2463,44 @@ def load_idb(
 
 
 @mcp.tool(description="Close a manager-owned headless session.", structured_output=False)
-def close_session(session_id: str, save: bool = True, force: bool = False) -> mcp_types.CallToolResult:
+def close_session(session_id: str, save: bool = True, force: bool = False, idb_output_dir: str = "") -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
-        return _mcp_result(_daemon_request_sync("close_session", {"session_id": session_id, "save": save, "force": force, "client_id": CLIENT_ID}))
-    return _mcp_result(_local_close_session(session_id=session_id, save=save, force=force, client_id=CLIENT_ID))
+        return _mcp_result(_daemon_request_sync(
+            "close_session",
+            {
+                "session_id": session_id,
+                "save": save,
+                "force": force,
+                "idb_output_dir": idb_output_dir,
+                "agent_cwd": os.getcwd(),
+                "client_id": CLIENT_ID,
+            },
+        ))
+    return _mcp_result(_local_close_session(
+        session_id=session_id,
+        save=save,
+        force=force,
+        client_id=CLIENT_ID,
+        idb_output_dir=idb_output_dir,
+        agent_cwd=os.getcwd(),
+    ))
+
+
+@mcp.tool(description="Keep only the most recent manager-owned headless sessions alive; save and close older sessions. Saved .i64 files are written to output_dir. When output_dir is omitted, the daemon uses the stdio MCP process startup cwd reported by the client; pass output_dir for an exact destination.", structured_output=False)
+def prune_alive_sessions(keep: int = 3, output_dir: str = "", save: bool = True, force: bool = False) -> mcp_types.CallToolResult:
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(_daemon_request_sync(
+            "prune_alive_sessions",
+            {"keep": keep, "output_dir": output_dir, "save": save, "force": force, "agent_cwd": os.getcwd(), "client_id": CLIENT_ID},
+        ))
+    return _mcp_result(_local_prune_alive_sessions(
+        keep=keep,
+        output_dir=output_dir,
+        save=save,
+        force=force,
+        client_id=CLIENT_ID,
+        agent_cwd=os.getcwd(),
+    ))
 
 
 @mcp.tool(description="List backend tools exposed by the explicit session_id, or by the current selected session when session_id is omitted.", structured_output=False)

@@ -33,6 +33,7 @@ REQUIRED_MANAGER_TOOLS = {
     "load_idb",
     "close_session",
     "export_decompiled_c",
+    "prune_alive_sessions",
 }
 
 REQUIRED_BACKEND_TOOLS = {
