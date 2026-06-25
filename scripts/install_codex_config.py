@@ -139,11 +139,26 @@ def render_wsl_server_block(repo_root: Path, host: str, ida_install_root: str) -
 
 def render_windows_server_block(repo_root: Path, host: str, ida_install_root: str) -> str:
     distro = os.getenv("IDA_WSL_DISTRO", "Ubuntu-24.04").strip() or "Ubuntu-24.04"
+    args = [
+        "-d",
+        distro,
+        "--cd",
+        str(repo_root),
+        "env",
+        f"IDA_MCP_CONNECT_HOST={host}",
+        f"IDA_INSTALL_ROOT={ida_install_root}",
+        "./.venv/bin/python",
+        "-m",
+        "ida_hybrid_manager.server",
+        "--transport",
+        "stdio",
+    ]
+    rendered_args = "[" + ", ".join(_toml_basic_string(arg) for arg in args) + "]"
     return "\n".join(
         [
             f"[{SECTION_NAME}]",
             'command = "wsl.exe"',
-            f'args = ["-d", "{distro}", "--cd", "{repo_root}", "env", "IDA_MCP_CONNECT_HOST={host}", "IDA_INSTALL_ROOT={ida_install_root}", "./.venv/bin/python", "-m", "ida_hybrid_manager.server", "--transport", "stdio"]',
+            f"args = {rendered_args}",
             "startup_timeout_sec = 90.0",
             "tool_timeout_sec = 120.0",
             "",
