@@ -164,7 +164,7 @@ def _disconnect_stdio_client(reason: str) -> None:
         _stdio_debug(f"disconnect_client start reason={reason} client_id={client_id}")
         _daemon_request_sync(
             "disconnect_client",
-            {"client_id": client_id},
+            {"client_id": client_id, "async_close": True, "reason": reason},
             timeout_sec=STDIO_DISCONNECT_TIMEOUT_SEC,
         )
         _stdio_debug(f"disconnect_client ok reason={reason} client_id={client_id}")
@@ -475,16 +475,12 @@ def _on_session_registered(record) -> None:
         _daemon_debug(f"registered session owner disconnected cleanup failed session_id={record.session_id}: {exc!r}")
 
 
-def _client_disconnect(client_id: str | None) -> dict[str, Any]:
-    detached_session_id = None
-    client_info: dict[str, Any] = {}
-    with _client_lock:
-        if client_id:
-            detached_session_id = _client_current_sessions.pop(client_id, None)
-            _client_last_seen.pop(client_id, None)
-            client_info = _client_infos.pop(client_id, {})
-            _client_cwds.pop(client_id, None)
-    detached_records = registry.detach_client(client_id)
+def _close_detached_client_sessions(
+    detached_records: list[Any],
+    client_info: dict[str, Any],
+    *,
+    reason: str,
+) -> tuple[list[str], list[dict[str, Any]]]:
     auto_closed: list[str] = []
     auto_close_errors: list[dict[str, Any]] = []
     for record in detached_records:
@@ -504,7 +500,7 @@ def _client_disconnect(client_id: str | None) -> dict[str, Any]:
             _terminate_session_record(
                 closable,
                 save=True,
-                reason="last_client_detached",
+                reason=reason,
                 idb_output_dir=None,
                 agent_cwd=record_agent_cwd,
             )
@@ -513,6 +509,59 @@ def _client_disconnect(client_id: str | None) -> dict[str, Any]:
             auto_close_errors.append({"session_id": record.session_id, "error": str(exc)})
             continue
         auto_closed.append(record.session_id)
+    return auto_closed, auto_close_errors
+
+
+def _client_disconnect(client_id: str | None, *, async_close: bool = False, reason: str = "disconnect_client") -> dict[str, Any]:
+    detached_session_id = None
+    client_info: dict[str, Any] = {}
+    with _client_lock:
+        if client_id:
+            detached_session_id = _client_current_sessions.pop(client_id, None)
+            _client_last_seen.pop(client_id, None)
+            client_info = _client_infos.pop(client_id, {})
+            _client_cwds.pop(client_id, None)
+    detached_records = registry.detach_client(client_id)
+    close_candidates = [
+        record
+        for record in detached_records
+        if record.status != "dead"
+        and record.engine == "headless"
+        and record.source == "manager_created"
+        and record.closable
+    ]
+    if async_close and close_candidates:
+        def close_worker() -> None:
+            auto_closed, auto_close_errors = _close_detached_client_sessions(
+                close_candidates,
+                client_info,
+                reason=reason,
+            )
+            if auto_closed or auto_close_errors:
+                _daemon_debug(
+                    "async disconnect cleanup done "
+                    f"client_id={client_id} closed={auto_closed} errors={auto_close_errors}"
+                )
+
+        thread = threading.Thread(
+            target=close_worker,
+            name=f"ida-disconnect-cleanup-{client_id or 'unknown'}",
+            daemon=True,
+        )
+        thread.start()
+        return {
+            "ok": True,
+            "client_id": client_id,
+            "detached_session_id": detached_session_id,
+            "auto_close_pending_session_ids": [record.session_id for record in close_candidates],
+            "auto_closed_session_ids": [],
+            "auto_close_errors": [],
+        }
+    auto_closed, auto_close_errors = _close_detached_client_sessions(
+        close_candidates,
+        client_info,
+        reason=reason,
+    )
     return {
         "ok": True,
         "client_id": client_id,
@@ -2367,7 +2416,11 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
     op_map = {
         "connect_client": lambda **kwargs: _client_connect(**kwargs),
         "heartbeat_client": lambda **kwargs: {"ok": bool(_client_touch(kwargs.get("client_id"))), "client_id": kwargs.get("client_id")},
-        "disconnect_client": lambda **kwargs: _client_disconnect(kwargs.get("client_id")),
+        "disconnect_client": lambda **kwargs: _client_disconnect(
+            kwargs.get("client_id"),
+            async_close=bool(kwargs.get("async_close", False)),
+            reason=str(kwargs.get("reason") or "disconnect_client"),
+        ),
         "inspect_environment": lambda **kwargs: _local_inspect_environment(),
         "list_alive_sessions": lambda **kwargs: _local_list_alive_sessions(client_id=client_id),
         "current_session": lambda **kwargs: _local_current_session(client_id=client_id),
