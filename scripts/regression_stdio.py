@@ -33,6 +33,8 @@ REQUIRED_MANAGER_TOOLS = {
     "load_idb",
     "close_session",
     "export_decompiled_c",
+    "export_header",
+    "import_header",
     "prune_alive_sessions",
 }
 
@@ -44,6 +46,8 @@ REQUIRED_BACKEND_TOOLS = {
     "list_strings",
     "imports",
     "export_decompiled_c",
+    "export_header",
+    "import_header",
 }
 
 

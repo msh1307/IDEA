@@ -77,6 +77,7 @@ MUTATING_BACKEND_TOOLS = {
     "define_code",
     "define_func",
     "delete_stack",
+    "import_header",
     "make_array",
     "reanalyze_function",
     "rename",
@@ -2556,6 +2557,26 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
             kwargs.get("session_id", ""),
             client_id=client_id,
         ),
+        "export_header": lambda **kwargs: _local_call_session_tool(
+            "export_header",
+            {
+                "path": kwargs.get("path", ""),
+                "struct_names": kwargs.get("struct_names", kwargs.get("names", [])),
+                "return_header": kwargs.get("return_header", False),
+                "include_guard": kwargs.get("include_guard", True),
+            },
+            kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
+        "import_header": lambda **kwargs: _local_call_session_tool(
+            "import_header",
+            {
+                "path": kwargs.get("path", ""),
+                "header": kwargs.get("header", kwargs.get("decl", kwargs.get("text", ""))),
+            },
+            kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
         "reanalyze_function": lambda **kwargs: _local_call_session_tool("reanalyze_function", {"addr": kwargs["addr"]}, kwargs.get("session_id", ""), client_id=client_id),
         "lookup_funcs": lambda **kwargs: _local_call_session_tool("lookup_funcs", {"queries": kwargs["queries"]}, kwargs.get("session_id", ""), client_id=client_id),
         "xrefs_to": lambda **kwargs: _local_call_session_tool("xrefs_to", {"addrs": kwargs["addrs"], "limit": kwargs.get("limit", 100)}, kwargs.get("session_id", ""), client_id=client_id),
@@ -2953,6 +2974,39 @@ async def apply_decl(
     if ACTIVE_BACKEND == "daemon":
         return _mcp_result(await _daemon_request_async("apply_decl", payload))
     return _mcp_result(await _local_call_session_tool("apply_decl", payload, session_id=session_id, client_id=CLIENT_ID))
+
+
+@mcp.tool(description="Export one or more named structs from the current IDB into a reusable .h file.", structured_output=False)
+async def export_header(
+    struct_names: list[str] | str,
+    path: str = "",
+    session_id: str = "",
+    return_header: bool = False,
+    include_guard: bool = True,
+) -> mcp_types.CallToolResult:
+    payload = {
+        "struct_names": struct_names,
+        "path": path,
+        "session_id": session_id,
+        "return_header": return_header,
+        "include_guard": include_guard,
+        "client_id": CLIENT_ID,
+    }
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(await _daemon_request_async("export_header", payload))
+    return _mcp_result(await _local_call_session_tool("export_header", payload, session_id=session_id, client_id=CLIENT_ID))
+
+
+@mcp.tool(description="Import C declarations from a .h file or raw header text into IDA's type system.", structured_output=False)
+async def import_header(
+    path: str = "",
+    header: str = "",
+    session_id: str = "",
+) -> mcp_types.CallToolResult:
+    payload = {"path": path, "header": header, "session_id": session_id, "client_id": CLIENT_ID}
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(await _daemon_request_async("import_header", payload))
+    return _mcp_result(await _local_call_session_tool("import_header", payload, session_id=session_id, client_id=CLIENT_ID))
 
 
 @mcp.tool(description="Create or reanalyze the function containing an address.", structured_output=False)

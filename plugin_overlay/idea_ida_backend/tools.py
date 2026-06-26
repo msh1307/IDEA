@@ -538,10 +538,97 @@ def _split_string_list(value: Any) -> list[str]:
 
 
 def _coerce_decl_list(value: Any) -> list[str]:
-    decls = _split_string_list(value)
-    if not decls and isinstance(value, str) and value.strip():
-        decls = [value.strip()]
-    return [item.strip() for item in decls if str(item).strip()]
+    if value is None:
+        return []
+    if isinstance(value, list):
+        decls: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                decls.extend(_split_c_declarations(item))
+            elif str(item).strip():
+                decls.append(str(item).strip())
+        return decls
+    if isinstance(value, str):
+        return _split_c_declarations(value)
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _split_c_declarations(text: str) -> list[str]:
+    source = str(text or "").strip()
+    if not source:
+        return []
+    lines = source.splitlines()
+    if any(line.lstrip().startswith("#") for line in lines):
+        return [source]
+
+    parts: list[str] = []
+    start = 0
+    brace_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+    in_line_comment = False
+    in_block_comment = False
+    in_string: str | None = None
+    escaped = False
+    i = 0
+    while i < len(source):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in {"'", '"'}:
+            in_string = ch
+            i += 1
+            continue
+        if ch == "{":
+            brace_depth += 1
+        elif ch == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif ch == "[":
+            bracket_depth += 1
+        elif ch == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif ch == ";" and brace_depth == 0 and paren_depth == 0 and bracket_depth == 0:
+            item = source[start : i + 1].strip()
+            if item:
+                parts.append(item)
+            start = i + 1
+        i += 1
+    tail = source[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts or [source]
 
 
 def _disasm_window(ea: int, max_instructions: int) -> list[dict[str, Any]]:
@@ -2965,6 +3052,85 @@ def export_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     return payload
 
 
+def _header_guard_from_path(path: str) -> str:
+    stem = Path(path or "ida_export.h").name.upper()
+    guard = re.sub(r"[^A-Z0-9]+", "_", stem).strip("_")
+    return f"IDA_HYBRID_{guard or 'EXPORT_H'}_"
+
+
+@idasync
+def export_header(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    struct_names = _split_string_list(
+        arguments.get("struct_names", arguments.get("names", arguments.get("struct_name", arguments.get("name", []))))
+    )
+    path = str(arguments.get("path") or "").strip()
+    return_header = _bool_argument(arguments, "return_header", False)
+    include_guard = _bool_argument(arguments, "include_guard", True)
+    if not struct_names:
+        raise ValueError("struct_names/names is required for export_header")
+    if not path:
+        idb_path = idc.get_idb_path() or "ida_export.i64"
+        path = str(Path(idb_path).with_suffix(".h"))
+
+    blocks: list[str] = []
+    structs: list[dict[str, Any]] = []
+    for struct_name in struct_names:
+        tif = _get_named_struct_tinfo(struct_name)
+        logical_fields = _struct_fields_from_tif(tif, include_auto_pad=False)
+        total_size = int(tif.get_size())
+        layout = _build_padded_layout(logical_fields, total_size=total_size)
+        blocks.append(_header_decl_from_layout(struct_name, layout, total_size))
+        structs.append({"name": struct_name, "size": total_size, "field_count": len(logical_fields)})
+
+    guard = _header_guard_from_path(path)
+    lines = ["/* IDA Hybrid Manager type export */", ""]
+    if include_guard:
+        lines.extend([f"#ifndef {guard}", f"#define {guard}", ""])
+    lines.append("\n\n".join(blocks))
+    if include_guard:
+        lines.extend(["", f"#endif /* {guard} */"])
+    header = "\n".join(lines).rstrip() + "\n"
+
+    target = _normalize_export_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(header, encoding="utf-8")
+    payload = {
+        "ok": True,
+        "mode": "export_header",
+        "path": str(target),
+        "struct_count": len(structs),
+        "structs": structs,
+        "bytes_written": target.stat().st_size,
+        "include_guard": include_guard,
+    }
+    if return_header:
+        payload["header"] = header
+    return payload
+
+
+@idasync
+def import_header(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    path = str(arguments.get("path") or "").strip()
+    header = str(arguments.get("header") or arguments.get("decl") or arguments.get("text") or "").strip()
+    if path:
+        target = _normalize_export_path(path)
+        header = target.read_text(encoding="utf-8", errors="ignore")
+    if not header:
+        raise ValueError("path or header/decl/text is required")
+    errors = ida_typeinf.parse_decls(None, header, False, ida_typeinf.HTI_PAKDEF)
+    ok = int(errors) == 0
+    return {
+        "ok": ok,
+        "mode": "import_header",
+        "path": str(_normalize_export_path(path)) if path else "",
+        "errors": int(errors),
+        "declaration_count": len(_split_c_declarations(header)),
+        "error": None if ok else "Failed to parse one or more declarations",
+    }
+
+
 @idasync
 def field_xrefs_for_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
@@ -3369,6 +3535,8 @@ TOOL_DEFINITIONS = [
     {"name": "apply_struct_to_many", "description": "Apply a named struct type to many addresses, stack variables, or local variables."},
     {"name": "struct_diff", "description": "Compare the current IDA struct definition against an exported header/json reference."},
     {"name": "export_struct", "description": "Export a named struct as canonical header text or json."},
+    {"name": "export_header", "description": "Export one or more named structs from the current IDB into a reusable .h file."},
+    {"name": "import_header", "description": "Import C declarations from a .h file or header text into IDA's type system."},
     {"name": "field_xrefs_for_struct", "description": "Return per-field xrefs for a struct with contextual disassembly."},
     {"name": "typed_decompile_export", "description": "Export decompiled code for a function under the current typed DB state."},
     {"name": "export_decompiled_c", "description": "Export all or filtered functions from the current IDB as one .c file. Prefer this over manually copying per-function decompile output; filter is a simple substring on function name/address."},
@@ -3443,6 +3611,8 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any] | None], Any]] = {
     "apply_struct_to_many": apply_struct_to_many,
     "struct_diff": struct_diff,
     "export_struct": export_struct,
+    "export_header": export_header,
+    "import_header": import_header,
     "field_xrefs_for_struct": field_xrefs_for_struct,
     "typed_decompile_export": typed_decompile_export,
     "export_decompiled_c": export_decompiled_c,
