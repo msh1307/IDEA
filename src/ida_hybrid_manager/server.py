@@ -2834,7 +2834,7 @@ async def decompile(addr: str, session_id: str = "", full: bool = False, detail:
     return _mcp_result(await _local_call_session_tool("decompile", _merge_detail_payload(None, full=full, detail=detail, addr=addr), session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Export selected or all functions from the current IDB as one .c file. fallback must be one of: comment, none, disasm, asm.", structured_output=False)
+@mcp.tool(description="Export all or filtered functions from the current IDB as one .c file. Prefer this over manually copying per-function decompile output. filter is a simple case-insensitive substring match on function name or 0x address; omit filter for full export and use max_functions to cap size. fallback must be one of: comment, none, disasm, asm.", structured_output=False)
 async def export_decompiled_c(
     path: str = "",
     session_id: str = "",

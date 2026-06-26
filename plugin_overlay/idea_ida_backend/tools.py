@@ -3055,7 +3055,7 @@ def export_decompiled_c(arguments: dict[str, Any] | None = None) -> dict[str, An
         idb_path = idc.get_idb_path() or "ida_export.i64"
         path = str(Path(idb_path).with_suffix(".c"))
 
-    functions: list[tuple[int, dict[str, Any]]] = []
+    eligible_functions: list[tuple[int, dict[str, Any]]] = []
     for ea in idautils.Functions():
         func = idaapi.get_func(ea)
         if func is None:
@@ -3066,12 +3066,45 @@ def export_decompiled_c(arguments: dict[str, Any] | None = None) -> dict[str, An
         flags = idc.get_func_flags(func.start_ea)
         if not include_thunks and flags != -1 and (flags & idc.FUNC_THUNK):
             continue
+        eligible_functions.append((int(func.start_ea), item))
+
+    eligible_functions.sort(key=lambda pair: (pair[1]["segment"].lower() == "extern", pair[0]))
+    functions: list[tuple[int, dict[str, Any]]] = []
+    for ea, item in eligible_functions:
         if filt and filt not in item["name"].lower() and filt not in item["address"].lower():
             continue
-        functions.append((int(func.start_ea), item))
-    functions.sort(key=lambda pair: (pair[1]["segment"].lower() == "extern", pair[0]))
+        functions.append((ea, item))
     selected_pairs = functions[:max_functions] if max_functions else functions
     selected = [item for _ea, item in selected_pairs]
+
+    if not selected:
+        return {
+            "ok": False,
+            "complete": False,
+            "mode": "export_decompiled_c",
+            "path": str(_normalize_export_path(path)),
+            "bytes_written": 0,
+            "function_total": len(eligible_functions),
+            "matched_count": len(functions),
+            "selected_count": 0,
+            "decompiled_count": 0,
+            "fallback_count": 0,
+            "failed_count": 0,
+            "exported_count": 0,
+            "include_extern": include_extern,
+            "include_thunks": include_thunks,
+            "filter": filt,
+            "fallback": fallback,
+            "max_functions": max_functions,
+            "error": "export_decompiled_c selected zero functions",
+            "hint": "filter is a simple case-insensitive substring match against function name or 0x address. Omit filter to export all eligible functions; use max_functions to cap size.",
+            "next_steps": [
+                "Retry export_decompiled_c without filter for full-IDB export.",
+                "Use lookup_funcs or list_functions to confirm the exact function name/address before filtering.",
+                "Do not manually assemble a .c file by copying individual decompile results unless export_decompiled_c is unavailable.",
+            ],
+            "sample_functions": [item for _ea, item in eligible_functions[:20]],
+        }
 
     exported: list[dict[str, Any]] = []
     fallbacks: list[dict[str, Any]] = []
@@ -3128,12 +3161,13 @@ def export_decompiled_c(arguments: dict[str, Any] | None = None) -> dict[str, An
 
     file_size = target.stat().st_size
     payload = {
-        "ok": bool(not selected or exported),
+        "ok": bool(exported),
         "complete": bool(len(failed) == 0 and len(fallbacks) == 0),
         "mode": "export_decompiled_c",
         "path": str(target),
         "bytes_written": file_size,
-        "function_total": len(functions),
+        "function_total": len(eligible_functions),
+        "matched_count": len(functions),
         "selected_count": len(selected),
         "decompiled_count": len(exported),
         "fallback_count": len(fallbacks),
@@ -3337,7 +3371,7 @@ TOOL_DEFINITIONS = [
     {"name": "export_struct", "description": "Export a named struct as canonical header text or json."},
     {"name": "field_xrefs_for_struct", "description": "Return per-field xrefs for a struct with contextual disassembly."},
     {"name": "typed_decompile_export", "description": "Export decompiled code for a function under the current typed DB state."},
-    {"name": "export_decompiled_c", "description": "Export all selected functions from the current IDB as one .c file."},
+    {"name": "export_decompiled_c", "description": "Export all or filtered functions from the current IDB as one .c file. Prefer this over manually copying per-function decompile output; filter is a simple substring on function name/address."},
     {"name": "type_workflow", "description": "LLM-friendly high-level workflow for declaring types, upserting structs, applying them, exporting them, and exporting typed decompilation."},
     {"name": "make_array", "description": "Convert the current item into an array."},
     {"name": "save_database", "description": "Save the current database."},
