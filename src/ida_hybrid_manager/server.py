@@ -500,13 +500,12 @@ def _client_disconnect(client_id: str | None) -> dict[str, Any]:
             or record.metadata.get("owner_agent_cwd")
             or ""
         )
-        idb_output_dir = str(_resolve_agent_output_dir("", record_agent_cwd)) if record_agent_cwd else None
         try:
             _terminate_session_record(
                 closable,
                 save=True,
                 reason="last_client_detached",
-                idb_output_dir=idb_output_dir,
+                idb_output_dir=None,
                 agent_cwd=record_agent_cwd,
             )
         except Exception as exc:
@@ -2152,7 +2151,7 @@ def _local_prune_alive_sessions(
         group_skipped_before = len(skipped)
         for record in targets:
             record_agent_cwd = agent_cwd or str(record.metadata.get("owner_agent_cwd") or "")
-            target_output_dir = str(_resolve_agent_output_dir(output_dir, record_agent_cwd))
+            target_output_dir = str(_resolve_agent_output_dir(output_dir, record_agent_cwd)) if output_dir else ""
             allowed_client_ids = _attached_clients_for_agent_scope(record, scope) if per_agent else None
             closable, error = registry.begin_close(
                 record.session_id,
@@ -2172,7 +2171,7 @@ def _local_prune_alive_sessions(
                     save=save,
                     reason="prune_alive_sessions",
                     force=force,
-                    idb_output_dir=target_output_dir,
+                    idb_output_dir=target_output_dir or None,
                     agent_cwd=record_agent_cwd,
                 )
             except Exception as exc:
@@ -2181,7 +2180,7 @@ def _local_prune_alive_sessions(
                 continue
             closed.append({
                 **_prune_session_summary(record, scope),
-                "output_dir": target_output_dir,
+                "output_dir": target_output_dir or "source_path",
                 **result,
             })
         groups.append({
@@ -2197,7 +2196,7 @@ def _local_prune_alive_sessions(
         "keep": keep,
         "per_agent": bool(per_agent),
         "agent_scope": requested_scope,
-        "output_dir": str(_resolve_agent_output_dir(output_dir, agent_cwd)) if output_dir or agent_cwd else "per_session_owner_cwd",
+        "output_dir": str(_resolve_agent_output_dir(output_dir, agent_cwd)) if output_dir else "source_path",
         "candidate_count": len(records),
         "kept_count": len(kept),
         "closed_count": len(closed),
@@ -2669,7 +2668,7 @@ def close_session(session_id: str, save: bool = True, force: bool = False, idb_o
     ))
 
 
-@mcp.tool(description="Keep only the most recent manager-owned headless sessions alive per agent scope by default; save and close older sessions. Set per_agent=false for a global cap. Saved .i64 files are written to output_dir. When output_dir is omitted, the daemon uses the stdio MCP process startup cwd reported by the owning client; pass output_dir for an exact destination.", structured_output=False)
+@mcp.tool(description="Keep only the most recent manager-owned headless sessions alive per agent scope by default; save and close older sessions. Set per_agent=false for a global cap. By default saved .i64 data is persisted back to the original/source-adjacent IDB path; pass output_dir only when you explicitly want an additional copy in a chosen directory.", structured_output=False)
 def prune_alive_sessions(
     keep: int = 3,
     output_dir: str = "",
