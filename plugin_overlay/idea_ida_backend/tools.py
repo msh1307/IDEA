@@ -60,6 +60,11 @@ def _parse_ea(value: Any) -> int:
     text = value.strip()
     if not text:
         raise ValueError("Missing address")
+    lowered = text.lower()
+    if lowered.startswith("rva:"):
+        return idaapi.get_imagebase() + int(text.split(":", 1)[1].strip(), 0)
+    if lowered.startswith("rva "):
+        return idaapi.get_imagebase() + int(text.split(None, 1)[1].strip(), 0)
     try:
         return int(text, 0)
     except ValueError:
@@ -67,6 +72,100 @@ def _parse_ea(value: Any) -> int:
         if ea == ida_idaapi.BADADDR:
             raise ValueError(f"Unable to resolve address or symbol: {text}") from None
         return ea
+
+
+def _is_mapped_ea(ea: int) -> bool:
+    return ea != ida_idaapi.BADADDR and ida_segment.getseg(ea) is not None
+
+
+def _address_query_candidates(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, int):
+        numeric = value
+        explicit_rva = False
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return []
+        lowered = text.lower()
+        explicit_rva = lowered.startswith("rva:")
+        if explicit_rva:
+            raw = text.split(":", 1)[1].strip()
+        elif lowered.startswith("rva "):
+            explicit_rva = True
+            raw = text.split(None, 1)[1].strip()
+        else:
+            raw = text
+        try:
+            numeric = int(raw, 0)
+        except ValueError:
+            return []
+
+    image_base = idaapi.get_imagebase()
+    raw_candidates = [("rva", image_base + numeric)] if explicit_rva else [("addr", numeric), ("rva", image_base + numeric)]
+    candidates: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for source, ea in raw_candidates:
+        if ea in seen:
+            continue
+        seen.add(ea)
+        candidates.append(
+            {
+                "source": source,
+                "address": ea,
+                "mapped": _is_mapped_ea(ea),
+            }
+        )
+    mapped = [candidate for candidate in candidates if candidate["mapped"]]
+    return mapped or candidates
+
+
+def _has_argument_value(value: Any) -> bool:
+    return value is not None and value != ""
+
+
+def _resolve_target_ea(arguments: dict[str, Any]) -> int:
+    addr = arguments.get("addr")
+    if _has_argument_value(addr):
+        return _parse_ea(addr)
+    rva = arguments.get("rva")
+    if _has_argument_value(rva):
+        return idaapi.get_imagebase() + _parse_int_like(rva, "rva")
+    symbol = str(arguments.get("target_symbol") or arguments.get("symbol") or arguments.get("name") or "").strip()
+    if symbol:
+        ea = ida_name.get_name_ea(ida_idaapi.BADADDR, symbol)
+        if ea == ida_idaapi.BADADDR:
+            raise ValueError(f"Unable to resolve symbol: {symbol}")
+        return ea
+    return _parse_ea(arguments.get("addr"))
+
+
+def _resolve_optional_end_ea(arguments: dict[str, Any], base_ea: int) -> int | None:
+    if _has_argument_value(arguments.get("end_rva")):
+        return idaapi.get_imagebase() + _parse_int_like(arguments.get("end_rva"), "end_rva")
+    if arguments.get("end_symbol") or arguments.get("end_name"):
+        symbol = str(arguments.get("end_symbol") or arguments.get("end_name") or "").strip()
+        end_ea = ida_name.get_name_ea(ida_idaapi.BADADDR, symbol)
+        if end_ea == ida_idaapi.BADADDR:
+            raise ValueError(f"Unable to resolve end symbol: {symbol}")
+        return end_ea
+    end_raw = arguments.get("end")
+    if str(end_raw or "").strip():
+        return _parse_ea(end_raw)
+    size_raw = arguments.get("size")
+    if _has_argument_value(size_raw) and size_raw != 0:
+        return base_ea + max(0, _parse_int_like(size_raw, "size"))
+    return None
+
+
+def _address_payload(ea: int) -> dict[str, Any]:
+    image_base = idaapi.get_imagebase()
+    return {
+        "addr": _hex(ea),
+        "rva": _hex(max(0, ea - image_base)),
+        "image_base": _hex(image_base),
+        "segment": _segment_name(ea),
+        "name": _name_at(ea),
+    }
 
 
 def _hex(ea: int) -> str:
@@ -202,6 +301,22 @@ def _normalize_export_path(path: str) -> Path:
         rest = match.group("rest").replace("/", "\\")
         return Path(f"{match.group('drive').upper()}:\\{rest}")
     return Path(raw).expanduser()
+
+
+def _path_basename(path: Any) -> str:
+    text = str(path or "").rstrip("\\/")
+    if not text:
+        return ""
+    return re.split(r"[\\/]+", text)[-1]
+
+
+def _include_path_for_header(source_path: Path, header_path: Any) -> str:
+    header = Path(str(header_path or ""))
+    try:
+        include_path = os.path.relpath(str(header), str(source_path.parent))
+    except Exception:
+        include_path = _path_basename(header_path)
+    return include_path.replace("\\", "/")
 
 
 def _c_comment_text(value: Any) -> str:
@@ -387,6 +502,110 @@ def _pseudocode_lines(cfunc) -> list[str]:
     return lines
 
 
+# Hex-Rays prints local declarations at the top of the function.  They are
+# useful when inspecting a function's frame, but are usually boilerplate in a
+# model-facing decompile result.  Keep this deliberately conservative: only a
+# single, uninitialised declaration is eligible for compact projection.  Any
+# line we cannot classify safely remains in the compact view.
+_LOCAL_DECL_RE = re.compile(
+    r"^\s*(?:(?:const|volatile|signed|unsigned|short|long|struct|union|enum|class)\s+)*"
+    r"(?:[_A-Za-z][_A-Za-z0-9]*\s+)+[*\s]*[_A-Za-z][_A-Za-z0-9]*(?:\s*\[[^\]]*\])?"
+    r"\s*(?:=\s*[^;]+)?;\s*(?://.*)?$"
+)
+_AUTO_LOCAL_NAME_RE = re.compile(r"^(?:v|a|varg|arg)\d+(?:_[0-9A-Za-z]+)?$")
+
+
+def _normalize_decompile_lines(lines: list[str]) -> list[str]:
+    """Normalize presentation-only whitespace without changing code tokens."""
+    normalized: list[str] = []
+    pending_blank = False
+    for line in lines:
+        cleaned = str(line).rstrip()
+        if not cleaned.strip():
+            pending_blank = True
+            continue
+        if pending_blank and normalized:
+            normalized.append("")
+        pending_blank = False
+        normalized.append(cleaned)
+    while normalized and not normalized[-1].strip():
+        normalized.pop()
+    return normalized
+
+
+def _decompile_views(code: str) -> dict[str, Any]:
+    """Build compact/header projections while retaining the original text."""
+    raw_lines = str(code or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    normalized_lines = _normalize_decompile_lines(raw_lines)
+    opening_brace = next((idx for idx, line in enumerate(normalized_lines) if "{" in line), None)
+    if opening_brace is None:
+        return {
+            "compact": "\n".join(normalized_lines),
+            "header": "\n".join(normalized_lines),
+            "prototype": "\n".join(normalized_lines).strip(),
+            "declarations": [],
+            "initial_declarations": [],
+            "omitted_declaration_count": 0,
+        }
+
+    brace_line = normalized_lines[opening_brace]
+    prototype_lines = normalized_lines[:opening_brace]
+    brace_prefix = brace_line.split("{", 1)[0].rstrip()
+    if brace_prefix:
+        prototype_lines.append(brace_prefix)
+    header_lines = normalized_lines[: opening_brace + 1]
+    body_lines = normalized_lines[opening_brace + 1 :]
+    declarations: list[str] = []
+    initial_declarations: list[str] = []
+    compact_body: list[str] = []
+    scanning_declarations = True
+    for line in body_lines:
+        stripped = line.strip()
+        if scanning_declarations and not stripped:
+            # Do not let leading whitespace obscure the declaration block.
+            continue
+        if scanning_declarations and _LOCAL_DECL_RE.match(line):
+            declaration_text = line.strip()
+            initial_declarations.append(declaration_text)
+            # Only hide compiler-generated locals.  Named locals are retained
+            # because their type/name often carries analysis information.
+            declaration_code = declaration_text.split("//", 1)[0]
+            names = re.findall(r"\b[_A-Za-z][_A-Za-z0-9]*\b", declaration_code)
+            candidate_name = names[-1] if names else ""
+            if "=" not in declaration_code and _AUTO_LOCAL_NAME_RE.match(candidate_name):
+                declarations.append(declaration_text)
+                continue
+            compact_body.append(line)
+            continue
+        scanning_declarations = False
+        compact_body.append(line)
+
+    compact_lines = _normalize_decompile_lines(header_lines + compact_body)
+    prototype = "\n".join(_normalize_decompile_lines(prototype_lines)).strip()
+    header_text = "\n".join(_normalize_decompile_lines(prototype_lines + initial_declarations))
+    return {
+        "compact": "\n".join(compact_lines),
+        "header": header_text,
+        "prototype": prototype,
+        "declarations": initial_declarations,
+        "initial_declarations": initial_declarations,
+        "omitted_declaration_count": len(declarations),
+    }
+
+
+def _decompile_view(arguments: dict[str, Any] | None) -> str:
+    if _detail_is_full(arguments):
+        return "full"
+    raw = str((arguments or {}).get("view") or "").strip().lower()
+    if raw in {"", "default", "compact", "body", "slim"}:
+        return "compact"
+    if raw in {"header", "declarations", "decls"}:
+        return "header"
+    if raw in {"full", "raw", "verbose"}:
+        return "full"
+    raise ValueError("view must be one of: compact, header, full")
+
+
 def _decompile_line_map_payload(ea: int) -> dict[str, Any]:
     func, cfunc = _decompile_cfunc(ea)
     pseudocode_lines = _pseudocode_lines(cfunc)
@@ -454,6 +673,67 @@ def _function_summary(func) -> dict[str, Any]:
     }
 
 
+def _function_match_payload(func, query_ea: int, match_type: str, source: str = "") -> dict[str, Any]:
+    payload = _function_summary(func)
+    payload.update(
+        {
+            "match_type": match_type,
+            "source": source,
+            "query_address": _hex(query_ea),
+            "contains_query": func.start_ea <= query_ea < func.end_ea,
+            "offset": max(0, query_ea - func.start_ea) if query_ea >= func.start_ea else 0,
+            "end_address": _hex(func.end_ea),
+        }
+    )
+    return payload
+
+
+def _nearby_functions_payload(ea: int) -> dict[str, Any]:
+    def summarize(func) -> dict[str, Any] | None:
+        if func is None:
+            return None
+        payload = _function_summary(func)
+        payload["end_address"] = _hex(func.end_ea)
+        if ea < func.start_ea:
+            payload["distance"] = func.start_ea - ea
+        elif ea >= func.end_ea:
+            payload["distance"] = ea - func.end_ea
+        else:
+            payload["distance"] = 0
+        return payload
+
+    return {
+        "previous": summarize(ida_funcs.get_prev_func(ea)),
+        "next": summarize(ida_funcs.get_next_func(ea)),
+    }
+
+
+def _missing_function_guidance(ea: int) -> dict[str, Any]:
+    target = _address_payload(ea)
+    return {
+        "status": "no_function_at_address",
+        "message": f"No IDA function contains {target['addr']} ({target['rva']}). nearest_functions are nearby navigation hints, not matches.",
+        "nearest_functions": _nearby_functions_payload(ea),
+        "suggested_next_calls": [
+            {
+                "tool": "repair_function_analysis",
+                "arguments": {
+                    "rva": target["rva"],
+                    "define_code": True,
+                    "make_function": True,
+                    "decompile": True,
+                },
+                "when": "Use when this address should be a function start or IDA missed function analysis.",
+            },
+            {
+                "tool": "jump",
+                "arguments": {"rva": target["rva"], "mode": "inspect"},
+                "when": "Use before mutating if you need to inspect existing bytes/code at this address.",
+            },
+        ],
+    }
+
+
 def _enclosing_function_payload(ea: int) -> dict[str, Any]:
     func = idaapi.get_func(ea)
     if func is None:
@@ -461,6 +741,7 @@ def _enclosing_function_payload(ea: int) -> dict[str, Any]:
             "found": False,
             "query_address": _hex(ea),
             "contains_query": False,
+            **_missing_function_guidance(ea),
         }
     payload = _function_summary(func)
     payload.update(
@@ -882,6 +1163,21 @@ def _struct_fields_from_tif(tif: ida_typeinf.tinfo_t, *, include_auto_pad: bool 
     return fields
 
 
+def _struct_fields_equivalent(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> bool:
+    def normalize(fields: list[dict[str, Any]]) -> list[tuple[int, str, str, int]]:
+        return [
+            (
+                int(field.get("offset") or 0),
+                str(field.get("name") or ""),
+                str(field.get("type") or ""),
+                int(field.get("size") or 0),
+            )
+            for field in sorted(fields, key=lambda item: (int(item.get("offset") or 0), str(item.get("name") or "")))
+        ]
+
+    return normalize(left) == normalize(right)
+
+
 def _get_named_struct_tinfo(struct_name: str) -> ida_typeinf.tinfo_t:
     tif = _resolve_type_info(struct_name)
     if not tif.is_udt():
@@ -1002,17 +1298,118 @@ def _find_cfunc_lvar(func_ea: int, name: str):
     raise ValueError(f"Local variable not found: {name}")
 
 
-def _apply_struct_to_local(func_ea: int, local_name: str, struct_name: str) -> dict[str, Any]:
-    tif = _get_named_struct_tinfo(struct_name)
-    cfunc, lvar = _find_cfunc_lvar(func_ea, local_name)
+def _apply_type_to_lvar(cfunc, lvar, tif) -> bool:
     info = ida_hexrays.lvar_saved_info_t()
     info.ll = lvar
     info.type = tif
     info.size = int(tif.get_size())
-    ok = bool(ida_hexrays.modify_user_lvar_info(cfunc.entry_ea, ida_hexrays.MLI_TYPE, info))
+    return bool(ida_hexrays.modify_user_lvar_info(cfunc.entry_ea, ida_hexrays.MLI_TYPE, info))
+
+
+def _apply_struct_to_local(func_ea: int, local_name: str, struct_name: str) -> dict[str, Any]:
+    tif = _get_named_struct_tinfo(struct_name)
+    cfunc, lvar = _find_cfunc_lvar(func_ea, local_name)
+    ok = _apply_type_to_lvar(cfunc, lvar, tif)
     if ok:
         _refresh_decompiler(cfunc.entry_ea)
     return {"addr": _hex(cfunc.entry_ea), "name": local_name, "struct_name": struct_name, "ok": ok, "kind": "local"}
+
+
+def _define_or_replace_stack_member(
+    func,
+    var_name: str,
+    soff: int,
+    tif,
+    *,
+    old_size: int = 0,
+) -> tuple[bool, str, bool]:
+    """Apply a type to a frame member, expanding the slot when needed."""
+    new_size = max(1, int(tif.get_size() or 0))
+    fp_offset = ida_frame.soff_to_fpoff(func, soff)
+    set_member_type = getattr(ida_frame, "set_frame_member_type", None)
+    add_frame_member = getattr(ida_frame, "add_frame_member", None)
+    delete_end = soff + max(1, int(old_size or 0), new_size)
+
+    # Keep the fast path for replacements that fit the existing slot.
+    if new_size <= max(1, int(old_size or 0)):
+        if callable(set_member_type):
+            try:
+                if bool(set_member_type(func, soff, tif)):
+                    return True, "set_frame_member_type", False
+            except Exception:
+                pass
+        try:
+            if bool(ida_frame.define_stkvar(func, var_name, fp_offset, tif)):
+                return True, "define_stkvar", False
+        except Exception:
+            pass
+
+    # Snapshot the frame. IDA can expose reused stack storage as an implicit
+    # member, so a larger replacement may need the preceding member removed.
+    frame_members: list[tuple[str, int, Any, int]] = []
+    frame_tif = ida_typeinf.tinfo_t()
+    if ida_frame.get_func_frame(frame_tif, func):
+        current_udt = ida_typeinf.udt_type_data_t()
+        frame_tif.get_udt_details(current_udt)
+        frame_members = [
+            (str(member.name or ""), member.offset // 8, member.type, max(1, member.size // 8))
+            for member in current_udt
+            if not member.is_gap()
+        ]
+
+    target_members = [
+        member
+        for member in frame_members
+        if member[1] <= soff < member[1] + member[3] or soff <= member[1] < delete_end
+    ]
+    previous = max((member for member in frame_members if member[1] < soff), key=lambda member: member[1], default=None)
+
+    def delete_members(include_previous: bool) -> bool:
+        selected = list(target_members)
+        if include_previous and previous is not None:
+            selected.append(previous)
+        deleted_any = False
+        ordered = sorted(selected, key=lambda member: member[1], reverse=not include_previous)
+        for member_name, member_offset, _member_type, member_size in ordered:
+            if member_name:
+                deleted_any = bool(ida_frame.delete_frame_members(func, member_offset, member_offset + member_size)) or deleted_any
+        return deleted_any
+
+    def apply_replacement() -> tuple[bool, str]:
+        if callable(set_member_type):
+            try:
+                if bool(set_member_type(func, soff, tif)):
+                    return True, "set_frame_member_type"
+            except Exception:
+                pass
+        if callable(add_frame_member):
+            try:
+                if bool(add_frame_member(func, var_name, soff, tif)):
+                    return True, "add_frame_member"
+            except Exception:
+                pass
+        return False, "replace_frame_member"
+
+    if previous is not None and new_size > max(1, int(old_size or 0)) and delete_members(True):
+        ok, applied_via = apply_replacement()
+        if ok:
+            return True, applied_via, True
+    elif delete_members(False):
+        ok, applied_via = apply_replacement()
+        if ok:
+            return True, applied_via, bool(target_members)
+
+    # Best-effort restoration after a failed replacement.
+    for member_name, member_offset, member_type, _member_size in sorted(frame_members, key=lambda member: member[1]):
+        if not member_name:
+            continue
+        try:
+            if callable(add_frame_member) and bool(add_frame_member(func, member_name, member_offset, member_type)):
+                continue
+            ida_frame.define_stkvar(func, member_name, ida_frame.soff_to_fpoff(func, member_offset), member_type)
+        except Exception:
+            pass
+    return False, "replace_frame_member", True
 
 
 def _apply_struct_to_stack(func_ea: int, item: dict[str, Any], struct_name: str) -> dict[str, Any]:
@@ -1021,11 +1418,7 @@ def _apply_struct_to_stack(func_ea: int, item: dict[str, Any], struct_name: str)
     if target_name:
         try:
             cfunc, lvar = _find_cfunc_lvar(func_ea, target_name)
-            info = ida_hexrays.lvar_saved_info_t()
-            info.ll = lvar
-            info.type = tif
-            info.size = int(tif.get_size())
-            ok = bool(ida_hexrays.modify_user_lvar_info(cfunc.entry_ea, ida_hexrays.MLI_TYPE, info))
+            ok = _apply_type_to_lvar(cfunc, lvar, tif)
             if ok:
                 _refresh_decompiler(cfunc.entry_ea)
                 return {
@@ -1054,16 +1447,21 @@ def _apply_struct_to_stack(func_ea: int, item: dict[str, Any], struct_name: str)
             continue
         off = udm.offset // 8
         if target_name and str(udm.name or "") == target_name:
-            selected = (str(udm.name or ""), off)
+            selected = (str(udm.name or ""), off, udm.size // 8)
             break
         if target_offset is not None and off == _parse_int_like(target_offset, "offset"):
-            selected = (str(udm.name or ""), off)
+            selected = (str(udm.name or ""), off, udm.size // 8)
             break
     if selected is None:
         raise ValueError("Stack variable not found")
-    var_name, soff = selected
-    fp_offset = ida_frame.soff_to_fpoff(func, soff)
-    ok = bool(ida_frame.define_stkvar(func, var_name, fp_offset, tif))
+    var_name, soff, old_size = selected
+    ok, applied_via, replaced_existing = _define_or_replace_stack_member(
+        func,
+        var_name,
+        soff,
+        tif,
+        old_size=old_size,
+    )
     if ok:
         _refresh_decompiler(func.start_ea)
     return {
@@ -1073,7 +1471,8 @@ def _apply_struct_to_stack(func_ea: int, item: dict[str, Any], struct_name: str)
         "struct_name": struct_name,
         "ok": ok,
         "kind": "stack",
-        "applied_via": "define_stkvar",
+        "applied_via": applied_via,
+        "replaced_existing": replaced_existing,
     }
 
 
@@ -1094,10 +1493,14 @@ def _workflow_entries_changed(group: list[Any]) -> int:
     for entry in group:
         if not isinstance(entry, dict):
             continue
-        if entry.get("ok") is True:
-            count += 1
+        if "db_changed" in entry:
+            count += 1 if bool(entry.get("db_changed")) else 0
+        elif "changed_count" in entry:
+            count += int(entry.get("changed_count") or 0)
         elif "ok_count" in entry and int(entry.get("ok_count") or 0) > 0:
             count += int(entry.get("ok_count") or 0)
+        elif entry.get("ok") is True:
+            count += 1
         nested = entry.get("items")
         if isinstance(nested, list):
             count += _workflow_entries_changed(nested)
@@ -1137,6 +1540,86 @@ def _ensure_list_of_dicts(value: Any, field_name: str) -> list[dict[str, Any]]:
     if isinstance(value, list) and all(isinstance(item, dict) for item in value):
         return value
     raise ValueError(f"{field_name} must be an object or list of objects")
+
+
+def _function_definition_items(arguments: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("items", "batch", "functions", "funcs"):
+        value = arguments.get(key)
+        if value is not None and value != "":
+            return _ensure_list_of_dicts(value, key)
+    addrs = arguments.get("addrs")
+    if addrs is not None and addrs != "":
+        return [{"addr": addr} for addr in _split_string_list(addrs)]
+    return _ensure_list_of_dicts(arguments, "items")
+
+
+def _desired_function_name(arguments: dict[str, Any]) -> str:
+    for key in ("new_name", "function_name"):
+        value = str(arguments.get(key) or "").strip()
+        if value:
+            return value
+    has_explicit_address = any(_has_argument_value(arguments.get(key)) for key in ("addr", "rva"))
+    if has_explicit_address:
+        for key in ("name", "symbol"):
+            value = str(arguments.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _coerce_rename_items(value: Any, kind: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if value is None or value == "":
+        return [], []
+    if isinstance(value, dict):
+        direct_keys = {"addr", "rva", "symbol", "target_symbol", "func_addr", "old", "new"}
+        if any(key in value for key in direct_keys):
+            return [value], []
+        items = [{"addr": addr, "name": name} for addr, name in value.items()]
+        return items, []
+    if isinstance(value, list):
+        if all(isinstance(item, dict) for item in value):
+            return value, []
+        errors = [{"kind": kind, "item": item, "ok": False, "error": "expected object with addr/name"} for item in value if not isinstance(item, dict)]
+        return [item for item in value if isinstance(item, dict)], errors
+    return [], [{"kind": kind, "ok": False, "error": "expected object, address-to-name map, or list"}]
+
+
+def _normalize_rename_batch(arguments: dict[str, Any]) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    batch = arguments.get("batch", arguments)
+    if isinstance(batch, dict) and ("addr" in batch or "rva" in batch) and ("name" in batch or "new" in batch):
+        batch = {"func": [batch]}
+    if not isinstance(batch, dict):
+        return {"func": [], "data": [], "local": [], "stack": []}, [{"ok": False, "error": "schema_mismatch: rename expects {func:[{addr,name}]} or {functions:{addr:name}}"}]
+
+    normalized = {"func": [], "data": [], "local": [], "stack": []}
+    errors: list[dict[str, Any]] = []
+    aliases = {
+        "func": ("func", "function", "functions", "funcs"),
+        "data": ("data", "global", "globals"),
+        "local": ("local", "locals", "lvar", "lvars"),
+        "stack": ("stack", "stack_vars", "stackvars"),
+    }
+    for kind, keys in aliases.items():
+        for key in keys:
+            if key not in batch:
+                continue
+            items, item_errors = _coerce_rename_items(batch.get(key), kind)
+            normalized[kind].extend(items)
+            errors.extend(item_errors)
+    unknown_keys = sorted(key for key in batch if key not in {alias for keys in aliases.values() for alias in keys})
+    if unknown_keys:
+        errors.append({"ok": False, "error": "unknown_rename_keys", "keys": unknown_keys, "expected": "func/functions/data/local/stack"})
+    return normalized, errors
+
+
+def _bulk_recover_items(arguments: dict[str, Any]) -> list[dict[str, Any]]:
+    value = arguments.get("items", arguments.get("functions", arguments.get("batch", arguments)))
+    if isinstance(value, dict) and not any(key in value for key in ("addr", "rva", "symbol", "target_symbol")):
+        option_keys = {"define_code", "make_function", "reanalyze", "apply_comments", "expected_txid", "force"}
+        if set(value).issubset(option_keys):
+            raise ValueError("items must be a list of {addr|rva,name?,decl?,comment?}")
+        return [{"addr": addr, "name": name} for addr, name in value.items()]
+    return _ensure_list_of_dicts(value, "items")
 
 
 def _primitive_create(ea: int, elem_type: str) -> bool:
@@ -1188,7 +1671,13 @@ def inspect(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = inspect_addr({"addr": ea})
     if include_decompile:
         try:
-            payload["decompile"] = decompile({"addr": ea, "fallback": arguments.get("fallback", "disasm")})
+            payload["decompile"] = decompile(
+                {
+                    "addr": ea,
+                    "fallback": arguments.get("fallback", "disasm"),
+                    "view": "full" if full else "compact",
+                }
+            )
         except Exception as exc:
             payload["decompile_error"] = str(exc)
     if include_disasm:
@@ -1281,47 +1770,397 @@ def imports(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"items": sliced, "offset": offset, "count": count, "total": total}
 
 
+_AUTO_QUEUE_NAMES = (
+    "AU_UNK",
+    "AU_CODE",
+    "AU_WEAK",
+    "AU_PROC",
+    "AU_TAIL",
+    "AU_FCHUNK",
+    "AU_USED",
+    "AU_USD2",
+    "AU_TYPE",
+    "AU_LIBF",
+    "AU_LBF2",
+    "AU_LBF3",
+    "AU_CHLB",
+    "AU_FINAL",
+)
+_AUTO_QUEUE_LABELS = {
+    "AU_UNK": "marking unexplored bytes",
+    "AU_CODE": "creating instructions",
+    "AU_WEAK": "creating speculative instructions",
+    "AU_PROC": "creating functions",
+    "AU_TAIL": "creating function tails",
+    "AU_FCHUNK": "finding function chunks",
+    "AU_USED": "reanalyzing references",
+    "AU_USD2": "reanalyzing references (pass 2)",
+    "AU_TYPE": "applying type information",
+    "AU_LIBF": "matching library signatures",
+    "AU_LBF2": "matching library signatures (pass 2)",
+    "AU_LBF3": "matching library signatures (pass 3)",
+    "AU_CHLB": "loading signature files",
+    "AU_FINAL": "running the final analysis pass",
+}
+
+
+def _autoanalysis_bounds() -> tuple[int, int]:
+    try:
+        return int(ida_ida.inf_get_min_ea()), int(ida_ida.inf_get_max_ea())
+    except Exception:
+        return 0, int(ida_idaapi.BADADDR)
+
+
+def _auto_queue_definitions() -> list[tuple[str, int]]:
+    definitions: list[tuple[str, int]] = []
+    seen: set[int] = set()
+    for name in _AUTO_QUEUE_NAMES:
+        value = getattr(ida_auto, name, None)
+        if value is None:
+            continue
+        queue_type = int(value)
+        if queue_type in seen:
+            continue
+        seen.add(queue_type)
+        definitions.append((name, queue_type))
+    return definitions
+
+
+def _auto_phase_payload(queue_type: int, definitions: list[tuple[str, int]]) -> dict[str, Any]:
+    for index, (name, value) in enumerate(definitions):
+        if value == queue_type:
+            return {
+                "id": queue_type,
+                "name": name,
+                "label": _AUTO_QUEUE_LABELS.get(name, name),
+                "index": index,
+                "total": len(definitions),
+            }
+    return {
+        "id": queue_type,
+        "name": "AU_NONE" if queue_type == int(getattr(ida_auto, "AU_NONE", -1)) else f"AU_{queue_type}",
+        "label": "idle" if queue_type == int(getattr(ida_auto, "AU_NONE", -1)) else "unknown analysis phase",
+        "index": -1,
+        "total": len(definitions),
+    }
+
+
+def _auto_state_name(state: int) -> str:
+    for name in ("st_Ready", "st_Think", "st_Waiting", "st_Work"):
+        value = getattr(ida_auto, name, None)
+        if value is not None and int(value) == state:
+            return name
+    return str(state)
+
+
+def _analysis_address_payload(ea: int) -> dict[str, Any] | None:
+    if ea == ida_idaapi.BADADDR:
+        return None
+    segment = ida_segment.getseg(ea)
+    image_base = idaapi.get_imagebase()
+    payload: dict[str, Any] = {
+        "address": _hex(ea),
+        "rva": _hex(max(0, ea - image_base)),
+        "segment": ida_segment.get_segm_name(segment) if segment is not None else "",
+    }
+    if segment is not None:
+        size = max(0, int(segment.end_ea - segment.start_ea))
+        offset = max(0, min(size, int(ea - segment.start_ea)))
+        payload.update(
+            {
+                "segment_start": _hex(segment.start_ea),
+                "segment_end": _hex(segment.end_ea),
+                "segment_offset": offset,
+                "segment_size": size,
+                "segment_percent": round((offset / size) * 100.0, 2) if size else 100.0,
+            }
+        )
+    return payload
+
+
+def _segment_analysis_tail(seg) -> dict[str, Any]:
+    start_ea = int(seg.start_ea)
+    end_ea = int(seg.end_ea)
+    size = max(0, end_ea - start_ea)
+    last_head = ida_bytes.prev_head(end_ea, start_ea) if size else ida_idaapi.BADADDR
+    if last_head == ida_idaapi.BADADDR:
+        last_defined_end = start_ea
+        trailing_unknown_start = start_ea if size and ida_bytes.is_unknown(ida_bytes.get_flags32(start_ea)) else None
+    else:
+        item_size = max(1, int(ida_bytes.get_item_size(last_head)))
+        last_defined_end = min(end_ea, int(last_head) + item_size)
+        trailing_unknown_start = None
+        if last_defined_end < end_ea and ida_bytes.is_unknown(ida_bytes.get_flags32(last_defined_end)):
+            trailing_unknown_start = last_defined_end
+
+    last_defined_kind = None
+    if last_head != ida_idaapi.BADADDR:
+        last_flags = ida_bytes.get_flags32(last_head)
+        if ida_bytes.is_code(last_flags):
+            last_defined_kind = "code"
+        elif hasattr(ida_bytes, "is_align") and ida_bytes.is_align(last_flags):
+            last_defined_kind = "alignment"
+        elif ida_bytes.is_data(last_flags):
+            last_defined_kind = "data"
+        else:
+            last_defined_kind = "other"
+
+    last_code_head = ida_idaapi.BADADDR
+    candidate = last_head
+    for _ in range(10_000):
+        if candidate == ida_idaapi.BADADDR:
+            break
+        if ida_bytes.is_code(ida_bytes.get_flags32(candidate)):
+            last_code_head = candidate
+            break
+        if candidate <= start_ea:
+            break
+        previous = ida_bytes.prev_head(candidate, start_ea)
+        if previous == candidate and candidate > start_ea:
+            previous = ida_bytes.prev_head(candidate - 1, start_ea)
+        if previous == ida_idaapi.BADADDR or previous >= candidate:
+            break
+        candidate = previous
+    if last_code_head == ida_idaapi.BADADDR:
+        last_code_end = None
+    else:
+        last_code_end = min(end_ea, int(last_code_head) + max(1, int(ida_bytes.get_item_size(last_code_head))))
+
+    last_function_start = None
+    last_function_end = None
+    for function_ea in idautils.Functions(start_ea, end_ea):
+        func = ida_funcs.get_func(function_ea)
+        if func is None:
+            continue
+        last_function_start = int(func.start_ea)
+        last_function_end = min(end_ea, int(func.end_ea))
+
+    permissions = int(getattr(seg, "perm", 0))
+    executable = bool(permissions & int(getattr(ida_segment, "SEGPERM_EXEC", 0)))
+    name = ida_segment.get_segm_name(seg)
+    trailing_unknown_bytes = end_ea - trailing_unknown_start if trailing_unknown_start is not None else 0
+    return {
+        "name": name,
+        "start": _hex(start_ea),
+        "end": _hex(end_ea),
+        "size": size,
+        "executable": executable,
+        "text_like": name.lower() in {".text", "text", "code"},
+        "last_defined_head": None if last_head == ida_idaapi.BADADDR else _hex(int(last_head)),
+        "last_defined_end": _hex(last_defined_end),
+        "last_defined_kind": last_defined_kind,
+        "defined_through_percent": round(((last_defined_end - start_ea) / size) * 100.0, 2) if size else 100.0,
+        "last_code_head": None if last_code_head == ida_idaapi.BADADDR else _hex(int(last_code_head)),
+        "last_code_end": None if last_code_end is None else _hex(last_code_end),
+        "last_code_end_percent": (
+            round(((last_code_end - start_ea) / size) * 100.0, 2)
+            if size and last_code_end is not None
+            else None
+        ),
+        "bytes_after_last_code": size if last_code_end is None else end_ea - last_code_end,
+        "last_function_start": None if last_function_start is None else _hex(last_function_start),
+        "last_function_end": None if last_function_end is None else _hex(last_function_end),
+        "last_function_end_percent": (
+            round(((last_function_end - start_ea) / size) * 100.0, 2)
+            if size and last_function_end is not None
+            else None
+        ),
+        "bytes_after_last_function": size if last_function_end is None else end_ea - last_function_end,
+        "trailing_unknown_start": None if trailing_unknown_start is None else _hex(trailing_unknown_start),
+        "trailing_unknown_bytes": trailing_unknown_bytes,
+        "tail_status": "unexplored" if trailing_unknown_start is not None else "defined_to_segment_end",
+    }
+
+
+def _executable_segment_analysis_tails() -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    for seg_ea in idautils.Segments():
+        seg = ida_segment.getseg(seg_ea)
+        if seg is None:
+            continue
+        permissions = int(getattr(seg, "perm", 0))
+        name = ida_segment.get_segm_name(seg)
+        if not (permissions & int(getattr(ida_segment, "SEGPERM_EXEC", 0))) and name.lower() not in {".text", "text", "code"}:
+            continue
+        segments.append(_segment_analysis_tail(seg))
+    return segments
+
+
+def _analysis_status_payload(*, include_coverage: bool = False) -> dict[str, Any]:
+    try:
+        complete = bool(ida_auto.auto_is_ok())
+    except Exception:
+        complete = False
+
+    definitions = _auto_queue_definitions()
+    min_ea, max_ea = _autoanalysis_bounds()
+    pending_queues: list[dict[str, Any]] = []
+    if hasattr(ida_auto, "peek_auto_queue"):
+        for name, queue_type in definitions:
+            try:
+                next_ea = int(ida_auto.peek_auto_queue(min_ea, queue_type))
+            except Exception:
+                continue
+            if next_ea == ida_idaapi.BADADDR:
+                continue
+            pending_queues.append(
+                {
+                    "phase": _auto_phase_payload(queue_type, definitions),
+                    "next": _analysis_address_payload(next_ea),
+                }
+            )
+
+    display_ea = ida_idaapi.BADADDR
+    display_type = int(getattr(ida_auto, "AU_NONE", -1))
+    display_state = int(getattr(ida_auto, "st_Ready", 0))
+    if hasattr(ida_auto, "auto_display_t") and hasattr(ida_auto, "get_auto_display"):
+        try:
+            display = ida_auto.auto_display_t()
+            if ida_auto.get_auto_display(display):
+                display_ea = int(display.ea)
+                display_type = int(display.type)
+                display_state = int(display.state)
+        except Exception:
+            pass
+    if hasattr(ida_auto, "get_auto_state"):
+        try:
+            state_type = int(ida_auto.get_auto_state())
+            if display_type == int(getattr(ida_auto, "AU_NONE", -1)):
+                display_type = state_type
+        except Exception:
+            pass
+
+    if (display_ea == ida_idaapi.BADADDR or display_type == int(getattr(ida_auto, "AU_NONE", -1))) and pending_queues:
+        first_pending = pending_queues[0]
+        pending_address = first_pending.get("next") or {}
+        try:
+            display_ea = int(str(pending_address.get("address") or ""), 0)
+        except Exception:
+            display_ea = ida_idaapi.BADADDR
+        display_type = int((first_pending.get("phase") or {}).get("id", display_type))
+
+    phase = _auto_phase_payload(display_type, definitions)
+    current = _analysis_address_payload(display_ea)
+    address_fraction = 0.0
+    if display_ea != ida_idaapi.BADADDR and max_ea > min_ea:
+        address_fraction = max(0.0, min(1.0, (display_ea - min_ea) / (max_ea - min_ea)))
+    if complete:
+        estimated_percent = 100.0
+    elif phase["index"] >= 0 and phase["total"]:
+        estimated_percent = ((phase["index"] + address_fraction) / phase["total"]) * 100.0
+    else:
+        estimated_percent = address_fraction * 100.0
+    estimated_percent = round(max(0.0, min(99.9, estimated_percent)), 2) if not complete else 100.0
+
+    if complete:
+        message = "IDA autoanalysis complete"
+    elif current and current.get("segment"):
+        message = (
+            f"{phase['name']} {current['segment']} {current.get('segment_percent', 0):.2f}% "
+            f"at {current['address']}"
+        )
+    elif current:
+        message = f"{phase['name']} at {current['address']}"
+    else:
+        message = f"{phase['name']} (analysis queues pending)"
+
+    payload: dict[str, Any] = {
+        "autoanalysis_complete": complete,
+        "status": "complete" if complete else ("analyzing" if pending_queues or phase["name"] != "AU_NONE" else "pending"),
+        "message": message,
+        "progress_percent": estimated_percent,
+        "progress_is_estimate": True,
+        "phase": phase,
+        "ida_state": {"id": display_state, "name": _auto_state_name(display_state)},
+        "current": current,
+        "pending_queue_count": len(pending_queues),
+        "pending_queues": pending_queues,
+        "function_total": sum(1 for _ in idautils.Functions()),
+    }
+    if include_coverage:
+        payload["executable_segments"] = _executable_segment_analysis_tails()
+        payload["coverage_note"] = (
+            "Best-effort tail coverage: last_defined_end, last_code_end, and last_function_end show how far IDA has "
+            "classified each executable segment; trailing_unknown_* identifies a contiguous unexplored segment tail."
+        )
+    return payload
+
+
 @idasync
 def analysis_status(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-    auto_is_ok = False
-    if hasattr(ida_auto, "auto_is_ok"):
-        try:
-            auto_is_ok = bool(ida_auto.auto_is_ok())
-        except Exception:
-            auto_is_ok = False
-    function_total = sum(1 for _ in idautils.Functions())
-    return {
-        "autoanalysis_complete": auto_is_ok,
-        "function_total": function_total,
-    }
+    arguments = arguments or {}
+    return _analysis_status_payload(include_coverage=_bool_argument(arguments, "include_coverage", False))
 
 
 @idasync
 def wait_for_autoanalysis(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
     timeout_sec = max(0.0, float(arguments.get("timeout_sec", 120.0)))
-    poll_interval = max(0.05, min(float(arguments.get("poll_interval_sec", 0.25)), 2.0))
+    max_work_raw = arguments.get("max_work_sec")
+    max_work_sec = None if max_work_raw is None or max_work_raw == "" else max(0.0, float(max_work_raw))
+    work_budget_sec = max_work_sec if max_work_sec is not None else timeout_sec
+    max_steps = max(1, int(arguments.get("max_steps", 1_000_000)))
+    include_coverage = _bool_argument(arguments, "include_coverage", False)
     start = time.monotonic()
-    if hasattr(ida_auto, "auto_wait"):
-        ida_auto.auto_wait()
-    while True:
-        ready = False
-        if hasattr(ida_auto, "auto_is_ok"):
+    deadline = start + work_budget_sec if work_budget_sec > 0 else None
+    steps_processed = 0
+    stalled = False
+    finalized_with_auto_wait = False
+
+    if hasattr(ida_auto, "auto_make_step"):
+        min_ea, max_ea = _autoanalysis_bounds()
+        while steps_processed < max_steps:
             try:
-                ready = bool(ida_auto.auto_is_ok())
+                if ida_auto.auto_is_ok():
+                    break
             except Exception:
-                ready = False
-        if ready:
-            break
-        if timeout_sec and (time.monotonic() - start) >= timeout_sec:
-            break
-        time.sleep(poll_interval)
-    function_total = sum(1 for _ in idautils.Functions())
-    return {
-        "autoanalysis_complete": bool(getattr(ida_auto, "auto_is_ok", lambda: True)()),
-        "function_total": function_total,
-        "waited_sec": round(time.monotonic() - start, 3),
-    }
+                pass
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            try:
+                made_step = bool(ida_auto.auto_make_step(min_ea, max_ea))
+            except Exception:
+                made_step = False
+            if not made_step:
+                # IDA 9.3 can have non-address finalization work after
+                # auto_make_step() has exhausted every address queue. A final
+                # auto_wait() is required to commit that work and make
+                # auto_is_ok() true. All address-based work was already sliced,
+                # so this fallback is normally short.
+                if hasattr(ida_auto, "auto_wait"):
+                    ida_auto.auto_wait()
+                    finalized_with_auto_wait = True
+                    try:
+                        stalled = not bool(ida_auto.auto_is_ok())
+                    except Exception:
+                        stalled = True
+                else:
+                    stalled = True
+                break
+            steps_processed += 1
+    elif hasattr(ida_auto, "auto_wait"):
+        # Compatibility fallback for older IDA versions. This path cannot emit
+        # intermediate progress because the legacy API is one blocking call.
+        ida_auto.auto_wait()
+
+    elapsed = time.monotonic() - start
+    status = _analysis_status_payload(include_coverage=include_coverage or bool(getattr(ida_auto, "auto_is_ok", lambda: False)()))
+    status.update(
+        {
+            "waited_sec": round(elapsed, 3),
+            "steps_processed": steps_processed,
+            "work_slice_exhausted": bool(not status["autoanalysis_complete"] and deadline is not None and elapsed >= work_budget_sec),
+            "timed_out": bool(
+                not status["autoanalysis_complete"]
+                and max_work_sec is None
+                and timeout_sec > 0
+                and elapsed >= timeout_sec
+            ),
+            "stalled": stalled,
+            "finalized_with_auto_wait": finalized_with_auto_wait,
+        }
+    )
+    return status
 
 
 @idasync
@@ -1372,21 +2211,42 @@ def lookup_funcs(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]
     all_funcs = [idaapi.get_func(ea) for ea in idautils.Functions()]
     for query in queries:
         matches = []
-        try:
-            ea = _parse_ea(query)
-            func = idaapi.get_func(ea)
-            if func is not None:
-                matches.append(_function_summary(func))
-        except Exception:
+        candidates = _address_query_candidates(query)
+        if candidates:
+            seen_funcs: set[int] = set()
+            for candidate in candidates:
+                ea = int(candidate["address"])
+                func = idaapi.get_func(ea)
+                if func is not None and func.start_ea not in seen_funcs:
+                    seen_funcs.add(func.start_ea)
+                    match_type = "function_start" if func.start_ea == ea else "containing_function"
+                    matches.append(_function_match_payload(func, ea, match_type, str(candidate["source"])))
+            if not matches:
+                nearby = _nearby_functions_payload(int(candidates[0]["address"]))
+                for match_type, func_payload in (("nearest_before", nearby.get("previous")), ("nearest_after", nearby.get("next"))):
+                    if not func_payload:
+                        continue
+                    func_payload = {**func_payload, "match_type": match_type, "source": str(candidates[0]["source"]), "query_address": _hex(int(candidates[0]["address"])), "contains_query": False}
+                    matches.append(func_payload)
+        else:
+            try:
+                ea = _parse_ea(query)
+            except Exception:
+                ea = ida_idaapi.BADADDR
+            if ea != ida_idaapi.BADADDR:
+                func = idaapi.get_func(ea)
+                if func is not None:
+                    matches.append(_function_match_payload(func, ea, "containing_function", "symbol"))
             q = str(query).lower()
             for func in all_funcs:
+                if len(matches) >= 20:
+                    break
                 if func is None:
                     continue
                 summary = _function_summary(func)
-                if q in summary["name"].lower():
+                if q in summary["name"].lower() and not any(item.get("address") == summary["address"] for item in matches):
+                    summary.update({"match_type": "name_substring", "source": "name"})
                     matches.append(summary)
-                    if len(matches) >= 20:
-                        break
         results.append({"query": query, "matches": matches})
     return results
 
@@ -1427,6 +2287,12 @@ def decompile(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
     ea = _parse_ea(arguments.get("addr"))
     full = _detail_is_full(arguments)
+    view = _decompile_view(arguments)
+    include_line_map = _bool_argument(arguments, "include_line_map", False) or full
+    # The address map is indexed against the original Hex-Rays lines.  Return
+    # the matching full text whenever a caller explicitly asks for that map.
+    if include_line_map:
+        view = "full"
     func = idaapi.get_func(ea)
     fallback = str(arguments.get("fallback") or "disasm").strip().lower()
     if func is None:
@@ -1439,15 +2305,30 @@ def decompile(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
             "decompile_error": f"No function found at {_hex(ea)}",
             "instructions": _disasm_window(ea, min(max(1, int(arguments.get('max_instructions', 200))), 2000)),
         }
-        if full:
+        if include_line_map:
             payload["line_map"] = {"items": [], "count": 0, "error": payload["decompile_error"]}
         return payload
     start_ea = func.start_ea
     name = ida_funcs.get_func_name(start_ea) or ""
     try:
         _func, cfunc = _decompile_cfunc(start_ea)
-        payload = {"addr": _hex(start_ea), "name": name, "mode": "decompile", "code": str(cfunc)}
-        if full:
+        raw_code = str(cfunc)
+        views = _decompile_views(raw_code)
+        payload = {
+            "addr": _hex(start_ea),
+            "name": name,
+            "mode": "decompile",
+            "view": view,
+            "code": raw_code if view == "full" else views[view],
+            "declaration_count": len(views["declarations"]),
+            "omitted_declaration_count": views["omitted_declaration_count"],
+        }
+        if view == "header":
+            payload["prototype"] = views["prototype"]
+            payload["declarations"] = views["declarations"]
+        elif views["declarations"]:
+            payload["declarations_available"] = True
+        if include_line_map:
             try:
                 payload["line_map"] = _decompile_line_map_payload(start_ea)
             except Exception as exc:
@@ -1469,7 +2350,7 @@ def decompile(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
             "decompile_error": str(exc),
             "instructions": instructions,
         }
-        if full:
+        if include_line_map:
             payload["line_map_error"] = str(exc)
         return payload
 
@@ -1518,7 +2399,7 @@ def disasm(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 @idasync
 def inspect_addr(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
-    ea = _parse_ea(arguments.get("addr"))
+    ea = _resolve_target_ea(arguments)
     flags = ida_bytes.get_flags(ea)
     item_size = ida_bytes.get_item_size(ea)
     prev_head = ida_bytes.prev_head(ea, ida_ida.inf_get_min_ea())
@@ -1535,6 +2416,520 @@ def inspect_addr(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
             "prev_head": _hex(prev_head) if prev_head != ida_idaapi.BADADDR else "",
             "next_head": _hex(next_head) if next_head != ida_idaapi.BADADDR else "",
             "enclosing_function": _enclosing_function_payload(ea),
+        }
+    )
+    return payload
+
+
+@idasync
+def jump(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    ea = _resolve_target_ea(arguments)
+    mode = str(arguments.get("mode") or "decompile").strip().lower()
+    max_instructions = max(1, min(int(arguments.get("max_instructions", 400) or 400), 4000))
+    result: dict[str, Any] = {
+        "ok": True,
+        "mode": "jump",
+        "target": _address_payload(ea),
+        "function": _enclosing_function_payload(ea),
+    }
+    if not result["function"].get("found"):
+        result.update(
+            {
+                "status": result["function"].get("status", "no_function_at_address"),
+                "message": result["function"].get("message", ""),
+                "nearest_functions": result["function"].get("nearest_functions"),
+                "suggested_next_calls": result["function"].get("suggested_next_calls", []),
+            }
+        )
+    try:
+        idc.jumpto(ea)
+    except Exception:
+        pass
+    if mode in {"inspect", "addr"}:
+        result["result"] = inspect_addr({"addr": ea})
+    elif mode in {"function", "func"}:
+        result["result"] = result["function"]
+    elif mode in {"disasm", "asm"}:
+        result["result"] = disasm({"addr": ea, "max_instructions": max_instructions})
+    elif mode in {"decompile", "pseudocode", "code"}:
+        result["result"] = decompile(
+            {
+                "addr": ea,
+                "fallback": arguments.get("fallback", "disasm"),
+                "max_instructions": max_instructions,
+                "view": arguments.get("view", "compact"),
+            }
+        )
+    else:
+        raise ValueError("mode must be one of: decompile, inspect, function, disasm")
+    return result
+
+
+def _reanalyze_range(start_ea: int, end_ea: int | None = None) -> None:
+    try:
+        if end_ea is not None and end_ea > start_ea:
+            ida_auto.plan_range(start_ea, end_ea)
+        else:
+            auto_code = getattr(ida_auto, "AU_CODE", None)
+            if auto_code is not None:
+                ida_auto.auto_mark_range(start_ea, start_ea + 1, auto_code)
+    except Exception:
+        pass
+    ida_auto.auto_wait()
+    _refresh_decompiler(start_ea)
+
+
+def _result_changed(result: Any) -> bool:
+    if isinstance(result, dict):
+        if "db_changed" in result:
+            return bool(result.get("db_changed"))
+        if "changed_count" in result:
+            return int(result.get("changed_count") or 0) > 0
+        if "ok" in result:
+            return bool(result.get("ok"))
+        return any(_result_changed(value) for value in result.values() if isinstance(value, (dict, list)))
+    if isinstance(result, list):
+        return any(isinstance(item, dict) and bool(item.get("ok")) for item in result)
+    return False
+
+
+def _hex_bytes_from_argument(value: Any) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, list):
+        return bytes(int(item) & 0xFF for item in value)
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("bytes is required")
+    normalized = re.sub(r"[^0-9A-Fa-f]", "", text)
+    if len(normalized) % 2:
+        raise ValueError("hex byte string must have an even number of hex digits")
+    return bytes.fromhex(normalized)
+
+
+@idasync
+def patch_bytes(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    ea = _resolve_target_ea(arguments)
+    data = _hex_bytes_from_argument(arguments.get("bytes", arguments.get("hex", "")))
+    dry_run = _bool_argument(arguments, "dry_run", True)
+    reanalyze = _bool_argument(arguments, "reanalyze", True)
+    max_bytes = max(1, min(int(arguments.get("max_bytes", 4096) or 4096), 65536))
+    if len(data) > max_bytes:
+        raise ValueError(f"patch too large: {len(data)} > max_bytes={max_bytes}")
+    original = bytes(ida_bytes.get_byte(ea + idx) & 0xFF for idx in range(len(data)))
+    patched_ok = True
+    changed_any = False
+    if not dry_run:
+        for idx, byte in enumerate(data):
+            if original[idx] == byte:
+                patched = True
+            else:
+                patched = bool(ida_bytes.patch_byte(ea + idx, byte))
+                changed_any = changed_any or patched
+            patched_ok = patched_ok and patched
+        if patched_ok and reanalyze:
+            _reanalyze_range(ea, ea + len(data))
+    revert_arguments = {
+        "addr": _hex(ea),
+        "original": original.hex(" "),
+        "dry_run": False,
+        "reanalyze": reanalyze,
+        "max_bytes": max_bytes,
+    }
+    return {
+        "ok": patched_ok,
+        "mode": "patch_bytes",
+        "dry_run": dry_run,
+        "db_changed": (not dry_run) and changed_any,
+        "addr": _hex(ea),
+        "size": len(data),
+        "original": original.hex(" "),
+        "patched": data.hex(" "),
+        "revert": {
+            "tool": "revert_patch",
+            "arguments": revert_arguments,
+        },
+        "error": None if patched_ok else "patch_byte failed for one or more bytes",
+    }
+
+
+@idasync
+def revert_patch(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    patch_result = arguments.get("patch") if isinstance(arguments.get("patch"), dict) else {}
+    if patch_result:
+        arguments = {**patch_result.get("revert", {}).get("arguments", {}), **arguments}
+    original = arguments.get("original", arguments.get("original_bytes", arguments.get("bytes", "")))
+    if not original:
+        raise ValueError("original/original_bytes is required for revert_patch")
+    result = patch_bytes(
+        {
+            **arguments,
+            "bytes": original,
+            "dry_run": arguments.get("dry_run", False),
+        }
+    )
+    result["mode"] = "revert_patch"
+    result["reverted"] = bool(result.get("db_changed"))
+    result["restored"] = result.get("patched", "")
+    result["current_before_revert"] = result.get("original", "")
+    return result
+
+
+@idasync
+def nop_range(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    ea = _resolve_target_ea(arguments)
+    size = int(arguments.get("size", 0) or 0)
+    end_ea = _resolve_optional_end_ea({key: value for key, value in arguments.items() if key != "size"}, ea)
+    if size <= 0 and end_ea is not None:
+        size = max(0, end_ea - ea)
+    if size <= 0:
+        raise ValueError("size or end is required")
+    nop_byte = int(arguments.get("nop_byte", 0x90) or 0x90) & 0xFF
+    result = patch_bytes(
+        {
+            "addr": _hex(ea),
+            "bytes": bytes([nop_byte]) * size,
+            "dry_run": arguments.get("dry_run", True),
+            "reanalyze": arguments.get("reanalyze", True),
+            "max_bytes": arguments.get("max_bytes", 4096),
+        }
+    )
+    result["mode"] = "nop_range"
+    result["nop_byte"] = _hex(nop_byte)
+    return result
+
+
+@idasync
+def set_function_options(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    ea = _resolve_target_ea(arguments)
+    func = idaapi.get_func(ea)
+    created = False
+    if func is None:
+        if not _bool_argument(arguments, "create", False):
+            return {"ok": False, "db_changed": False, "target": _address_payload(ea), "error": "No function found"}
+        created = bool(ida_funcs.add_func(ea))
+        func = idaapi.get_func(ea)
+        if func is None:
+            return {"ok": False, "db_changed": created, "target": _address_payload(ea), "created": created, "error": "Unable to create function"}
+    changed = created
+    results: list[dict[str, Any]] = []
+
+    end_ea = _resolve_optional_end_ea(arguments, func.start_ea)
+    if end_ea is not None:
+        try:
+            ok = bool(ida_funcs.set_func_end(func.start_ea, end_ea))
+            changed = changed or ok
+            results.append({"field": "end", "value": _hex(end_ea), "ok": ok})
+            func = idaapi.get_func(func.start_ea) or func
+        except Exception as exc:
+            results.append({"field": "end", "value": _hex(end_ea), "ok": False, "error": str(exc)})
+
+    attr_map = {
+        "frame_size": "FUNCATTR_FRSIZE",
+        "frsize": "FUNCATTR_FRSIZE",
+        "local_size": "FUNCATTR_FRSIZE",
+        "saved_regs_size": "FUNCATTR_FRREGS",
+        "frregs": "FUNCATTR_FRREGS",
+        "args_size": "FUNCATTR_ARGSIZE",
+        "argsize": "FUNCATTR_ARGSIZE",
+        "purged_bytes": "FUNCATTR_ARGSIZE",
+        "fpd": "FUNCATTR_FPD",
+        "flags": "FUNCATTR_FLAGS",
+    }
+    for key, const_name in attr_map.items():
+        if key not in arguments or arguments.get(key) in {None, ""}:
+            continue
+        attr = getattr(idc, const_name, None)
+        value = _parse_int_like(arguments.get(key), key)
+        if attr is None:
+            results.append({"field": key, "value": value, "ok": False, "error": f"idc.{const_name} is unavailable"})
+            continue
+        try:
+            ok = bool(idc.set_func_attr(func.start_ea, attr, value))
+            changed = changed or ok
+            results.append({"field": key, "value": value, "ok": ok})
+        except Exception as exc:
+            results.append({"field": key, "value": value, "ok": False, "error": str(exc)})
+
+    if changed and _bool_argument(arguments, "reanalyze", True):
+        func = idaapi.get_func(func.start_ea) or func
+        _reanalyze_range(func.start_ea, func.end_ea)
+    success = (created and not results) or (bool(results) and all(bool(item.get("ok")) for item in results))
+    payload = _enclosing_function_payload(func.start_ea)
+    payload.update({"ok": success, "mode": "set_function_options", "db_changed": changed, "created": created, "results": results})
+    return payload
+
+
+@idasync
+def set_sp_delta(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    ea = _resolve_target_ea(arguments)
+    delta = _parse_int_like(arguments.get("delta"), "delta")
+    func = idaapi.get_func(ea)
+    if func is None:
+        return {"ok": False, "db_changed": False, "target": _address_payload(ea), "error": "No function found"}
+    setter = getattr(idc, "add_user_stkpnt", None) or getattr(ida_frame, "add_user_stkpnt", None)
+    if setter is None:
+        return {
+            "ok": False,
+            "db_changed": False,
+            "target": _address_payload(ea),
+            "function": _enclosing_function_payload(ea),
+            "error": "IDA stack pointer override API is unavailable",
+        }
+    try:
+        ok = bool(setter(ea, delta))
+    except Exception as exc:
+        return {"ok": False, "db_changed": False, "target": _address_payload(ea), "function": _enclosing_function_payload(ea), "error": str(exc)}
+    if ok and _bool_argument(arguments, "reanalyze", True):
+        _reanalyze_range(func.start_ea, func.end_ea)
+    return {
+        "ok": ok,
+        "mode": "set_sp_delta",
+        "db_changed": ok,
+        "target": _address_payload(ea),
+        "function": _enclosing_function_payload(ea),
+        "delta": delta,
+    }
+
+
+@idasync
+def repair_function_analysis(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    ea = _resolve_target_ea(arguments)
+    desired_name = _desired_function_name(arguments)
+    steps: list[dict[str, Any]] = []
+    db_changed = False
+    if _bool_argument(arguments, "undefine", False):
+        item = {"addr": _hex(ea)}
+        end_ea = _resolve_optional_end_ea(arguments, ea)
+        if end_ea is not None:
+            item["end"] = _hex(end_ea)
+        result = undefine({"items": [item]})
+        db_changed = db_changed or _result_changed(result)
+        steps.append({"step": "undefine", "result": result})
+    if _bool_argument(arguments, "define_code", True):
+        result = define_code({"items": [{"addr": _hex(ea)}]})
+        db_changed = db_changed or _result_changed(result)
+        steps.append({"step": "define_code", "result": result})
+    if _bool_argument(arguments, "make_function", True):
+        end_ea = _resolve_optional_end_ea(arguments, ea)
+        result = define_func({"items": [{"addr": _hex(ea), "end": _hex(end_ea) if end_ea is not None else ""}]})
+        db_changed = db_changed or _result_changed(result)
+        steps.append({"step": "define_func", "result": result})
+    if arguments.get("decl") or arguments.get("signature"):
+        result = apply_decl(
+            {
+                "addr": _hex(ea),
+                "decl": arguments.get("decl", arguments.get("signature")),
+                "supporting_decls": arguments.get("supporting_decls", []),
+            }
+        )
+        db_changed = db_changed or _result_changed(result)
+        steps.append(
+            {
+                "step": "apply_decl",
+                "result": result,
+            }
+        )
+    if any(key in arguments for key in ("frame_size", "frsize", "local_size", "saved_regs_size", "frregs", "args_size", "argsize", "purged_bytes", "fpd", "flags")):
+        result = set_function_options({**arguments, "addr": _hex(ea), "create": False, "reanalyze": False})
+        db_changed = db_changed or _result_changed(result)
+        steps.append({"step": "set_function_options", "result": result})
+    if desired_name:
+        func = idaapi.get_func(ea)
+        name_ea = func.start_ea if func else ea
+        current_name = ida_funcs.get_func_name(name_ea) if func else _name_at(name_ea)
+        if current_name == desired_name:
+            result = {"ok": True, "db_changed": False, "addr": _hex(name_ea), "name": desired_name, "already_named": True}
+        else:
+            ok = bool(idaapi.set_name(name_ea, desired_name, ida_name.SN_CHECK))
+            if ok:
+                _refresh_decompiler(name_ea)
+            result = {
+                "ok": ok,
+                "db_changed": ok,
+                "addr": _hex(name_ea),
+                "old_name": current_name or "",
+                "name": desired_name,
+                "error": None if ok else "rename failed",
+            }
+        db_changed = db_changed or _result_changed(result)
+        steps.append({"step": "rename_function", "result": result})
+    result = reanalyze_function({"addr": _hex(ea)})
+    db_changed = db_changed or _result_changed(result)
+    steps.append({"step": "reanalyze_function", "result": result})
+    include_decompile = _bool_argument(arguments, "decompile", True)
+    payload: dict[str, Any] = {
+        "ok": True,
+        "mode": "repair_function_analysis",
+        "db_changed": db_changed,
+        "target": _address_payload(ea),
+        "function": _enclosing_function_payload(ea),
+        "steps": steps,
+    }
+    if include_decompile:
+        payload["decompile"] = decompile({"addr": ea, "fallback": arguments.get("fallback", "disasm")})
+    return payload
+
+
+@idasync
+def bulk_recover_and_name(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    items = _bulk_recover_items(arguments)
+    define_code_enabled = _bool_argument(arguments, "define_code", True)
+    make_function_enabled = _bool_argument(arguments, "make_function", True)
+    reanalyze_enabled = _bool_argument(arguments, "reanalyze", True)
+    apply_comments = _bool_argument(arguments, "apply_comments", True)
+    results: list[dict[str, Any]] = []
+    ok_count = 0
+    changed_count = 0
+    for item in items:
+        ea = ida_idaapi.BADADDR
+        row: dict[str, Any] = {"ok": False}
+        changed = False
+        errors: list[str] = []
+        try:
+            ea = _resolve_target_ea(item)
+            row.update({"addr": _hex(ea), "rva": _address_payload(ea)["rva"]})
+            if define_code_enabled:
+                was_code = bool(ida_bytes.is_code(ida_bytes.get_flags(ea)))
+                code_result = define_code({"items": [{"addr": _hex(ea)}]})
+                is_code = bool(ida_bytes.is_code(ida_bytes.get_flags(ea)))
+                row["defined_code"] = is_code and not was_code
+                if not is_code:
+                    errors.append("define_code failed")
+                changed = changed or row["defined_code"]
+            if make_function_enabled:
+                before_func = idaapi.get_func(ea)
+                end_ea = _resolve_optional_end_ea(item, ea)
+                func_result = define_func({"items": [{"addr": _hex(ea), "end": _hex(end_ea) if end_ea is not None else ""}]})
+                after_func = idaapi.get_func(ea)
+                row["created_function"] = bool(after_func is not None and (before_func is None or before_func.start_ea != after_func.start_ea))
+                if after_func is None:
+                    errors.append("define_func failed")
+                changed = changed or bool(row["created_function"])
+            func = idaapi.get_func(ea)
+            name_ea = func.start_ea if func else ea
+            desired_name = _desired_function_name(item)
+            if desired_name:
+                current_name = ida_funcs.get_func_name(name_ea) if func else _name_at(name_ea)
+                if current_name == desired_name:
+                    row["renamed"] = False
+                else:
+                    rename_ok = bool(idaapi.set_name(name_ea, desired_name, ida_name.SN_CHECK))
+                    row["renamed"] = rename_ok
+                    changed = changed or rename_ok
+                    if not rename_ok:
+                        errors.append("rename failed")
+                row["name"] = ida_funcs.get_func_name(name_ea) if func else _name_at(name_ea)
+            decl = str(item.get("decl") or item.get("signature") or "").strip()
+            if decl:
+                decl_result = apply_decl(
+                    {
+                        "addr": _hex(name_ea),
+                        "decl": decl,
+                        "supporting_decls": item.get("supporting_decls", item.get("decls", [])),
+                    }
+                )
+                row["typed"] = bool(decl_result.get("ok"))
+                changed = changed or _result_changed(decl_result)
+                if not decl_result.get("ok"):
+                    errors.append(str(decl_result.get("error") or "apply_decl failed"))
+            comment = str(item.get("comment") or item.get("cmt") or "").strip()
+            if comment and apply_comments:
+                repeatable = bool(item.get("repeatable", False))
+                comment_ok = bool(idaapi.set_cmt(name_ea, comment, repeatable))
+                if func is not None and name_ea == func.start_ea:
+                    comment_ok = bool(idc.set_func_cmt(name_ea, comment, 1 if repeatable else 0)) or comment_ok
+                row["commented"] = comment_ok
+                changed = changed or comment_ok
+                if not comment_ok:
+                    errors.append("comment failed")
+            if changed and reanalyze_enabled:
+                func = idaapi.get_func(name_ea)
+                if func is not None:
+                    _reanalyze_range(func.start_ea, func.end_ea)
+                else:
+                    _reanalyze_range(ea)
+            row["db_changed"] = changed
+            row["ok"] = not errors
+            if errors:
+                row["errors"] = errors
+        except Exception as exc:
+            row.update({"addr": _hex(ea) if ea != ida_idaapi.BADADDR else "", "error": str(exc), "expected": "{addr|rva, name?, decl?, comment?}"})
+        ok_count += 1 if row.get("ok") else 0
+        changed_count += 1 if row.get("db_changed") else 0
+        results.append(row)
+    return {
+        "ok": ok_count == len(results) if results else False,
+        "mode": "bulk_recover_and_name",
+        "count": len(results),
+        "ok_count": ok_count,
+        "changed_count": changed_count,
+        "db_changed": changed_count > 0,
+        "items": results,
+    }
+
+
+@idasync
+def diagnose_function(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    ea = _resolve_target_ea(arguments)
+    max_items = max(1, min(int(arguments.get("max_items", 200) or 200), 2000))
+    func = idaapi.get_func(ea)
+    payload: dict[str, Any] = {"mode": "diagnose_function", "target": _address_payload(ea), "function": _enclosing_function_payload(ea)}
+    if func is None:
+        payload.update({"ok": False, "error": "No function found", "recommendations": ["repair_function_analysis(make_function=true)"]})
+        return payload
+    blocks = list(idaapi.FlowChart(func))
+    edges = sum(len(list(block.succs())) for block in blocks)
+    orphan_blocks = [block for block in blocks if block.start_ea != func.start_ea and not list(block.preds())]
+    indirect: list[dict[str, Any]] = []
+    suspicious: list[dict[str, Any]] = []
+    for item_ea in idautils.FuncItems(func.start_ea):
+        if len(indirect) + len(suspicious) >= max_items:
+            break
+        insn = _decode_insn_at(item_ea)
+        if insn is None:
+            continue
+        line = ida_lines.tag_remove(ida_lines.generate_disasm_line(item_ea, 0) or "")
+        mnemonic = (line.split(None, 1)[0].lower() if line.strip() else "")
+        if mnemonic in {"jmp", "call"} and insn.ops[0].type in {ida_ua.o_reg, ida_ua.o_phrase, ida_ua.o_displ}:
+            indirect.append({"address": _hex(item_ea), "text": line})
+        if mnemonic in {"jmp", "jz", "jnz", "je", "jne"} and "$" in line:
+            suspicious.append({"address": _hex(item_ea), "kind": "self_relative_branch", "text": line})
+    try:
+        _decompile_cfunc(func.start_ea)
+        decompile_error = ""
+    except Exception as exc:
+        decompile_error = str(exc)
+    recommendations: list[str] = []
+    if decompile_error:
+        recommendations.append("repair_function_analysis with a simpler/explicit prototype via decl may help Hex-Rays")
+    if orphan_blocks:
+        recommendations.append("inspect orphan blocks before patching; they may be junk or missed xrefs")
+    if indirect:
+        recommendations.append("resolve indirect branches/calls before trusting the CFG")
+    payload.update(
+        {
+            "ok": True,
+            "block_count": len(blocks),
+            "edge_count": edges,
+            "orphan_block_count": len(orphan_blocks),
+            "orphan_blocks": [{"start": _hex(block.start_ea), "end": _hex(block.end_ea)} for block in orphan_blocks[:max_items]],
+            "indirect_count": len(indirect),
+            "indirect": indirect[:max_items],
+            "suspicious": suspicious[:max_items],
+            "decompile_error": decompile_error,
+            "recommendations": recommendations,
         }
     )
     return payload
@@ -2473,30 +3868,58 @@ def declare_type(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]
 @idasync
 def define_func(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     arguments = arguments or {}
-    items = _ensure_list_of_dicts(arguments.get("items", arguments), "items")
+    items = _function_definition_items(arguments)
     results = []
     for item in items:
-        addr = _parse_ea(item.get("addr"))
-        end_raw = item.get("end")
-        end_ea = _parse_ea(end_raw) if str(end_raw or "").strip() else ida_idaapi.BADADDR
+        addr = ida_idaapi.BADADDR
         try:
+            addr = _resolve_target_ea(item)
+            end_ea = _resolve_optional_end_ea(item, addr)
+            desired_name = _desired_function_name(item)
             existing = idaapi.get_func(addr)
             if existing is not None and existing.start_ea == addr:
-                results.append({"addr": _hex(addr), "start": _hex(existing.start_ea), "end": _hex(existing.end_ea), "ok": False, "error": "Function already exists"})
-                continue
-            ok = bool(ida_funcs.add_func(addr, end_ea))
-            func = idaapi.get_func(addr)
+                created = False
+                ok = False
+                error = "Function already exists"
+                func = existing
+            else:
+                add_end = end_ea if end_ea is not None else ida_idaapi.BADADDR
+                ok = bool(ida_funcs.add_func(addr, add_end))
+                created = ok
+                func = idaapi.get_func(addr)
+                error = None if ok else "define_func failed"
+            renamed = False
+            rename_ok = None
+            rename_error = None
+            name_ea = func.start_ea if func else addr
+            if desired_name:
+                current_name = ida_funcs.get_func_name(name_ea) or ""
+                if current_name == desired_name:
+                    rename_ok = True
+                else:
+                    rename_ok = bool(idaapi.set_name(name_ea, desired_name, ida_name.SN_CHECK))
+                    renamed = bool(rename_ok)
+                    if rename_ok:
+                        _refresh_decompiler(name_ea)
+                    else:
+                        rename_error = "rename failed"
             results.append(
                 {
                     "addr": _hex(addr),
                     "start": _hex(func.start_ea) if func else _hex(addr),
-                    "end": _hex(func.end_ea) if func else (_hex(end_ea) if end_ea != ida_idaapi.BADADDR else ""),
-                    "ok": ok,
-                    "error": None if ok else "define_func failed",
+                    "end": _hex(func.end_ea) if func else (_hex(end_ea) if end_ea is not None else ""),
+                    "name": ida_funcs.get_func_name(name_ea) if func else _name_at(name_ea),
+                    "requested_name": desired_name,
+                    "created": created,
+                    "renamed": renamed,
+                    "rename_ok": rename_ok,
+                    "ok": bool(ok or renamed),
+                    "error": None if (ok or renamed or rename_ok) else error,
+                    "rename_error": rename_error,
                 }
             )
         except Exception as exc:
-            results.append({"addr": _hex(addr), "ok": False, "error": str(exc)})
+            results.append({"addr": _hex(addr) if addr != ida_idaapi.BADADDR else "", "ok": False, "error": str(exc), "item": item})
     return results
 
 
@@ -2621,27 +4044,48 @@ def get_data_item(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 @idasync
 def rename(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
-    batch = arguments.get("batch", arguments)
-    if isinstance(batch, dict) and "addr" in batch and "name" in batch:
-        batch = {"func": [batch]}
-    if not isinstance(batch, dict):
-        raise ValueError("batch must be an object")
+    batch, schema_errors = _normalize_rename_batch(arguments)
     results = {"func": [], "data": [], "local": [], "stack": []}
+    errors = list(schema_errors)
     for item in batch.get("func", []) or []:
-        ea = _parse_ea(item.get("addr"))
-        name = str(item.get("name") or "")
-        ok = idaapi.set_name(ea, name, ida_name.SN_CHECK)
-        if ok:
-            _refresh_decompiler(ea)
-        results["func"].append({"addr": _hex(ea), "name": name, "ok": bool(ok)})
+        try:
+            ea = _resolve_target_ea(item)
+            name = str(item.get("new") or item.get("name") or "").strip()
+            if not name:
+                raise ValueError("function rename expects {addr|rva, name}")
+            current_name = ida_funcs.get_func_name(ea) or _name_at(ea)
+            if current_name == name:
+                results["func"].append({"addr": _hex(ea), "name": name, "ok": True, "db_changed": False, "already_named": True, "error": None})
+            else:
+                ok = bool(idaapi.set_name(ea, name, ida_name.SN_CHECK))
+                if ok:
+                    _refresh_decompiler(ea)
+                results["func"].append({"addr": _hex(ea), "name": name, "ok": ok, "db_changed": ok, "error": None if ok else "rename failed"})
+        except Exception as exc:
+            results["func"].append({"item": item, "ok": False, "error": str(exc), "expected": "{addr|rva, name}"})
     for item in batch.get("data", []) or []:
-        ea = _parse_ea(item.get("addr") or item.get("old"))
-        new_name = str(item.get("new") or item.get("name") or "")
-        ok = idaapi.set_name(ea, new_name, ida_name.SN_CHECK)
-        results["data"].append({"addr": _hex(ea), "name": new_name, "ok": bool(ok)})
+        try:
+            if item.get("addr") or item.get("rva") or item.get("symbol"):
+                ea = _resolve_target_ea(item)
+            else:
+                ea = _parse_ea(item.get("old"))
+            new_name = str(item.get("new") or item.get("name") or "").strip()
+            if not new_name:
+                raise ValueError("data rename expects {addr|rva, name}")
+            current_name = _name_at(ea)
+            if current_name == new_name:
+                results["data"].append({"addr": _hex(ea), "name": new_name, "ok": True, "db_changed": False, "already_named": True, "error": None})
+            else:
+                ok = bool(idaapi.set_name(ea, new_name, ida_name.SN_CHECK))
+                results["data"].append({"addr": _hex(ea), "name": new_name, "ok": ok, "db_changed": ok, "error": None if ok else "rename failed"})
+        except Exception as exc:
+            results["data"].append({"item": item, "ok": False, "error": str(exc), "expected": "{addr|rva, name}"})
     for item in batch.get("local", []) or []:
         try:
-            fn_ea = _parse_ea(item.get("func_addr") or item.get("addr"))
+            if item.get("func_addr"):
+                fn_ea = _parse_ea(item.get("func_addr"))
+            else:
+                fn_ea = _resolve_target_ea({key: value for key, value in item.items() if key not in {"name", "old", "new"}})
             old_name = str(item.get("old") or item.get("name") or "").strip()
             new_name = str(item.get("new") or "").strip()
             if not old_name or not new_name:
@@ -2657,7 +4101,10 @@ def rename(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
             results["local"].append({"item": item, "ok": False, "error": str(exc)})
     for item in batch.get("stack", []) or []:
         try:
-            fn_ea = _parse_ea(item.get("func_addr") or item.get("addr"))
+            if item.get("func_addr"):
+                fn_ea = _parse_ea(item.get("func_addr"))
+            else:
+                fn_ea = _resolve_target_ea({key: value for key, value in item.items() if key not in {"name", "old", "new"}})
             old_name = str(item.get("old") or item.get("name") or "").strip()
             new_name = str(item.get("new") or "").strip()
             if not old_name or not new_name:
@@ -2687,6 +4134,26 @@ def rename(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
             results["stack"].append({"addr": _hex(func.start_ea), "old": old_name, "new": new_name, "ok": ok, "error": None if ok else "Rename failed"})
         except Exception as exc:
             results["stack"].append({"item": item, "ok": False, "error": str(exc)})
+    matched_count = sum(len(items) for items in results.values())
+    reason = ""
+    if matched_count == 0:
+        reason = "schema_mismatch"
+        errors.append({"ok": False, "error": "schema_mismatch", "expected": "func: [{addr,name}] or functions: {addr: name}"})
+    ok_count = sum(1 for items in results.values() for item in items if bool(item.get("ok")))
+    changed_count = sum(1 for items in results.values() for item in items if bool(item.get("db_changed", item.get("ok"))))
+    error_count = sum(1 for items in results.values() for item in items if not bool(item.get("ok"))) + len(errors)
+    results.update(
+        {
+            "ok": ok_count > 0,
+            "db_changed": changed_count > 0,
+            "matched_count": matched_count,
+            "ok_count": ok_count,
+            "changed_count": changed_count,
+            "error_count": error_count,
+            "reason": reason,
+            "errors": errors,
+        }
+    )
     return results
 
 
@@ -2816,6 +4283,7 @@ def create_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
     name = str(arguments.get("name") or "").strip()
     fields = arguments.get("fields", [])
+    compact = _bool_argument(arguments, "compact", True)
     if not name:
         raise ValueError("name is required")
     if not isinstance(fields, list) or not fields:
@@ -2828,11 +4296,18 @@ def create_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
             raise ValueError(f"Invalid struct field: {field}")
         field_lines.append(f"    {field_type} {field_name};")
     decl = "typedef struct {name} {{\n{fields}\n}} {name};".format(name=name, fields="\n".join(field_lines))
+    base = _struct_payload_summary(name, False, field_count=len(fields), db_changed=False)
     if _type_exists(name):
-        return {"name": name, "ok": False, "errors": None, "decl": decl, "error": f"Type already exists: {name}"}
+        base.update({"errors": None, "error": f"Type already exists: {name}"})
+        if not compact:
+            base["decl"] = decl
+        return base
     errors = ida_typeinf.parse_decls(None, decl, False, ida_typeinf.HTI_PAKDEF)
     ok = errors == 0 and _type_exists(name)
-    return {"name": name, "ok": ok, "errors": int(errors), "decl": decl, "error": None if ok else "Failed to parse declaration"}
+    base.update({"ok": ok, "errors": int(errors), "db_changed": ok, "error": None if ok else "Failed to parse declaration"})
+    if not compact:
+        base["decl"] = decl
+    return base
 
 
 @idasync
@@ -2841,24 +4316,40 @@ def create_padded_struct_from_map(arguments: dict[str, Any] | None = None) -> di
     name = str(arguments.get("name") or "").strip()
     fields = arguments.get("fields", [])
     total_size_arg = arguments.get("size")
+    compact = _bool_argument(arguments, "compact", True)
     if not name:
         raise ValueError("name is required")
     if not isinstance(fields, list) or not fields:
         raise ValueError("fields must be a non-empty list")
     total_size = _parse_int_like(total_size_arg, "size") if total_size_arg not in (None, "") else None
     layout = _build_padded_layout(fields, total_size=total_size)
-    materialized = _save_named_struct(name, layout)
+    logical_fields = [field for field in layout if not field.get("auto_pad")]
     logical_count = len([field for field in layout if not field.get("auto_pad")])
     total_size_value = max((field["offset"] + field["size"] for field in layout), default=0)
-    return {
+    same_existing = False
+    if _type_exists(name):
+        try:
+            existing_tif = _get_named_struct_tinfo(name)
+            same_existing = int(existing_tif.get_size()) == total_size_value and _struct_fields_equivalent(
+                _struct_fields_from_tif(existing_tif, include_auto_pad=False),
+                logical_fields,
+            )
+        except Exception:
+            same_existing = False
+    materialized = {"ok": True, "code": 0} if same_existing else _save_named_struct(name, layout)
+    payload = {
         "name": name,
         "ok": materialized["ok"],
         "code": materialized["code"],
+        "db_changed": bool(materialized["ok"] and not same_existing),
+        "unchanged": same_existing,
         "field_count": logical_count,
         "layout_count": len(layout),
         "size": total_size_value,
-        "decl": _header_decl_from_layout(name, layout, total_size_value),
     }
+    if not compact:
+        payload["decl"] = _header_decl_from_layout(name, layout, total_size_value)
+    return payload
 
 
 @idasync
@@ -2867,16 +4358,19 @@ def upsert_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     name = str(arguments.get("name") or "").strip()
     incoming = arguments.get("fields", [])
     total_size_arg = arguments.get("size")
+    compact = _bool_argument(arguments, "compact", True)
     if not name:
         raise ValueError("name is required")
     if not isinstance(incoming, list) or not incoming:
         raise ValueError("fields must be a non-empty list")
 
     existing_fields: list[dict[str, Any]] = []
+    existing_size = 0
     existed = _type_exists(name)
     if existed:
         tif = _get_named_struct_tinfo(name)
         existing_fields = _struct_fields_from_tif(tif, include_auto_pad=False)
+        existing_size = int(tif.get_size())
 
     merged_by_key: dict[tuple[int, str], dict[str, Any]] = {}
     for field in existing_fields:
@@ -2901,18 +4395,24 @@ def upsert_struct(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     inferred_size = max((field["offset"] + field["size"] for field in merged_fields), default=0)
     total_size = _parse_int_like(total_size_arg, "size") if total_size_arg not in (None, "") else inferred_size
     layout = _build_padded_layout(merged_fields, total_size=total_size)
-    materialized = _save_named_struct(name, layout)
-    return {
+    total_size_value = max((field["offset"] + field["size"] for field in layout), default=0)
+    same_existing = bool(existed and existing_size == total_size_value and _struct_fields_equivalent(existing_fields, merged_fields))
+    materialized = {"ok": True, "code": 0} if same_existing else _save_named_struct(name, layout)
+    payload = {
         "name": name,
         "ok": materialized["ok"],
         "code": materialized["code"],
+        "db_changed": bool(materialized["ok"] and not same_existing),
+        "unchanged": same_existing,
         "created": not existed,
         "updated": existed,
         "field_count": len(merged_fields),
         "layout_count": len(layout),
-        "size": max((field["offset"] + field["size"] for field in layout), default=0),
-        "decl": _header_decl_from_layout(name, layout, max((field["offset"] + field["size"] for field in layout), default=0)),
+        "size": total_size_value,
     }
+    if not compact:
+        payload["decl"] = _header_decl_from_layout(name, layout, total_size_value)
+    return payload
 
 
 @idasync
@@ -3058,24 +4558,125 @@ def _header_guard_from_path(path: str) -> str:
     return f"IDA_HYBRID_{guard or 'EXPORT_H'}_"
 
 
-@idasync
-def export_header(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-    arguments = arguments or {}
-    struct_names = _split_string_list(
-        arguments.get("struct_names", arguments.get("names", arguments.get("struct_name", arguments.get("name", []))))
-    )
-    path = str(arguments.get("path") or "").strip()
-    return_header = _bool_argument(arguments, "return_header", False)
-    include_guard = _bool_argument(arguments, "include_guard", True)
+def _struct_payload_summary(name: str, ok: bool, **extra: Any) -> dict[str, Any]:
+    payload = {"name": name, "ok": ok}
+    payload.update(extra)
+    return payload
+
+
+def _struct_type_dependencies(struct_name: str, selected: set[str]) -> set[str]:
+    if struct_name not in selected:
+        return set()
+    try:
+        tif = _get_named_struct_tinfo(struct_name)
+        fields = _struct_fields_from_tif(tif, include_auto_pad=False)
+    except Exception:
+        return set()
+    deps: set[str] = set()
+    for field in fields:
+        field_type = str(field.get("type") or "")
+        for candidate in selected:
+            if candidate == struct_name:
+                continue
+            if re.search(rf"\b{re.escape(candidate)}\b", field_type):
+                deps.add(candidate)
+    return deps
+
+
+def _dependency_order_struct_names(struct_names: list[str]) -> tuple[list[str], bool]:
+    selected = set(struct_names)
+    dependencies = {name: _struct_type_dependencies(name, selected) for name in struct_names}
+    ordered: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    had_cycle = False
+
+    def visit(name: str) -> None:
+        nonlocal had_cycle
+        if name in visited:
+            return
+        if name in visiting:
+            had_cycle = True
+            return
+        visiting.add(name)
+        for dep in sorted(dependencies.get(name, set())):
+            visit(dep)
+        visiting.remove(name)
+        visited.add(name)
+        ordered.append(name)
+
+    for name in struct_names:
+        visit(name)
+    return ordered, had_cycle
+
+
+_TYPE_FORWARD_SKIP_WORDS = {
+    "const",
+    "volatile",
+    "signed",
+    "unsigned",
+    "struct",
+    "union",
+    "enum",
+    "char",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "void",
+    "__int8",
+    "__int16",
+    "__int32",
+    "__int64",
+}
+
+
+def _external_struct_forward_decls(struct_names: list[str]) -> list[str]:
+    selected = set(struct_names)
+    candidates: list[str] = []
+    for struct_name in struct_names:
+        try:
+            tif = _get_named_struct_tinfo(struct_name)
+            fields = _struct_fields_from_tif(tif, include_auto_pad=False)
+        except Exception:
+            continue
+        for field in fields:
+            for identifier in re.findall(r"\b[A-Za-z_]\w*\b", str(field.get("type") or "")):
+                if identifier in selected or identifier in candidates or identifier.lower() in _TYPE_FORWARD_SKIP_WORDS:
+                    continue
+                try:
+                    _get_named_struct_tinfo(identifier)
+                except Exception:
+                    continue
+                candidates.append(identifier)
+    return candidates
+
+
+def _build_header_export(
+    *,
+    struct_names: list[str],
+    path: str,
+    return_header: bool = False,
+    include_guard: bool = True,
+    auto_order: bool = True,
+    forward_decls: bool = True,
+) -> dict[str, Any]:
     if not struct_names:
         raise ValueError("struct_names/names is required for export_header")
     if not path:
         idb_path = idc.get_idb_path() or "ida_export.i64"
         path = str(Path(idb_path).with_suffix(".h"))
 
+    ordered_names = list(dict.fromkeys(struct_names))
+    dependency_cycle = False
+    if auto_order:
+        ordered_names, dependency_cycle = _dependency_order_struct_names(ordered_names)
+    external_forward_decls = _external_struct_forward_decls(ordered_names) if forward_decls else []
+
     blocks: list[str] = []
     structs: list[dict[str, Any]] = []
-    for struct_name in struct_names:
+    for struct_name in ordered_names:
         tif = _get_named_struct_tinfo(struct_name)
         logical_fields = _struct_fields_from_tif(tif, include_auto_pad=False)
         total_size = int(tif.get_size())
@@ -3087,6 +4688,9 @@ def export_header(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     lines = ["/* IDA Hybrid Manager type export */", ""]
     if include_guard:
         lines.extend([f"#ifndef {guard}", f"#define {guard}", ""])
+    if forward_decls:
+        lines.extend([f"typedef struct {name} {name};" for name in [*external_forward_decls, *ordered_names]])
+        lines.append("")
     lines.append("\n\n".join(blocks))
     if include_guard:
         lines.extend(["", f"#endif /* {guard} */"])
@@ -3103,10 +4707,30 @@ def export_header(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         "structs": structs,
         "bytes_written": target.stat().st_size,
         "include_guard": include_guard,
+        "auto_order": auto_order,
+        "dependency_cycle": dependency_cycle,
+        "forward_decls": forward_decls,
+        "forward_decl_count": (len(ordered_names) + len(external_forward_decls)) if forward_decls else 0,
+        "external_forward_decls": external_forward_decls,
     }
     if return_header:
         payload["header"] = header
     return payload
+
+
+@idasync
+def export_header(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    arguments = arguments or {}
+    return _build_header_export(
+        struct_names=_split_string_list(
+            arguments.get("struct_names", arguments.get("names", arguments.get("struct_name", arguments.get("name", []))))
+        ),
+        path=str(arguments.get("path") or "").strip(),
+        return_header=_bool_argument(arguments, "return_header", False),
+        include_guard=_bool_argument(arguments, "include_guard", True),
+        auto_order=_bool_argument(arguments, "auto_order", True),
+        forward_decls=_bool_argument(arguments, "forward_decls", True),
+    )
 
 
 @idasync
@@ -3175,7 +4799,9 @@ def typed_decompile_export(arguments: dict[str, Any] | None = None) -> dict[str,
     include_line_map = _bool_argument(arguments, "include_line_map", False)
     output_format = str(arguments.get("format") or "json").strip().lower()
     path = str(arguments.get("path") or "").strip()
-    decomp = decompile({"addr": ea, "fallback": arguments.get("fallback", "disasm"), "max_instructions": arguments.get("max_instructions", 400)})
+    # File exports must remain valid, complete C; never use the model-facing
+    # compact projection for this path.
+    decomp = decompile({"addr": ea, "fallback": arguments.get("fallback", "disasm"), "max_instructions": arguments.get("max_instructions", 400), "view": "full"})
     payload = {
         "addr": decomp.get("addr"),
         "name": decomp.get("name"),
@@ -3216,6 +4842,9 @@ def export_decompiled_c(arguments: dict[str, Any] | None = None) -> dict[str, An
     max_functions = max(0, int(arguments.get("max_functions", 0) or 0))
     return_code = _bool_argument(arguments, "return_code", False)
     max_return_bytes = max(0, int(arguments.get("max_return_bytes", 256 * 1024) or 0))
+    include_structs = _bool_argument(arguments, "include_structs", False)
+    header_path = str(arguments.get("header_path") or "").strip()
+    struct_names = _split_string_list(arguments.get("struct_names", arguments.get("header_structs", [])))
     path = str(arguments.get("path") or "").strip()
     if not path:
         idb_path = idc.get_idb_path() or "ida_export.i64"
@@ -3277,6 +4906,28 @@ def export_decompiled_c(arguments: dict[str, Any] | None = None) -> dict[str, An
     failed: list[dict[str, Any]] = []
     target = _normalize_export_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    header_export: dict[str, Any] | None = None
+    if include_structs or header_path or struct_names:
+        if struct_names:
+            header_target = header_path or str(target.with_suffix(".h"))
+            try:
+                header_export = _build_header_export(
+                    struct_names=struct_names,
+                    path=header_target,
+                    return_header=False,
+                    include_guard=True,
+                    auto_order=True,
+                    forward_decls=True,
+                )
+            except Exception as exc:
+                header_export = {"ok": False, "mode": "export_header", "path": header_target, "error": str(exc)}
+        else:
+            header_export = {
+                "ok": False,
+                "mode": "export_header",
+                "path": header_path or str(target.with_suffix(".h")),
+                "error": "struct_names/header_structs is required when include_structs or header_path is set",
+            }
     code_parts: list[str] = []
     returned_bytes = 0
 
@@ -3297,6 +4948,8 @@ def export_decompiled_c(arguments: dict[str, Any] | None = None) -> dict[str, An
         emit(handle, f" * idb: {_c_comment_text(idc.get_idb_path() or '')}")
         emit(handle, f" * functions: {len(selected)} / {len(functions)}")
         emit(handle, " */")
+        if header_export and header_export.get("ok"):
+            emit(handle, f'#include "{_c_comment_text(_include_path_for_header(target, header_export.get("path")))}"')
         emit(handle)
 
         for item in selected:
@@ -3304,7 +4957,9 @@ def export_decompiled_c(arguments: dict[str, Any] | None = None) -> dict[str, An
             name = item["name"]
             emit(handle, f"/* ===== {_c_comment_text(name or '<unnamed>')} @ {addr} ===== */")
             try:
-                decomp = decompile({"addr": addr, "fallback": "disasm" if fallback in {"disasm", "asm"} else "none"})
+                # Export uses the lossless Hex-Rays text, independently of the
+                # compact default used by interactive MCP decompile calls.
+                decomp = decompile({"addr": addr, "fallback": "disasm" if fallback in {"disasm", "asm"} else "none", "view": "full"})
                 if decomp.get("mode") == "decompile" and decomp.get("code"):
                     emit(handle, str(decomp["code"]).rstrip())
                     exported.append({"addr": addr, "name": name, "mode": "decompile"})
@@ -3326,9 +4981,10 @@ def export_decompiled_c(arguments: dict[str, Any] | None = None) -> dict[str, An
             emit(handle)
 
     file_size = target.stat().st_size
+    header_ok = header_export is None or bool(header_export.get("ok"))
     payload = {
-        "ok": bool(exported),
-        "complete": bool(len(failed) == 0 and len(fallbacks) == 0),
+        "ok": bool(exported) and header_ok,
+        "complete": bool(len(failed) == 0 and len(fallbacks) == 0 and header_ok),
         "mode": "export_decompiled_c",
         "path": str(target),
         "bytes_written": file_size,
@@ -3349,6 +5005,10 @@ def export_decompiled_c(arguments: dict[str, Any] | None = None) -> dict[str, An
         "fallback": fallback,
         "max_functions": max_functions,
     }
+    if header_export is not None:
+        payload["header_export"] = header_export
+        if not header_ok:
+            payload["error"] = str(header_export.get("error") or "paired header export failed")
     if return_code:
         payload["code"] = "".join(code_parts)
         payload["code_truncated"] = max_return_bytes > 0 and returned_bytes < file_size
@@ -3465,24 +5125,39 @@ def make_array(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 
 @idasync
 def save_database(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-    path = str((arguments or {}).get("path") or "")
-    ok = bool(idc.save_database(path, 0))
-    return {"ok": ok, "path": path or idc.get_idb_path() or ""}
+    requested_path = str((arguments or {}).get("path") or "").strip()
+    idb_path_before = idc.get_idb_path() or ""
+    ok = bool(idc.save_database(requested_path, 0))
+    idb_path_after = idc.get_idb_path() or idb_path_before
+    attempted_path = requested_path or idb_path_after or idb_path_before
+    saved_path = attempted_path if ok else ""
+    return {
+        "ok": ok,
+        "path": saved_path,
+        "saved_path": saved_path,
+        "attempted_path": attempted_path,
+        "requested_path": requested_path,
+        "idb_path": idb_path_after,
+        "idb_path_before": idb_path_before,
+        "input_path": ida_nalt.get_input_file_path() or "",
+        "root_filename": ida_nalt.get_root_filename() or "",
+        "error": None if ok else "save_database returned false",
+    }
 
 
 TOOL_DEFINITIONS = [
     {"name": "get_metadata", "description": "Return basic database metadata."},
     {"name": "inspect", "description": "High-level address inspection with optional decompile/disasm payloads."},
-    {"name": "analysis_status", "description": "Return current autoanalysis status and function count."},
-    {"name": "wait_for_autoanalysis", "description": "Block until autoanalysis is complete or timeout expires."},
+    {"name": "analysis_status", "description": "Return IDA autoanalysis phase, queue/address progress, function count, and optional executable-segment tail coverage."},
+    {"name": "wait_for_autoanalysis", "description": "Advance autoanalysis until complete, timeout, or max_work_sec slice; returns phase/address progress and final segment-tail coverage."},
     {"name": "list_segments", "description": "List segments and ranges."},
     {"name": "list_globals", "description": "List named globals with pagination."},
     {"name": "imports", "description": "List imports with pagination."},
     {"name": "list_functions", "description": "List functions with pagination."},
-    {"name": "lookup_funcs", "description": "Lookup functions by address or name."},
+    {"name": "lookup_funcs", "description": "Lookup functions by name, VA, or RVA. Bare hex values are checked as VA and image-base-relative RVA."},
     {"name": "get_function", "description": "Return function metadata for an address."},
     {"name": "get_enclosing_function", "description": "Return the function containing the queried address."},
-    {"name": "decompile", "description": "Decompile a function with Hex-Rays."},
+    {"name": "decompile", "description": "Decompile a function with Hex-Rays. view=compact (default) omits only safe autogenerated local declarations; view=header returns the prototype/declarations; view=full returns exact text."},
     {"name": "get_decompile_line_map", "description": "Return pseudocode lines with best-effort disassembly address mapping."},
     {"name": "disasm_function", "description": "Disassemble the full containing function for an address."},
     {"name": "disasm", "description": "Disassemble a function or address range."},
@@ -3500,6 +5175,8 @@ TOOL_DEFINITIONS = [
     {"name": "find_insns", "description": "Search for instruction text sequences."},
     {"name": "search", "description": "High-level search API for text/regex/bytes/immediates/instructions."},
     {"name": "inspect_addr", "description": "Inspect an address and return code/data/function context."},
+    {"name": "jump", "description": "Resolve an address/RVA/symbol and return decompile, disassembly, function, or address context without modifying the database."},
+    {"name": "diagnose_function", "description": "Read-only function diagnosis for Hex-Rays failures, CFG anomalies, orphan blocks, and indirect control flow."},
     {"name": "get_data_item", "description": "Inspect what exists at a specific address."},
     {"name": "get_bytes", "description": "Compatibility memory-read helper returning spaced hex bytes."},
     {"name": "get_int", "description": "Compatibility integer-read helper using i8/u32/i16be style types."},
@@ -3518,9 +5195,16 @@ TOOL_DEFINITIONS = [
     {"name": "stack_frame", "description": "Return stack-frame variables for one or more functions."},
     {"name": "declare_type", "description": "Register one or more C declarations in IDA's type system."},
     {"name": "define", "description": "High-level define API for function/code/type/struct/array/stack/undefine."},
-    {"name": "define_func", "description": "Define functions at one or more addresses."},
+    {"name": "define_func", "description": "Define functions at one or more VA/RVA addresses. Accepts direct {addr|rva,name} or batch/items/functions lists."},
     {"name": "define_code", "description": "Define code instructions at one or more addresses."},
     {"name": "undefine", "description": "Undefine items back to raw bytes."},
+    {"name": "repair_function_analysis", "description": "Run an explicit IDA analysis repair workflow: optional undefine, define code, create function, apply declaration, set function options, reanalyze, and decompile."},
+    {"name": "bulk_recover_and_name", "description": "Compact bulk workflow for [{addr|rva,name,decl,comment}]: define code/function, rename, apply declaration, comment, and reanalyze."},
+    {"name": "set_function_options", "description": "Set function bounds or selected IDA function attributes such as frame size, saved-register size, arg size, FPD, or flags."},
+    {"name": "set_sp_delta", "description": "Set a user stack-pointer delta at an instruction when the IDA API is available."},
+    {"name": "patch_bytes", "description": "Patch bytes at an address. dry_run defaults to true and returns original/patched bytes plus a revert_patch payload."},
+    {"name": "revert_patch", "description": "Restore bytes using a patch_bytes original/original_bytes payload. dry_run defaults to false."},
+    {"name": "nop_range", "description": "Replace an address range with NOP bytes. dry_run defaults to true."},
     {"name": "declare_stack", "description": "Create stack variables in a function frame."},
     {"name": "delete_stack", "description": "Delete stack variables from a function frame."},
     {"name": "rename", "description": "Rename functions, globals, local variables, or stack variables."},
@@ -3576,6 +5260,8 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any] | None], Any]] = {
     "find_insns": find_insns,
     "search": search,
     "inspect_addr": inspect_addr,
+    "jump": jump,
+    "diagnose_function": diagnose_function,
     "get_data_item": get_data_item,
     "get_bytes": get_bytes,
     "get_int": get_int,
@@ -3597,6 +5283,13 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any] | None], Any]] = {
     "define_func": define_func,
     "define_code": define_code,
     "undefine": undefine,
+    "repair_function_analysis": repair_function_analysis,
+    "bulk_recover_and_name": bulk_recover_and_name,
+    "set_function_options": set_function_options,
+    "set_sp_delta": set_sp_delta,
+    "patch_bytes": patch_bytes,
+    "revert_patch": revert_patch,
+    "nop_range": nop_range,
     "declare_stack": declare_stack,
     "delete_stack": delete_stack,
     "rename": rename,

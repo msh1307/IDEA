@@ -7,6 +7,8 @@ from typing import Any
 
 from .tools import TOOL_DEFINITIONS, call_tool
 
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
+
 
 class NativeToolServer:
     def __init__(self) -> None:
@@ -43,11 +45,24 @@ class NativeToolServer:
                 self._json(404, {"ok": False, "error": "not_found"})
 
             def do_POST(self) -> None:
-                content_length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    content_length = int(self.headers.get("Content-Length", "0"))
+                except (TypeError, ValueError):
+                    self._json(400, {"ok": False, "error": "invalid_content_length"})
+                    return
+                if content_length < 0:
+                    self._json(400, {"ok": False, "error": "invalid_content_length"})
+                    return
+                if content_length > MAX_REQUEST_BYTES:
+                    self._json(413, {"ok": False, "error": "request_too_large"})
+                    return
                 try:
                     payload = json.loads(self.rfile.read(content_length).decode("utf-8")) if content_length else {}
-                except json.JSONDecodeError:
+                except (UnicodeDecodeError, json.JSONDecodeError):
                     self._json(400, {"ok": False, "error": "invalid_json"})
+                    return
+                if not isinstance(payload, dict):
+                    self._json(400, {"ok": False, "error": "json_object_required"})
                     return
 
                 if self.path != "/api/tools/call":

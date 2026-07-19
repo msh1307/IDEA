@@ -201,13 +201,15 @@ class SessionRegistry:
                 return None
             record.last_seen = utc_now()
             record.status = payload.get("status", record.status)
-            record.metadata.update(
-                {
-                    "current_address": payload.get("current_address", ""),
-                    "current_function": payload.get("current_function", ""),
-                    "busy": payload.get("busy", False),
-                }
-            )
+            metadata = {
+                "current_address": payload.get("current_address", ""),
+                "current_function": payload.get("current_function", ""),
+                "busy": payload.get("busy", False),
+            }
+            autoanalysis = payload.get("autoanalysis")
+            if isinstance(autoanalysis, dict):
+                metadata["autoanalysis"] = dict(autoanalysis)
+            record.metadata.update(metadata)
             record.metadata.pop("unregister_reason", None)
             return record
 

@@ -40,12 +40,12 @@ def pump_main_thread(timeout_sec: float = 0.1, max_items: int = 32) -> int:
 
 
 def run_in_ida(func):
+    if threading.get_ident() == _MAIN_THREAD_ID:
+        return _run_with_batch(func)
     sync_mode = (os.getenv("IDEA_IDA_SYNC_MODE", "").strip() or "execute_sync").lower()
     if sync_mode == "direct":
         return _run_with_batch(func)
     if sync_mode == "queue":
-        if threading.get_ident() == _MAIN_THREAD_ID:
-            return _run_with_batch(func)
         result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         _CALL_QUEUE.put((func, result_queue))
         status, value = result_queue.get()

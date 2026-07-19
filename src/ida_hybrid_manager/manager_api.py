@@ -8,6 +8,8 @@ from typing import Any
 
 from .registry import SessionRegistry
 
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
+
 
 class ManagerApiServer:
     def __init__(
@@ -62,15 +64,32 @@ class ManagerApiServer:
                 self._json(404, {"ok": False, "error": "not_found"})
 
             def do_POST(self) -> None:
-                content_length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    content_length = int(self.headers.get("Content-Length", "0"))
+                except (TypeError, ValueError):
+                    self._json(400, {"ok": False, "error": "invalid_content_length"})
+                    return
+                if content_length < 0:
+                    self._json(400, {"ok": False, "error": "invalid_content_length"})
+                    return
+                if content_length > MAX_REQUEST_BYTES:
+                    self._json(413, {"ok": False, "error": "request_too_large"})
+                    return
                 try:
                     payload = json.loads(self.rfile.read(content_length).decode("utf-8")) if content_length else {}
-                except json.JSONDecodeError:
+                except (UnicodeDecodeError, json.JSONDecodeError):
                     self._json(400, {"ok": False, "error": "invalid_json"})
+                    return
+                if not isinstance(payload, dict):
+                    self._json(400, {"ok": False, "error": "json_object_required"})
                     return
 
                 if self.path == "/api/sessions/register":
-                    record = registry.register_session(payload)
+                    try:
+                        record = registry.register_session(payload)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        self._json(400, {"ok": False, "error": str(exc)})
+                        return
                     if session_registered_callback is not None:
                         session_registered_callback(record)
                     self._json(200, {"ok": True, "session_id": record.session_id, "heartbeat_interval_sec": 10})

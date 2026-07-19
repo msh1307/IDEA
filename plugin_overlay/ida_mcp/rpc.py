@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 from typing import Any, Optional
 from .zeromcp import McpRpcRegistry, McpServer, McpToolError, McpHttpRequestHandler
 
@@ -12,8 +14,21 @@ MCP_SERVER = McpServer("ida-pro-mcp", extensions=MCP_EXTENSIONS)
 # ============================================================================
 
 OUTPUT_LIMIT_MAX_CHARS = 50000
-OUTPUT_CACHE_MAX_SIZE = 100
-_output_cache: dict[str, Any] = {}
+try:
+    OUTPUT_CACHE_MAX_SIZE = max(1, int(os.environ.get("IDA_MCP_OUTPUT_CACHE_MAX_SIZE", "100")))
+except ValueError:
+    OUTPUT_CACHE_MAX_SIZE = 100
+try:
+    OUTPUT_CACHE_TTL_SEC = max(60, int(os.environ.get("IDA_MCP_OUTPUT_CACHE_TTL_SEC", "1800")))
+except ValueError:
+    OUTPUT_CACHE_TTL_SEC = 1800
+try:
+    OUTPUT_CACHE_MAX_BYTES = max(1024 * 1024, int(os.environ.get("IDA_MCP_OUTPUT_CACHE_MAX_BYTES", str(64 * 1024 * 1024))))
+except ValueError:
+    OUTPUT_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_output_cache: dict[str, tuple[float, int, Any]] = {}
+_output_cache_bytes = 0
+_output_cache_lock = threading.RLock()
 _download_base_url: str = os.environ.get("IDA_MCP_URL", "http://127.0.0.1:13337")
 
 
@@ -87,14 +102,52 @@ def _add_download_info(result: Any, output_id: str, total_chars: int) -> Any:
 
 
 def get_cached_output(output_id: str) -> Optional[Any]:
-    return _output_cache.get(output_id)
+    global _output_cache_bytes
+    now = time.monotonic()
+    with _output_cache_lock:
+        entry = _output_cache.get(output_id)
+        if entry is None:
+            return None
+        created_at, size, data = entry
+        if now - created_at >= OUTPUT_CACHE_TTL_SEC:
+            _output_cache.pop(output_id, None)
+            _output_cache_bytes = max(0, _output_cache_bytes - size)
+            return None
+        return data
 
 
-def _cache_output(output_id: str, data: Any) -> None:
-    if len(_output_cache) >= OUTPUT_CACHE_MAX_SIZE:
-        oldest_key = next(iter(_output_cache))
-        del _output_cache[oldest_key]
-    _output_cache[output_id] = data
+def _prune_output_cache_locked(now: float) -> None:
+    global _output_cache_bytes
+    for output_id, (created_at, size, _data) in list(_output_cache.items()):
+        if now - created_at < OUTPUT_CACHE_TTL_SEC:
+            continue
+        _output_cache.pop(output_id, None)
+        _output_cache_bytes = max(0, _output_cache_bytes - size)
+
+
+def _cache_output(output_id: str, data: Any, size: int | None = None) -> bool:
+    global _output_cache_bytes
+    if size is None:
+        try:
+            size = len(json.dumps(data).encode("utf-8"))
+        except Exception:
+            size = 0
+    size = max(0, int(size))
+    if size > OUTPUT_CACHE_MAX_BYTES:
+        return False
+    now = time.monotonic()
+    with _output_cache_lock:
+        _prune_output_cache_locked(now)
+        while _output_cache and (
+            len(_output_cache) >= OUTPUT_CACHE_MAX_SIZE
+            or _output_cache_bytes + size > OUTPUT_CACHE_MAX_BYTES
+        ):
+            oldest_key, (_created_at, oldest_size, _oldest_data) = next(iter(_output_cache.items()))
+            del _output_cache[oldest_key]
+            _output_cache_bytes = max(0, _output_cache_bytes - oldest_size)
+        _output_cache[output_id] = (now, size, data)
+        _output_cache_bytes += size
+        return True
 
 
 def _install_tools_call_patch() -> None:
@@ -117,10 +170,18 @@ def _install_tools_call_patch() -> None:
             return response
 
         output_id = _generate_output_id()
-        _cache_output(output_id, structured)
+        cached = _cache_output(output_id, structured, len(serialized.encode("utf-8")))
 
         preview = _truncate_value(structured)
-        preview = _add_download_info(preview, output_id, len(serialized))
+        if cached:
+            preview = _add_download_info(preview, output_id, len(serialized))
+        elif isinstance(preview, dict):
+            preview = {
+                **preview,
+                "_output_truncated": True,
+                "_total_chars": len(serialized),
+                "_output_cache": "result exceeds in-memory cache budget",
+            }
 
         return {
             "structuredContent": preview,

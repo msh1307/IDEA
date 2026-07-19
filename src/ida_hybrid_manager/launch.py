@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import shutil
 import socket
@@ -103,6 +104,59 @@ class IdaLauncher:
         self.stage_root.mkdir(parents=True, exist_ok=True)
         self.overlay_root = self.wsl_temp / "overlay"
         self.overlay_root.mkdir(parents=True, exist_ok=True)
+        self.cleanup_stale_temp()
+
+    def cleanup_stale_temp(self, max_age_sec: int | None = None) -> dict[str, Any]:
+        """Remove only old manager-generated staging/log entries.
+
+        User binaries, IDBs, exports, and the plugin overlay are outside this
+        allowlist and are never removed here. Active launches are normally much
+        newer than the default seven-day TTL; normal session close still does
+        immediate staging cleanup.
+        """
+        if max_age_sec is None:
+            try:
+                max_age_sec = max(3600, int(os.getenv("IDA_MCP_TEMP_TTL_SEC", str(7 * 24 * 3600))))
+            except ValueError:
+                max_age_sec = 7 * 24 * 3600
+        cutoff = time.time() - max_age_sec
+        removed_files = 0
+        removed_dirs = 0
+        errors: list[str] = []
+        file_prefixes = ("headless-", "headless-launch-", "launch-")
+        file_suffixes = (".py", ".log", ".stdout.log", ".stderr.log", ".idat.log")
+        try:
+            entries = list(self.wsl_temp.iterdir())
+        except OSError as exc:
+            return {"removed_files": 0, "removed_dirs": 0, "errors": [str(exc)]}
+        for path in entries:
+            if not path.is_file() or not path.name.startswith(file_prefixes):
+                continue
+            if not path.name.endswith(file_suffixes):
+                continue
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+                removed_files += 1
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+        try:
+            staged_entries = list(self.stage_root.iterdir())
+        except OSError as exc:
+            staged_entries = []
+            errors.append(f"{self.stage_root}: {exc}")
+        for path in staged_entries:
+            if not path.is_dir() or not re.fullmatch(r"[0-9a-f]{12}", path.name, re.IGNORECASE):
+                continue
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                if self.cleanup_staged_dir(str(path)):
+                    removed_dirs += 1
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+        return {"removed_files": removed_files, "removed_dirs": removed_dirs, "errors": errors}
 
     def _powershell(self, command: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -275,12 +329,15 @@ class IdaLauncher:
         source_wsl = Path(normalized.wsl_path)
         source_idb = source_wsl.with_name(f"{source_wsl.name}.i64")
         source_idb_exists = source_idb.exists()
+        source_idb_stat = source_idb.stat() if source_idb_exists else None
         source_metadata = {
             "source_input_path": normalized.input_path,
             "source_windows_path": normalized.windows_path,
             "source_wsl_path": normalized.wsl_path,
             "source_idb_wsl_path": str(source_idb),
             "source_idb_exists": source_idb_exists,
+            "source_idb_size": int(source_idb_stat.st_size) if source_idb_stat is not None else None,
+            "source_idb_mtime_ns": int(source_idb_stat.st_mtime_ns) if source_idb_stat is not None else None,
             "existing_idb_allowed": allow_existing_idb,
         }
         if len(windows_path) >= 3 and windows_path[1:3] == ":\\" and not always_stage:
@@ -292,10 +349,14 @@ class IdaLauncher:
         staged_dir = self.stage_root / uuid.uuid4().hex[:12]
         staged_dir.mkdir(parents=True, exist_ok=True)
         staged_path = staged_dir / source_wsl.name
-        shutil.copy2(source_wsl, staged_path)
-        staged_idb = staged_path.with_name(f"{staged_path.name}.i64")
-        if allow_existing_idb and source_idb_exists:
-            shutil.copy2(source_idb, staged_idb)
+        try:
+            shutil.copy2(source_wsl, staged_path)
+            staged_idb = staged_path.with_name(f"{staged_path.name}.i64")
+            if allow_existing_idb and source_idb_exists:
+                shutil.copy2(source_idb, staged_idb)
+        except Exception:
+            shutil.rmtree(staged_dir, ignore_errors=True)
+            raise
         display_path = windows_path if len(windows_path) >= 3 and windows_path[1:3] == ":\\" else normalized.input_path
         metadata = {
             "staged_dir": str(staged_dir),
@@ -320,6 +381,7 @@ class IdaLauncher:
         if not source_idb.exists():
             raise FileNotFoundError(f"Input IDB not found: {idb_path}")
         source_binary = Path(str(source_idb)[:-4])
+        source_idb_stat = source_idb.stat()
         source_metadata = {
             "source_input_kind": "idb",
             "source_input_path": normalized.input_path,
@@ -327,6 +389,8 @@ class IdaLauncher:
             "source_wsl_path": normalized.wsl_path,
             "source_idb_wsl_path": normalized.wsl_path,
             "source_idb_exists": True,
+            "source_idb_size": int(source_idb_stat.st_size),
+            "source_idb_mtime_ns": int(source_idb_stat.st_mtime_ns),
             "source_binary_wsl_path": str(source_binary),
             "source_binary_windows_path": to_windows_path(str(source_binary)),
             "staged_from_existing_idb": True,
@@ -337,7 +401,11 @@ class IdaLauncher:
         staged_dir = self.stage_root / uuid.uuid4().hex[:12]
         staged_dir.mkdir(parents=True, exist_ok=True)
         staged_idb = staged_dir / source_idb.name
-        shutil.copy2(source_idb, staged_idb)
+        try:
+            shutil.copy2(source_idb, staged_idb)
+        except Exception:
+            shutil.rmtree(staged_dir, ignore_errors=True)
+            raise
         metadata = {
             "staged_dir": str(staged_dir),
             "staged_binary_path": "",
@@ -357,13 +425,21 @@ class IdaLauncher:
         stderr_path: str | None = None,
         working_directory: str | None = None,
     ) -> int | None:
+        def ps_quote(value: str) -> str:
+            return "'" + str(value).replace("'", "''") + "'"
+
         escaped_args = []
         for arg in arguments:
-            escaped_args.append("'" + arg.replace("'", "''") + "'")
+            escaped_args.append(ps_quote(arg))
         quoted_args = ", ".join(escaped_args)
         window_style = "-WindowStyle Hidden" if hidden else ""
         working_dir = working_directory or executable.rsplit("\\", 1)[0]
-        working_dir_arg = f"-WorkingDirectory '{working_dir}' " if working_dir else ""
+        working_dir_arg = f"-WorkingDirectory {ps_quote(working_dir)} " if working_dir else ""
+        redirect_args = ""
+        if stdout_path:
+            redirect_args += f"-RedirectStandardOutput {ps_quote(stdout_path)} "
+        if stderr_path:
+            redirect_args += f"-RedirectStandardError {ps_quote(stderr_path)} "
         env_prefix = ""
         if env:
             for key, value in env.items():
@@ -371,8 +447,8 @@ class IdaLauncher:
                 env_prefix += f"$env:{key} = '{escaped_value}'; "
         ps = (
             f"{env_prefix}"
-            f"$p = Start-Process -FilePath '{executable}' -ArgumentList @({quoted_args}) "
-            f"-PassThru {working_dir_arg}{window_style}; "
+            f"$p = Start-Process -FilePath {ps_quote(executable)} -ArgumentList @({quoted_args}) "
+            f"-PassThru {working_dir_arg}{redirect_args}{window_style}; "
             "$p.Id"
         )
         result = self._powershell(ps)
@@ -472,25 +548,42 @@ class IdaLauncher:
         existing_idb = allow_existing_idb and bool(metadata.get("staged_from_existing_idb")) and bool(staged_idb_path)
         open_path_windows = to_windows_path(staged_idb_path) if existing_idb else binary_windows
         idb_path = to_windows_path(staged_idb_path) if existing_idb else f"{binary_windows}.i64"
-        return self._launch_headless_open_path(
-            open_path_windows=open_path_windows,
-            display_path=display_path,
-            idb_path=idb_path,
-            metadata=metadata,
-            manager_url=manager_url,
-            existing_idb=existing_idb,
-        )
+        try:
+            return self._launch_headless_open_path(
+                open_path_windows=open_path_windows,
+                display_path=display_path,
+                idb_path=idb_path,
+                metadata=metadata,
+                manager_url=manager_url,
+                existing_idb=existing_idb,
+            )
+        except Exception:
+            self._cleanup_launch_staging(metadata)
+            raise
 
     def launch_headless_idb(self, idb_path: str, manager_url: str) -> PendingLaunch:
         idb_windows, display_path, metadata = self._prepare_idb_path(idb_path, always_stage=True)
-        return self._launch_headless_open_path(
-            open_path_windows=idb_windows,
-            display_path=display_path,
-            idb_path=idb_windows,
-            metadata=metadata,
-            manager_url=manager_url,
-            existing_idb=True,
-        )
+        try:
+            return self._launch_headless_open_path(
+                open_path_windows=idb_windows,
+                display_path=display_path,
+                idb_path=idb_windows,
+                metadata=metadata,
+                manager_url=manager_url,
+                existing_idb=True,
+            )
+        except Exception:
+            self._cleanup_launch_staging(metadata)
+            raise
+
+    def _cleanup_launch_staging(self, metadata: dict[str, Any]) -> None:
+        staged_dir = str(metadata.get("staged_dir") or "")
+        if not staged_dir:
+            return
+        try:
+            self.cleanup_staged_dir(staged_dir)
+        except OSError:
+            pass
 
     def list_idat_pids(self) -> list[int]:
         result = self._powershell(
@@ -547,29 +640,37 @@ class IdaLauncher:
 
     def launch_gui(self, binary_path: str, *, allow_existing_idb: bool = True) -> PendingLaunch:
         binary_windows, display_path, metadata = self._prepare_binary_path(binary_path, allow_existing_idb=allow_existing_idb)
-        pid = self._start_process(self.ida_gui, [binary_windows], hidden=False)
-        return PendingLaunch(
-            launch_token=f"gui-{uuid.uuid4().hex[:12]}",
-            binary_path=display_path,
-            idb_path=f"{binary_windows}.i64",
-            engine="gui",
-            port=None,
-            pid=pid,
-            metadata=metadata,
-        )
+        try:
+            pid = self._start_process(self.ida_gui, [binary_windows], hidden=False)
+            return PendingLaunch(
+                launch_token=f"gui-{uuid.uuid4().hex[:12]}",
+                binary_path=display_path,
+                idb_path=f"{binary_windows}.i64",
+                engine="gui",
+                port=None,
+                pid=pid,
+                metadata=metadata,
+            )
+        except Exception:
+            self._cleanup_launch_staging(metadata)
+            raise
 
     def launch_gui_idb(self, idb_path: str) -> PendingLaunch:
         idb_windows, display_path, metadata = self._prepare_idb_path(idb_path)
-        pid = self._start_process(self.ida_gui, [idb_windows], hidden=False)
-        return PendingLaunch(
-            launch_token=f"gui-{uuid.uuid4().hex[:12]}",
-            binary_path=display_path,
-            idb_path=idb_windows,
-            engine="gui",
-            port=None,
-            pid=pid,
-            metadata=metadata,
-        )
+        try:
+            pid = self._start_process(self.ida_gui, [idb_windows], hidden=False)
+            return PendingLaunch(
+                launch_token=f"gui-{uuid.uuid4().hex[:12]}",
+                binary_path=display_path,
+                idb_path=idb_windows,
+                engine="gui",
+                port=None,
+                pid=pid,
+                metadata=metadata,
+            )
+        except Exception:
+            self._cleanup_launch_staging(metadata)
+            raise
 
     def terminate_process(self, pid: int) -> None:
         result = subprocess.run(

@@ -8,10 +8,14 @@ import time
 import urllib.error
 import urllib.request
 
+import ida_auto
+import ida_ida
+import ida_idaapi
 import ida_kernwin
 import ida_loader
 import ida_nalt
 import ida_netnode
+import ida_segment
 import idaapi
 import idc
 
@@ -21,6 +25,38 @@ from .tools import TOOL_DEFINITIONS
 
 DEFAULT_MANAGER_URL = "http://127.0.0.1:18080"
 DEFAULT_HEARTBEAT_INTERVAL_SEC = 10.0
+_AUTO_QUEUE_NAMES = (
+    "AU_UNK",
+    "AU_CODE",
+    "AU_WEAK",
+    "AU_PROC",
+    "AU_TAIL",
+    "AU_FCHUNK",
+    "AU_USED",
+    "AU_USD2",
+    "AU_TYPE",
+    "AU_LIBF",
+    "AU_LBF2",
+    "AU_LBF3",
+    "AU_CHLB",
+    "AU_FINAL",
+)
+_AUTO_QUEUE_LABELS = {
+    "AU_UNK": "marking unexplored bytes",
+    "AU_CODE": "creating instructions",
+    "AU_WEAK": "creating speculative instructions",
+    "AU_PROC": "creating functions",
+    "AU_TAIL": "creating function tails",
+    "AU_FCHUNK": "finding function chunks",
+    "AU_USED": "reanalyzing references",
+    "AU_USD2": "reanalyzing references (pass 2)",
+    "AU_TYPE": "applying type information",
+    "AU_LIBF": "matching library signatures",
+    "AU_LBF2": "matching library signatures (pass 2)",
+    "AU_LBF3": "matching library signatures (pass 3)",
+    "AU_CHLB": "loading signature files",
+    "AU_FINAL": "running the final analysis pass",
+}
 
 
 def _config_json_get(key: str, default):
@@ -63,6 +99,111 @@ def _config_float(key: str, default: float) -> float:
         return default
 
 
+def _collect_autoanalysis_snapshot(source: str) -> dict:
+    try:
+        complete = bool(ida_auto.auto_is_ok())
+    except Exception:
+        complete = False
+
+    definitions = []
+    seen = set()
+    for name in _AUTO_QUEUE_NAMES:
+        value = getattr(ida_auto, name, None)
+        if value is None or int(value) in seen:
+            continue
+        seen.add(int(value))
+        definitions.append((name, int(value)))
+
+    try:
+        min_ea = int(ida_ida.inf_get_min_ea())
+        max_ea = int(ida_ida.inf_get_max_ea())
+    except Exception:
+        min_ea, max_ea = 0, int(ida_idaapi.BADADDR)
+
+    current_ea = int(ida_idaapi.BADADDR)
+    phase_id = int(getattr(ida_auto, "AU_NONE", -1))
+    if hasattr(ida_auto, "auto_display_t") and hasattr(ida_auto, "get_auto_display"):
+        try:
+            display = ida_auto.auto_display_t()
+            if ida_auto.get_auto_display(display):
+                current_ea = int(display.ea)
+                phase_id = int(display.type)
+        except Exception:
+            pass
+
+    if (current_ea == ida_idaapi.BADADDR or phase_id == int(getattr(ida_auto, "AU_NONE", -1))) and hasattr(ida_auto, "peek_auto_queue"):
+        for _, queue_type in definitions:
+            try:
+                pending_ea = int(ida_auto.peek_auto_queue(min_ea, queue_type))
+            except Exception:
+                continue
+            if pending_ea == ida_idaapi.BADADDR:
+                continue
+            current_ea = pending_ea
+            phase_id = queue_type
+            break
+
+    phase_index = -1
+    phase_name = "AU_NONE" if phase_id == int(getattr(ida_auto, "AU_NONE", -1)) else f"AU_{phase_id}"
+    for index, (name, queue_type) in enumerate(definitions):
+        if queue_type == phase_id:
+            phase_index = index
+            phase_name = name
+            break
+    phase = {
+        "name": phase_name,
+        "label": _AUTO_QUEUE_LABELS.get(phase_name, "idle" if phase_name == "AU_NONE" else "unknown analysis phase"),
+    }
+
+    current = None
+    address_fraction = 0.0
+    if current_ea != ida_idaapi.BADADDR:
+        image_base = int(idaapi.get_imagebase())
+        segment = ida_segment.getseg(current_ea)
+        segment_name = ida_segment.get_segm_name(segment) if segment is not None else ""
+        current = {
+            "address": f"0x{current_ea:X}",
+            "rva": f"0x{max(0, current_ea - image_base):X}",
+            "segment": segment_name,
+            "segment_percent": None,
+        }
+        if segment is not None:
+            size = max(0, int(segment.end_ea - segment.start_ea))
+            offset = max(0, min(size, int(current_ea - segment.start_ea)))
+            current["segment_percent"] = round((offset / size) * 100.0, 2) if size else 100.0
+        if max_ea > min_ea:
+            address_fraction = max(0.0, min(1.0, (current_ea - min_ea) / (max_ea - min_ea)))
+
+    if complete:
+        progress_percent = 100.0
+    elif phase_index >= 0 and definitions:
+        progress_percent = round(min(99.9, ((phase_index + address_fraction) / len(definitions)) * 100.0), 2)
+    else:
+        progress_percent = round(min(99.9, address_fraction * 100.0), 2)
+
+    if complete:
+        message = "IDA autoanalysis complete"
+    elif current and current.get("segment"):
+        segment_percent = current.get("segment_percent")
+        segment_progress = f" {segment_percent:.2f}%" if isinstance(segment_percent, (int, float)) else ""
+        message = f"{phase_name} {current['segment']}{segment_progress} at {current['address']}"
+    elif current:
+        message = f"{phase_name} at {current['address']}"
+    else:
+        message = f"{phase_name} (analysis queues pending)"
+
+    return {
+        "autoanalysis_complete": complete,
+        "status": "complete" if complete else "analyzing",
+        "message": message,
+        "progress_percent": progress_percent,
+        "phase": phase,
+        "current": current,
+        "source": source,
+        "checked_at_epoch": time.time(),
+    }
+
+
 @idasync
 def collect_registration_snapshot(host: str, port: int, engine: str, launch_token: str | None) -> dict:
     sha256_bytes = ida_nalt.retrieve_input_file_sha256() or b""
@@ -70,13 +211,14 @@ def collect_registration_snapshot(host: str, port: int, engine: str, launch_toke
     idb_path = idc.get_idb_path() or ida_loader.get_path(ida_loader.PATH_TYPE_IDB) or ""
     display_name = ida_nalt.get_root_filename() or os.path.basename(binary_path or idb_path or "ida")
     endpoint_host = _config_str("endpoint_host", "127.0.0.1")
+    autoanalysis = _collect_autoanalysis_snapshot("bridge_registration")
     return {
         "engine": engine,
         "display_name": display_name,
         "binary_path": binary_path,
         "binary_hash": f"sha256:{sha256_bytes.hex()}" if sha256_bytes else "",
         "idb_path": idb_path,
-        "status": "ready",
+        "status": "ready" if autoanalysis["autoanalysis_complete"] else "busy",
         "capabilities": sorted(tool["name"] for tool in TOOL_DEFINITIONS),
         "endpoint": {"transport": "native-http", "url": f"http://{endpoint_host}:{port}"},
         "owner_pid": os.getpid(),
@@ -86,6 +228,7 @@ def collect_registration_snapshot(host: str, port: int, engine: str, launch_toke
             "readonly": False,
             "launch_token": launch_token,
             "headless": engine == "headless",
+            "autoanalysis": autoanalysis,
         },
     }
 
@@ -97,11 +240,13 @@ def collect_heartbeat_snapshot() -> dict:
     current_func_name = ""
     if current_func is not None:
         current_func_name = idaapi.get_func_name(current_func.start_ea) or ""
+    autoanalysis = _collect_autoanalysis_snapshot("bridge_heartbeat")
     return {
-        "status": "ready",
+        "status": "ready" if autoanalysis["autoanalysis_complete"] else "busy",
         "current_address": hex(current_ea) if current_ea != idaapi.BADADDR else "",
         "current_function": current_func_name,
-        "busy": False,
+        "busy": not autoanalysis["autoanalysis_complete"],
+        "autoanalysis": autoanalysis,
     }
 
 
