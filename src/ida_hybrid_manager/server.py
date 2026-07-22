@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, contextmanager
 from datetime import datetime
 import fcntl
@@ -95,6 +96,8 @@ _open_binary_lock = threading.RLock()
 _operation_progress_lock = threading.RLock()
 _operation_progress: dict[str, dict[str, Any]] = {}
 _cancelled_operation_progress: dict[str, float] = {}
+_session_operation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ida-session-queue")
+_session_operation_stop = threading.Event()
 OPERATION_PROGRESS_TTL_SEC = 3600.0
 MUTATING_BACKEND_TOOLS = {
     "apply_decl",
@@ -175,6 +178,7 @@ LITE_MCP_TOOLS = {
     "inspect_environment",
     "open_binary",
     "load_idb",
+    "get_operation_progress",
     "close_session",
     "prune_alive_sessions",
     "list_session_tools",
@@ -262,6 +266,7 @@ def _set_operation_progress(
     progress: float,
     message: str,
     analysis: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
 ) -> None:
     operation_id = str(operation_id or "").strip()
     if not operation_id:
@@ -285,6 +290,8 @@ def _set_operation_progress(
         }
         if analysis is not None:
             entry["analysis"] = analysis
+        if result is not None:
+            entry["result"] = result
         _operation_progress[operation_id] = entry
 
 
@@ -318,6 +325,196 @@ def _cancel_operation_progress(operation_id: str | None) -> None:
         _operation_progress.pop(normalized, None)
 
 
+def _wait_for_queued_autoanalysis(
+    session_id: str,
+    *,
+    operation: str,
+    operation_id: str,
+) -> dict[str, Any]:
+    """Wait on heartbeat state, without putting a fixed RPC deadline on IDA."""
+    started = time.monotonic()
+    last_status: dict[str, Any] = {}
+    while True:
+        if _session_operation_stop.is_set():
+            return {
+                "waited": True,
+                "ok": False,
+                "autoanalysis_complete": False,
+                "waited_sec": round(time.monotonic() - started, 3),
+                "progress": last_status,
+                "stalled": True,
+                "cancelled": True,
+                "error": "queued session operation stopped while waiting for autoanalysis",
+            }
+        record = registry.get_session(session_id)
+        if record is None or record.status == "dead":
+            return {
+                "waited": True,
+                "ok": False,
+                "autoanalysis_complete": False,
+                "waited_sec": round(time.monotonic() - started, 3),
+                "progress": last_status,
+                "stalled": True,
+                "error": "IDA session disappeared while autoanalysis was running",
+                "warning": "The queued IDA session disappeared before autoanalysis completed.",
+            }
+        cached = _cached_session_autoanalysis(record)
+        if cached:
+            last_status = cached
+        if bool(last_status.get("autoanalysis_complete")):
+            return {
+                "waited": True,
+                "ok": True,
+                "autoanalysis_complete": True,
+                "waited_sec": round(time.monotonic() - started, 3),
+                "progress": last_status,
+            }
+        age_sec = max(0.0, (utc_now() - record.last_seen).total_seconds())
+        if age_sec > SESSION_HEARTBEAT_LIVENESS_SEC:
+            return {
+                "waited": True,
+                "ok": False,
+                "autoanalysis_complete": False,
+                "waited_sec": round(time.monotonic() - started, 3),
+                "progress": last_status,
+                "stalled": True,
+                "error": f"IDA heartbeat stale for {age_sec:.1f}s",
+                "warning": "IDA autoanalysis did not report a live heartbeat; the session was left running for inspection.",
+            }
+        status = last_status or {
+            "autoanalysis_complete": False,
+            "status": "analyzing",
+            "progress_percent": 0.0,
+            "message": "Waiting for IDA heartbeat analysis status",
+        }
+        _set_operation_progress(
+            operation_id,
+            operation=operation,
+            stage="autoanalysis",
+            progress=_analysis_operation_progress(status),
+            message=str(status.get("message") or "IDA autoanalysis in progress"),
+            analysis=status,
+        )
+        time.sleep(1.0)
+
+
+def _run_queued_session_operation(operation: str, payload: dict[str, Any]) -> None:
+    """Run one long open/load operation without tying it to the MCP request."""
+    operation_id = str(payload.get("progress_id") or "")
+    _set_operation_progress(
+        operation_id,
+        operation=operation,
+        stage="starting",
+        progress=1.0,
+        message=f"Starting queued {operation}",
+    )
+    client_id = payload.get("client_id")
+    try:
+        with _client_lease_renewal(client_id):
+            run_payload = dict(payload)
+            run_payload["enqueue"] = False
+            run_payload["wait_for_analysis"] = False
+            run_payload["defer_progress_completion"] = True
+            result = _dispatch_operation(operation, run_payload)
+            if (
+                isinstance(result, dict)
+                and result.get("ok")
+                and payload.get("wait_for_analysis", True)
+                and result.get("session_id")
+            ):
+                analysis = _wait_for_queued_autoanalysis(
+                    str(result["session_id"]),
+                    operation=operation,
+                    operation_id=operation_id,
+                )
+                result = dict(result)
+                result["analysis"] = analysis
+                result["analysis_complete"] = analysis.get("autoanalysis_complete")
+                result["status"] = "ready" if analysis.get("autoanalysis_complete") else "analysis_pending"
+        ok = bool(isinstance(result, dict) and result.get("ok", True))
+        analysis = result.get("analysis") if isinstance(result, dict) and isinstance(result.get("analysis"), dict) else {}
+        analysis_pending = bool(
+            payload.get("wait_for_analysis", True)
+            and isinstance(result, dict)
+            and result.get("session_id")
+            and not analysis.get("autoanalysis_complete")
+        )
+        final_state = (
+            "stalled"
+            if analysis_pending and analysis.get("stalled")
+            else ("analysis_pending" if analysis_pending else ("complete" if ok else "failed"))
+        )
+        result_error = (
+            str(result.get("error") or f"{operation} failed")
+            if isinstance(result, dict)
+            else f"{operation} failed"
+        )
+        _set_operation_progress(
+            operation_id,
+            operation=operation,
+            stage=final_state,
+            progress=99.0 if analysis_pending else 100.0,
+            message=(
+                "IDA heartbeat stalled; session was left running"
+                if final_state == "stalled"
+                else (
+                    "IDA session opened; autoanalysis is still pending"
+                    if analysis_pending
+                    else (f"{operation} complete" if ok else result_error)
+                )
+            ),
+            result=result if isinstance(result, dict) else {"ok": ok, "result": result},
+        )
+    except BaseException as exc:
+        _daemon_debug(f"queued {operation} failed operation_id={operation_id}: {exc!r}")
+        _set_operation_progress(
+            operation_id,
+            operation=operation,
+            stage="failed",
+            progress=100.0,
+            message=f"{operation} failed: {exc}",
+            result={"ok": False, "error": str(exc)},
+        )
+
+
+def _queue_session_operation(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+    operation_id = str(payload.get("progress_id") or "").strip()
+    if not operation_id:
+        raise ValueError("Queued open/load operations require progress_id")
+    if _session_operation_stop.is_set():
+        raise RuntimeError("session operation queue is stopping")
+    _set_operation_progress(
+        operation_id,
+        operation=operation,
+        stage="queued",
+        progress=0.0,
+        message=f"Queued {operation}; waiting for the IDA launch worker",
+    )
+    try:
+        _session_operation_executor.submit(_run_queued_session_operation, operation, dict(payload))
+    except BaseException as exc:
+        _set_operation_progress(
+            operation_id,
+            operation=operation,
+            stage="failed",
+            progress=100.0,
+            message=f"{operation} queue unavailable: {exc}",
+            result={"ok": False, "error": str(exc)},
+        )
+        raise
+    return {
+        "ok": True,
+        "status": "queued",
+        "operation_id": operation_id,
+        "message": "Operation accepted; poll get_operation_progress or list_alive_sessions for readiness.",
+    }
+
+
+def _stop_session_operation_queue() -> None:
+    _session_operation_stop.set()
+    _session_operation_executor.shutdown(wait=False, cancel_futures=True)
+
+
 def _get_launcher() -> IdaLauncher:
     global _launcher
     if _launcher is None:
@@ -348,6 +545,7 @@ STDIO_FORCE_EXIT_GRACE_SEC = max(0.1, float(os.getenv("IDA_MCP_STDIO_FORCE_EXIT_
 STDIO_PARENT_CHECK_INTERVAL_SEC = max(1.0, min(30.0, float(os.getenv("IDA_MCP_STDIO_PARENT_CHECK_INTERVAL_SEC", "5") or 5.0)))
 CLIENT_LEASE_TIMEOUT_SEC = max(60.0, float(os.getenv("IDA_MCP_CLIENT_LEASE_TIMEOUT_SEC", str(max(900, STDIO_IDLE_TIMEOUT_SEC * 2))) or 900.0))
 CLIENT_LEASE_SWEEP_INTERVAL_SEC = max(10.0, min(120.0, float(os.getenv("IDA_MCP_CLIENT_LEASE_SWEEP_INTERVAL_SEC", "30") or 30.0)))
+SESSION_HEARTBEAT_LIVENESS_SEC = max(30.0, float(os.getenv("IDA_SESSION_HEARTBEAT_LIVENESS_SEC", "90") or 90.0))
 AUTO_PRUNE_HEADLESS_ENABLED = os.getenv("IDA_MCP_AUTO_PRUNE_HEADLESS", "1").strip().lower() not in {"0", "false", "no", "off"}
 AUTO_PRUNE_HEADLESS_KEEP = max(1, int(os.getenv("IDA_MCP_AUTO_PRUNE_HEADLESS_KEEP", "3") or 3))
 DAEMON_REQUEST_TIMEOUT_SEC = max(30.0, float(os.getenv("IDA_MCP_DAEMON_REQUEST_TIMEOUT_SEC", "120") or 120.0))
@@ -1606,6 +1804,12 @@ def _terminate_managed_pid(pid: int | None, *, launch_token: str, errors: list[d
 def _terminate_pending_launch(pending: PendingLaunch | None, *, step: str) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     if pending is not None:
+        if pending.pid is None:
+            # The PowerShell handshake may have timed out after Start-Process
+            # created IDA. Keep the token recoverable; an unknown PID must not
+            # be treated as a terminated child or silently orphaned launch.
+            errors.append({"step": step, "error": "launch pid unknown; pending launch retained for late session registration"})
+            return errors
         terminated = _terminate_managed_pid(
             pending.pid,
             launch_token=str(pending.launch_token or ""),
@@ -1621,7 +1825,7 @@ def _terminate_pending_launch(pending: PendingLaunch | None, *, step: str) -> li
         # A launch that never registered a session should be removed once its
         # process is gone. Keep it in the registry when termination is
         # ambiguous so a later cleanup can still recover the owner PID.
-        if pending.pid is None or terminated or not still_alive:
+        if terminated or not still_alive:
             registry.pop_pending_launch(str(pending.launch_token or ""))
     return errors
 
@@ -2844,6 +3048,12 @@ def _local_open_binary(
     analysis_timeout_sec: Any = None,
     launch_timeout_sec: Any = None,
     backend_ready_timeout_sec: Any = None,
+    processor: str | None = None,
+    compiler: str | None = None,
+    bitness: int | None = None,
+    thumb_mode: bool | None = None,
+    thumb_address: str | int | None = None,
+    defer_progress_completion: bool = False,
     progress_id: str = "",
     client_id: str | None = None,
 ) -> dict[str, Any]:
@@ -2860,7 +3070,15 @@ def _local_open_binary(
         _sweep_unreachable_sessions()
         normalized = normalize_path(path)
         candidate_paths = {normalized.input_path, normalized.windows_path, normalized.wsl_path}
+        architecture_requested = any(
+            value is not None and value != ""
+            for value in (processor, compiler, bitness, thumb_mode, thumb_address)
+        )
         if remove_previous_idb:
+            reuse = False
+        if architecture_requested:
+            # Never silently attach to a session created with another processor
+            # or segment mode. The caller can opt into reuse after inspection.
             reuse = False
         candidate_hash = _compute_input_binary_hash(normalized) if reuse else ""
         removed_idb = _remove_adjacent_idb(normalized) if remove_previous_idb else None
@@ -2868,7 +3086,8 @@ def _local_open_binary(
             "open_binary start "
             f"path={path!r} mode={mode} reuse={reuse} remove_previous_idb={remove_previous_idb} "
             f"wait_for_analysis={wait_for_analysis} launch_timeout_sec={launch_timeout} "
-            f"backend_ready_timeout_sec={backend_ready_timeout} client_id={client_id}"
+            f"backend_ready_timeout_sec={backend_ready_timeout} processor={processor!r} compiler={compiler!r} "
+            f"bitness={bitness!r} thumb_mode={thumb_mode!r} thumb_address={thumb_address!r} client_id={client_id}"
         )
         if reuse:
             preferred_engine = None if mode == "auto" else mode
@@ -2904,22 +3123,23 @@ def _local_open_binary(
                     if analysis_wait.get("waited") and not analysis_wait.get("autoanalysis_complete")
                     else attached.status
                 )
-                _set_operation_progress(
-                    progress_id,
-                    operation="open_binary",
-                    stage="complete",
-                    progress=100.0,
-                    message=(
-                        "Reused session; IDA autoanalysis complete"
-                        if analysis_wait.get("autoanalysis_complete")
-                        else (
-                            "Reused session, but IDA autoanalysis is incomplete"
-                            if analysis_wait.get("waited")
-                            else "Reused existing IDA session"
-                        )
-                    ),
-                    analysis=analysis_wait.get("progress") if isinstance(analysis_wait.get("progress"), dict) else None,
-                )
+                if not defer_progress_completion:
+                    _set_operation_progress(
+                        progress_id,
+                        operation="open_binary",
+                        stage="complete",
+                        progress=100.0,
+                        message=(
+                            "Reused session; IDA autoanalysis complete"
+                            if analysis_wait.get("autoanalysis_complete")
+                            else (
+                                "Reused session, but IDA autoanalysis is incomplete"
+                                if analysis_wait.get("waited")
+                                else "Reused existing IDA session"
+                            )
+                        ),
+                        analysis=analysis_wait.get("progress") if isinstance(analysis_wait.get("progress"), dict) else None,
+                    )
                 return {
                     "ok": True,
                     "session_id": attached.session_id,
@@ -2952,7 +3172,15 @@ def _local_open_binary(
                     "environment": environment,
                 }
             try:
-                pending = launcher.launch_gui(path, allow_existing_idb=not remove_previous_idb)
+                pending = launcher.launch_gui(
+                    path,
+                    allow_existing_idb=not remove_previous_idb and not architecture_requested,
+                    processor=processor,
+                    compiler=compiler,
+                    bitness=bitness,
+                    thumb_mode=thumb_mode,
+                    thumb_address=thumb_address,
+                )
             except Exception as exc:
                 return {
                     "ok": False,
@@ -2988,7 +3216,16 @@ def _local_open_binary(
                 if _cleanup_untracked_headless_before_launch_enabled():
                     launcher.terminate_untracked_idat(_tracked_headless_pids())
                 try:
-                    pending = launcher.launch_headless(path, manager_url(), allow_existing_idb=not remove_previous_idb)
+                    pending = launcher.launch_headless(
+                        path,
+                        manager_url(),
+                        allow_existing_idb=not remove_previous_idb and not architecture_requested,
+                        processor=processor,
+                        compiler=compiler,
+                        bitness=bitness,
+                        thumb_mode=thumb_mode,
+                        thumb_address=thumb_address,
+                    )
                 except Exception as exc:
                     last_failure = {
                         "ok": False,
@@ -3128,22 +3365,23 @@ def _local_open_binary(
             if analysis_complete is False or (analysis_complete is None and attached.status == "busy")
             else "ready"
         )
-        _set_operation_progress(
-            progress_id,
-            operation="open_binary",
-            stage="complete",
-            progress=100.0,
-            message=(
-                "IDA autoanalysis complete"
-                if analysis_complete
-                else (
-                    "IDA session opened, but autoanalysis is incomplete"
-                    if analysis_wait.get("waited")
-                    else "IDA session ready"
-                )
-            ),
-            analysis=analysis_wait.get("progress") if isinstance(analysis_wait.get("progress"), dict) else None,
-        )
+        if not defer_progress_completion:
+            _set_operation_progress(
+                progress_id,
+                operation="open_binary",
+                stage="complete",
+                progress=100.0,
+                message=(
+                    "IDA autoanalysis complete"
+                    if analysis_complete
+                    else (
+                        "IDA session opened, but autoanalysis is incomplete"
+                        if analysis_wait.get("waited")
+                        else "IDA session ready"
+                    )
+                ),
+                analysis=analysis_wait.get("progress") if isinstance(analysis_wait.get("progress"), dict) else None,
+            )
         return {
             "ok": True,
             "session_id": attached.session_id,
@@ -3156,6 +3394,7 @@ def _local_open_binary(
             "removed_previous_idb": removed_idb,
             "analysis": analysis_wait,
             "analysis_complete": analysis_complete,
+            "architecture": pending.metadata.get("architecture") if pending is not None else None,
             "timeouts": {
                 "launch_timeout_sec": launch_timeout,
                 "backend_ready_timeout_sec": backend_ready_timeout,
@@ -3173,6 +3412,12 @@ def _local_load_idb(
     analysis_timeout_sec: Any = None,
     launch_timeout_sec: Any = None,
     backend_ready_timeout_sec: Any = None,
+    processor: str | None = None,
+    compiler: str | None = None,
+    bitness: int | None = None,
+    thumb_mode: bool | None = None,
+    thumb_address: str | int | None = None,
+    defer_progress_completion: bool = False,
     progress_id: str = "",
     client_id: str | None = None,
 ) -> dict[str, Any]:
@@ -3194,10 +3439,18 @@ def _local_load_idb(
         if idb_fingerprint is None:
             return {"ok": False, "error": f"Input IDB not found: {path}"}
         candidate_paths = {normalized.input_path, normalized.windows_path, normalized.wsl_path}
+        architecture_requested = any(
+            value is not None and value != ""
+            for value in (processor, compiler, bitness, thumb_mode, thumb_address)
+        )
+        if architecture_requested:
+            reuse = False
         _daemon_debug(
             "load_idb start "
             f"path={path!r} mode={mode} reuse={reuse} wait_for_analysis={wait_for_analysis} "
-            f"launch_timeout_sec={launch_timeout} backend_ready_timeout_sec={backend_ready_timeout} client_id={client_id}"
+            f"launch_timeout_sec={launch_timeout} backend_ready_timeout_sec={backend_ready_timeout} "
+            f"processor={processor!r} compiler={compiler!r} bitness={bitness!r} thumb_mode={thumb_mode!r} "
+            f"thumb_address={thumb_address!r} client_id={client_id}"
         )
         if reuse:
             preferred_engine = None if mode == "auto" else mode
@@ -3230,22 +3483,23 @@ def _local_load_idb(
                     if analysis_wait.get("waited") and not analysis_wait.get("autoanalysis_complete")
                     else attached.status
                 )
-                _set_operation_progress(
-                    progress_id,
-                    operation="load_idb",
-                    stage="complete",
-                    progress=100.0,
-                    message=(
-                        "Reused IDB session; IDA autoanalysis complete"
-                        if analysis_wait.get("autoanalysis_complete")
-                        else (
-                            "Reused IDB session, but IDA autoanalysis is incomplete"
-                            if analysis_wait.get("waited")
-                            else "Reused existing IDB session"
-                        )
-                    ),
-                    analysis=analysis_wait.get("progress") if isinstance(analysis_wait.get("progress"), dict) else None,
-                )
+                if not defer_progress_completion:
+                    _set_operation_progress(
+                        progress_id,
+                        operation="load_idb",
+                        stage="complete",
+                        progress=100.0,
+                        message=(
+                            "Reused IDB session; IDA autoanalysis complete"
+                            if analysis_wait.get("autoanalysis_complete")
+                            else (
+                                "Reused IDB session, but IDA autoanalysis is incomplete"
+                                if analysis_wait.get("waited")
+                                else "Reused existing IDB session"
+                            )
+                        ),
+                        analysis=analysis_wait.get("progress") if isinstance(analysis_wait.get("progress"), dict) else None,
+                    )
                 return {
                     "ok": True,
                     "session_id": attached.session_id,
@@ -3276,7 +3530,14 @@ def _local_load_idb(
                     "environment": environment,
                 }
             try:
-                pending = launcher.launch_gui_idb(path)
+                pending = launcher.launch_gui_idb(
+                    path,
+                    processor=processor,
+                    compiler=compiler,
+                    bitness=bitness,
+                    thumb_mode=thumb_mode,
+                    thumb_address=thumb_address,
+                )
             except Exception as exc:
                 return {
                     "ok": False,
@@ -3311,7 +3572,15 @@ def _local_load_idb(
                 if _cleanup_untracked_headless_before_launch_enabled():
                     launcher.terminate_untracked_idat(_tracked_headless_pids())
                 try:
-                    pending = launcher.launch_headless_idb(path, manager_url())
+                    pending = launcher.launch_headless_idb(
+                        path,
+                        manager_url(),
+                        processor=processor,
+                        compiler=compiler,
+                        bitness=bitness,
+                        thumb_mode=thumb_mode,
+                        thumb_address=thumb_address,
+                    )
                 except Exception as exc:
                     last_failure = {
                         "ok": False,
@@ -3452,22 +3721,23 @@ def _local_load_idb(
             if analysis_complete is False or (analysis_complete is None and attached.status == "busy")
             else "ready"
         )
-        _set_operation_progress(
-            progress_id,
-            operation="load_idb",
-            stage="complete",
-            progress=100.0,
-            message=(
-                "IDA autoanalysis complete"
-                if analysis_complete
-                else (
-                    "IDB session opened, but autoanalysis is incomplete"
-                    if analysis_wait.get("waited")
-                    else "IDB session ready"
-                )
-            ),
-            analysis=analysis_wait.get("progress") if isinstance(analysis_wait.get("progress"), dict) else None,
-        )
+        if not defer_progress_completion:
+            _set_operation_progress(
+                progress_id,
+                operation="load_idb",
+                stage="complete",
+                progress=100.0,
+                message=(
+                    "IDA autoanalysis complete"
+                    if analysis_complete
+                    else (
+                        "IDB session opened, but autoanalysis is incomplete"
+                        if analysis_wait.get("waited")
+                        else "IDB session ready"
+                    )
+                ),
+                analysis=analysis_wait.get("progress") if isinstance(analysis_wait.get("progress"), dict) else None,
+            )
         return {
             "ok": True,
             "session_id": attached.session_id,
@@ -3478,6 +3748,7 @@ def _local_load_idb(
             "reused": False,
             "analysis": analysis_wait,
             "analysis_complete": analysis_complete,
+            "architecture": pending.metadata.get("architecture") if pending is not None else None,
             "timeouts": {
                 "launch_timeout_sec": launch_timeout,
                 "backend_ready_timeout_sec": backend_ready_timeout,
@@ -4007,6 +4278,8 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
     client_id = payload.get("client_id")
     if client_id and op_name not in {"connect_client", "disconnect_client"} and not _client_touch(client_id):
         raise ValueError(f"Unknown client_id: {client_id}")
+    if op_name in {"open_binary", "load_idb"} and bool(payload.get("enqueue", False)):
+        return _queue_session_operation(op_name, payload)
     op_map = {
         "connect_client": lambda **kwargs: _client_connect(**kwargs),
         "heartbeat_client": lambda **kwargs: {"ok": bool(_client_touch(kwargs.get("client_id"))), "client_id": kwargs.get("client_id")},
@@ -4031,6 +4304,12 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
             analysis_timeout_sec=kwargs.get("analysis_timeout_sec"),
             launch_timeout_sec=kwargs.get("launch_timeout_sec"),
             backend_ready_timeout_sec=kwargs.get("backend_ready_timeout_sec"),
+            processor=kwargs.get("processor"),
+            compiler=kwargs.get("compiler"),
+            bitness=kwargs.get("bitness"),
+            thumb_mode=kwargs.get("thumb_mode"),
+            thumb_address=kwargs.get("thumb_address"),
+            defer_progress_completion=kwargs.get("defer_progress_completion", False),
             progress_id=kwargs.get("progress_id", ""),
             client_id=client_id,
         ),
@@ -4042,6 +4321,12 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
             analysis_timeout_sec=kwargs.get("analysis_timeout_sec"),
             launch_timeout_sec=kwargs.get("launch_timeout_sec"),
             backend_ready_timeout_sec=kwargs.get("backend_ready_timeout_sec"),
+            processor=kwargs.get("processor"),
+            compiler=kwargs.get("compiler"),
+            bitness=kwargs.get("bitness"),
+            thumb_mode=kwargs.get("thumb_mode"),
+            thumb_address=kwargs.get("thumb_address"),
+            defer_progress_completion=kwargs.get("defer_progress_completion", False),
             progress_id=kwargs.get("progress_id", ""),
             client_id=client_id,
         ),
@@ -4453,6 +4738,16 @@ def list_alive_sessions() -> mcp_types.CallToolResult:
     return _mcp_result(_local_list_alive_sessions(CLIENT_ID))
 
 
+@mcp.tool(description="Get the queued open_binary/load_idb operation state, progress, and final result by operation_id.", structured_output=False)
+def get_operation_progress(operation_id: str) -> mcp_types.CallToolResult:
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(_daemon_request_sync(
+            "get_operation_progress",
+            {"operation_id": operation_id, "client_id": CLIENT_ID},
+        ))
+    return _mcp_result(_get_operation_progress(operation_id))
+
+
 @mcp.tool(description="Return the currently selected IDA session.", structured_output=False)
 def current_session() -> mcp_types.CallToolResult:
     if ACTIVE_BACKEND == "daemon":
@@ -4536,6 +4831,7 @@ async def _run_operation_with_mcp_progress(
     last_revision = -1
     last_progress = 0.0
     last_message = f"Starting {operation}"
+    retain_progress = False
     try:
         while not task.done():
             try:
@@ -4551,6 +4847,7 @@ async def _run_operation_with_mcp_progress(
             await asyncio.sleep(0.25)
 
         result = await task
+        retain_progress = bool(isinstance(result, dict) and result.get("status") == "queued")
         try:
             entry = await fetch_progress()
             if entry.get("found"):
@@ -4559,7 +4856,9 @@ async def _run_operation_with_mcp_progress(
         except Exception:
             pass
 
-        if isinstance(result, dict) and result.get("ok") is False:
+        if retain_progress:
+            await ctx.report_progress(last_progress, 100.0, str(result.get("message") or f"{operation} queued"))
+        elif isinstance(result, dict) and result.get("ok") is False:
             await ctx.report_progress(last_progress, 100.0, str(result.get("error") or f"{operation} failed"))
         else:
             analysis = result.get("analysis") if isinstance(result, dict) and isinstance(result.get("analysis"), dict) else {}
@@ -4582,11 +4881,11 @@ async def _run_operation_with_mcp_progress(
                 pass
         raise
     finally:
-        if task.done():
+        if task.done() and not retain_progress:
             await clear_progress()
 
 
-@mcp.tool(description="Open a binary in headless mode, GUI mode, or auto mode and select the resulting session. Headless launches wait for IDA autoanalysis by default and emit live phase/address/segment progress; set wait_for_analysis=false for the old backend-ready-only behavior.", structured_output=False)
+@mcp.tool(description="Open a binary asynchronously. Optional processor, compiler, bitness (16/32/64), thumb_mode, and thumb_address configure raw binaries. Poll get_operation_progress(operation_id); use enqueue=false to block.", structured_output=False)
 async def open_binary(
     ctx: Context,
     path: str,
@@ -4594,10 +4893,16 @@ async def open_binary(
     reuse: bool = True,
     remove_previous_idb: bool = False,
     wait_for_analysis: bool = True,
-    analysis_timeout_sec: float = 120.0,
+    analysis_timeout_sec: float | None = None,
     launch_timeout_sec: float = 90.0,
     backend_ready_timeout_sec: float = 20.0,
+    processor: str | None = None,
+    compiler: str | None = None,
+    bitness: int | None = None,
+    thumb_mode: bool | None = None,
+    thumb_address: str = "",
     request_timeout_sec: float = 0.0,
+    enqueue: bool = True,
 ) -> mcp_types.CallToolResult:
     if str(path or "").strip().lower().endswith(".i64"):
         return _mcp_error_result("open_binary expects the original binary path. Use load_idb() to open an existing .i64 database.")
@@ -4610,6 +4915,12 @@ async def open_binary(
         "analysis_timeout_sec": analysis_timeout_sec,
         "launch_timeout_sec": launch_timeout_sec,
         "backend_ready_timeout_sec": backend_ready_timeout_sec,
+        "processor": processor,
+        "compiler": compiler,
+        "bitness": bitness,
+        "thumb_mode": thumb_mode,
+        "thumb_address": thumb_address or None,
+        "enqueue": enqueue,
         "client_id": CLIENT_ID,
     }
     timeout = _request_timeout_value(request_timeout_sec, default=_daemon_operation_timeout_sec("open_binary"))
@@ -4622,11 +4933,13 @@ async def open_binary(
             request_timeout_sec=timeout,
         )
     else:
-        result = await _run_operation_with_mcp_progress(
-            ctx,
-            operation="open_binary",
-            daemon_payload=payload,
-            local_call=lambda progress_id: _local_open_binary(
+        if enqueue:
+            local_call = lambda progress_id: _queue_session_operation(
+                "open_binary",
+                {**payload, "progress_id": progress_id},
+            )
+        else:
+            local_call = lambda progress_id: _local_open_binary(
                 path=path,
                 mode=mode,
                 reuse=reuse,
@@ -4635,25 +4948,41 @@ async def open_binary(
                 analysis_timeout_sec=analysis_timeout_sec,
                 launch_timeout_sec=launch_timeout_sec,
                 backend_ready_timeout_sec=backend_ready_timeout_sec,
+                processor=processor,
+                compiler=compiler,
+                bitness=bitness,
+                thumb_mode=thumb_mode,
+                thumb_address=thumb_address or None,
                 progress_id=progress_id,
                 client_id=CLIENT_ID,
-            ),
+            )
+        result = await _run_operation_with_mcp_progress(
+            ctx,
+            operation="open_binary",
+            daemon_payload=payload,
+            local_call=local_call,
             request_timeout_sec=timeout,
         )
     return _mcp_result(result)
 
 
-@mcp.tool(description="Load an existing .i64 database in headless or GUI mode and select the resulting session. Headless loads wait for IDA autoanalysis by default and emit live phase/address/segment progress; the final response includes executable-segment tail coverage.", structured_output=False)
+@mcp.tool(description="Load an .i64 asynchronously. Optional processor, compiler, bitness, thumb_mode, and thumb_address are explicit. Poll get_operation_progress(operation_id); use enqueue=false to block.", structured_output=False)
 async def load_idb(
     ctx: Context,
     path: str,
     mode: str = "headless",
     reuse: bool = True,
     wait_for_analysis: bool = True,
-    analysis_timeout_sec: float = 120.0,
+    analysis_timeout_sec: float | None = None,
     launch_timeout_sec: float = 90.0,
     backend_ready_timeout_sec: float = 20.0,
+    processor: str | None = None,
+    compiler: str | None = None,
+    bitness: int | None = None,
+    thumb_mode: bool | None = None,
+    thumb_address: str = "",
     request_timeout_sec: float = 0.0,
+    enqueue: bool = True,
 ) -> mcp_types.CallToolResult:
     payload = {
         "path": path,
@@ -4663,6 +4992,12 @@ async def load_idb(
         "analysis_timeout_sec": analysis_timeout_sec,
         "launch_timeout_sec": launch_timeout_sec,
         "backend_ready_timeout_sec": backend_ready_timeout_sec,
+        "processor": processor,
+        "compiler": compiler,
+        "bitness": bitness,
+        "thumb_mode": thumb_mode,
+        "thumb_address": thumb_address or None,
+        "enqueue": enqueue,
         "client_id": CLIENT_ID,
     }
     timeout = _request_timeout_value(request_timeout_sec, default=_daemon_operation_timeout_sec("load_idb"))
@@ -4675,11 +5010,13 @@ async def load_idb(
             request_timeout_sec=timeout,
         )
     else:
-        result = await _run_operation_with_mcp_progress(
-            ctx,
-            operation="load_idb",
-            daemon_payload=payload,
-            local_call=lambda progress_id: _local_load_idb(
+        if enqueue:
+            local_call = lambda progress_id: _queue_session_operation(
+                "load_idb",
+                {**payload, "progress_id": progress_id},
+            )
+        else:
+            local_call = lambda progress_id: _local_load_idb(
                 path=path,
                 mode=mode,
                 reuse=reuse,
@@ -4687,9 +5024,19 @@ async def load_idb(
                 analysis_timeout_sec=analysis_timeout_sec,
                 launch_timeout_sec=launch_timeout_sec,
                 backend_ready_timeout_sec=backend_ready_timeout_sec,
+                processor=processor,
+                compiler=compiler,
+                bitness=bitness,
+                thumb_mode=thumb_mode,
+                thumb_address=thumb_address or None,
                 progress_id=progress_id,
                 client_id=CLIENT_ID,
-            ),
+            )
+        result = await _run_operation_with_mcp_progress(
+            ctx,
+            operation="load_idb",
+            daemon_payload=payload,
+            local_call=local_call,
             request_timeout_sec=timeout,
         )
     return _mcp_result(result)
@@ -4719,7 +5066,7 @@ def close_session(session_id: str, save: bool = True, force: bool = False, idb_o
     ))
 
 
-@mcp.tool(description="Keep only the most recent manager-owned headless sessions alive per agent scope by default; save and close older sessions. Set per_agent=false for a global cap. By default saved .i64 data is persisted back to the original/source-adjacent IDB path; pass output_dir only when you explicitly want an additional copy in a chosen directory.", structured_output=False)
+@mcp.tool(description="Keep the newest manager-owned headless sessions; save and close older ones. Use per_agent=false for a global cap and output_dir for an extra IDB copy.", structured_output=False)
 def prune_alive_sessions(
     keep: int = 3,
     output_dir: str = "",
@@ -4980,7 +5327,7 @@ async def write_session_tool_output(
     ))
 
 
-@mcp.tool(description="Decompile a function. Default view=compact returns the signature/body with safe boilerplate local declarations removed. Use view=header for the prototype/declarations, or view=full/detail=full for the exact Hex-Rays text. include_line_map=true returns full text with the raw address map.", structured_output=False)
+@mcp.tool(description="Decompile a function. view=compact (default) omits boilerplate; use view=header or view=full. include_line_map=true adds address mapping.", structured_output=False)
 async def decompile(addr: str, session_id: str = "", full: bool = False, detail: str = "", view: str = "compact", include_line_map: bool = False) -> mcp_types.CallToolResult:
     payload = _merge_detail_payload(None, full=full, detail=detail, addr=addr, view=view, include_line_map=include_line_map)
     if ACTIVE_BACKEND == "daemon":
@@ -4988,7 +5335,7 @@ async def decompile(addr: str, session_id: str = "", full: bool = False, detail:
     return _mcp_result(await _local_call_session_tool("decompile", payload, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Export all or filtered functions from the current IDB as one .c file. Prefer this over manually copying per-function decompile output. Can also write a paired .h with include_structs/header_path/struct_names. filter is a simple case-insensitive substring match on function name or 0x address; omit filter for full export and use max_functions to cap size. fallback must be one of: comment, none, disasm, asm.", structured_output=False)
+@mcp.tool(description="Export decompiled functions to .c, optionally .h. Use filter/max_functions to bound output; fallback is comment, none, disasm, or asm.", structured_output=False)
 async def export_decompiled_c(
     path: str = "",
     session_id: str = "",
@@ -5107,7 +5454,7 @@ async def reanalyze_function(addr: str, session_id: str = "") -> mcp_types.CallT
     return _mcp_result(await _local_call_session_tool("reanalyze_function", {"addr": addr}, session_id=session_id, client_id=CLIENT_ID))
 
 
-@mcp.tool(description="Explicit IDA analysis repair workflow: optional undefine, define instruction, create function, rename with name/new_name/function_name, apply declaration, set function options, reanalyze, then decompile. Mutates the IDB and participates in txid stale-write checks.", structured_output=False)
+@mcp.tool(description="Repair one function: optionally undefine, define, rename, declare, set options, reanalyze, and decompile. Mutates the IDB.", structured_output=False)
 async def repair_function_analysis(
     addr: str = "",
     rva: str = "",
@@ -5486,6 +5833,7 @@ def _run_daemon() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        _stop_session_operation_queue()
         stop_maintenance.set()
         manager_api.stop()
         maintenance_thread.join(timeout=2.0)
@@ -5533,6 +5881,7 @@ def main() -> None:
     try:
         mcp.run(args.transport)
     finally:
+        _stop_session_operation_queue()
         manager_api.stop()
 
 

@@ -22,6 +22,80 @@ DEFAULT_IDA_INSTALL = r"C:\Program Files\IDA Professional 9.3"
 DEFAULT_WINDOWS_USER = "USER"
 
 
+def _architecture_options(
+    *,
+    processor: str | None = None,
+    compiler: str | None = None,
+    bitness: int | None = None,
+    thumb_mode: bool | None = None,
+    thumb_address: int | str | None = None,
+) -> dict[str, Any]:
+    """Validate explicit IDA architecture settings without guessing defaults."""
+    normalized_processor = str(processor or "").strip() or None
+    normalized_compiler = str(compiler or "").strip() or None
+    if isinstance(bitness, bool) or (isinstance(bitness, float) and not bitness.is_integer()):
+        raise ValueError("bitness must be an integer: 16, 32, or 64")
+    normalized_bitness = None if bitness is None else int(bitness)
+    if normalized_bitness is not None and normalized_bitness not in {16, 32, 64}:
+        raise ValueError("bitness must be 16, 32, or 64")
+    if thumb_mode is not None and not isinstance(thumb_mode, bool):
+        raise ValueError("thumb_mode must be true or false")
+    normalized_address = None
+    if thumb_address not in (None, ""):
+        if isinstance(thumb_address, bool):
+            raise ValueError("thumb_address must be a numeric address")
+        if isinstance(thumb_address, float) and not thumb_address.is_integer():
+            raise ValueError("thumb_address must be an integer address")
+        try:
+            normalized_address = int(thumb_address, 0) if isinstance(thumb_address, str) else int(thumb_address)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("thumb_address must be a decimal or hexadecimal address") from exc
+        if normalized_address < 0:
+            raise ValueError("thumb_address must be non-negative")
+    if normalized_address is not None and thumb_mode is None:
+        raise ValueError("thumb_mode is required when thumb_address is set")
+    return {
+        "processor": normalized_processor,
+        "compiler": normalized_compiler,
+        "bitness": normalized_bitness,
+        "thumb_mode": thumb_mode,
+        "thumb_address": normalized_address,
+    }
+
+
+def _architecture_args(options: dict[str, Any]) -> list[str]:
+    args: list[str] = []
+    if options.get("processor"):
+        args.append(f"-p{options['processor']}")
+    if options.get("compiler"):
+        args.append(f"-C{options['compiler']}")
+    return args
+
+
+def _architecture_metadata(options: dict[str, Any]) -> dict[str, Any]:
+    address = options.get("thumb_address")
+    return {
+        "processor": options.get("processor"),
+        "compiler": options.get("compiler"),
+        "bitness": options.get("bitness"),
+        "thumb_mode": options.get("thumb_mode"),
+        "thumb_address": hex(address) if address is not None else None,
+    }
+
+
+def _architecture_needs_script(options: dict[str, Any]) -> bool:
+    return options.get("bitness") is not None or options.get("thumb_mode") is not None
+
+
+def _launch_handshake_timeout_sec() -> float:
+    """Bound only the PowerShell launcher handshake, never the IDA child."""
+    try:
+        value = float(os.getenv("IDA_LAUNCHER_HANDSHAKE_TIMEOUT_SEC", "20") or 20.0)
+    except (TypeError, ValueError):
+        value = 20.0
+    return max(5.0, min(60.0, value))
+
+
 def _powershell_value(command: str) -> str:
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-Command", command],
@@ -123,7 +197,7 @@ class IdaLauncher:
         removed_files = 0
         removed_dirs = 0
         errors: list[str] = []
-        file_prefixes = ("headless-", "headless-launch-", "launch-")
+        file_prefixes = ("headless-", "headless-launch-", "architecture-", "launch-")
         file_suffixes = (".py", ".log", ".stdout.log", ".stderr.log", ".idat.log")
         try:
             entries = list(self.wsl_temp.iterdir())
@@ -158,13 +232,14 @@ class IdaLauncher:
                 errors.append(f"{path}: {exc}")
         return {"removed_files": removed_files, "removed_dirs": removed_dirs, "errors": errors}
 
-    def _powershell(self, command: str) -> subprocess.CompletedProcess[str]:
+    def _powershell(self, command: str, *, timeout_sec: float | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command", command],
             capture_output=True,
             text=True,
             check=False,
             stdin=subprocess.DEVNULL,
+            timeout=timeout_sec,
         )
 
     def _reserve_headless_port(self) -> int:
@@ -272,6 +347,7 @@ class IdaLauncher:
         background: bool,
         persist: bool,
         bootstrap_root: str,
+        architecture_script: str | None,
     ) -> str:
         script_path = self.wsl_temp / f"headless-{launch_token}.py"
         log_path = self.wsl_temp / f"headless-{launch_token}.log"
@@ -297,6 +373,14 @@ class IdaLauncher:
                     "    from idea_ida_backend.runtime import IdeaIdaRuntime",
                     "    from idea_ida_backend.sync import pump_main_thread",
                     "    print('[IDEA] runtime import ok')",
+                    f"    architecture_script = {architecture_script!r}",
+                    "    if architecture_script:",
+                    "        try:",
+                    "            with open(architecture_script, 'r', encoding='utf-8') as config_file:",
+                    "                exec(compile(config_file.read(), architecture_script, 'exec'), globals(), globals())",
+                    "        except Exception as exc:",
+                    "            print('[IDEA] architecture options failed:', repr(exc))",
+                    "            raise",
                     "    runtime = IdeaIdaRuntime()",
                     "    if not runtime.running:",
                     f"        runtime.start('0.0.0.0', {port}, background={str(background)}, engine='headless', launch_token={launch_token!r})",
@@ -310,6 +394,40 @@ class IdaLauncher:
                     "    print('[IDEA] headless bootstrap failed:', repr(exc))",
                     "    traceback.print_exc()",
                     "    raise",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return to_windows_path(str(script_path))
+
+    def _write_architecture_script(self, launch_token: str, architecture: dict[str, Any]) -> str:
+        script_path = self.wsl_temp / f"architecture-{launch_token}.py"
+        script_path.write_text(
+            "\n".join(
+                [
+                    "import ida_idaapi",
+                    "import ida_segment",
+                    "import idc",
+                    f"architecture = {architecture!r}",
+                    "bitness = architecture.get('bitness')",
+                    "if bitness is not None:",
+                    "    for index in range(ida_segment.get_segm_qty()):",
+                    "        segment = ida_segment.getnseg(index)",
+                    "        if segment is not None:",
+                    "            if not idc.set_segm_addressing(segment.start_ea, {16: 0, 32: 1, 64: 2}[bitness]):",
+                    "                raise RuntimeError(f'failed to set segment bitness at {segment.start_ea:#x}')",
+                    "thumb_mode = architecture.get('thumb_mode')",
+                    "if thumb_mode is not None:",
+                    "    thumb_value = 1 if thumb_mode else 0",
+                    "    thumb_address = architecture.get('thumb_address')",
+                    "    if thumb_address is None:",
+                    "        if not idc.set_default_sreg_value(ida_idaapi.BADADDR, 'T', thumb_value):",
+                    "            raise RuntimeError('failed to set default ARM T register')",
+                    "    else:",
+                    "        if not idc.split_sreg_range(thumb_address, 'T', thumb_value):",
+                    "            raise RuntimeError(f'failed to set ARM T register at {thumb_address:#x}')",
+                    "print('[IDEA] architecture options applied:', architecture)",
                     "",
                 ]
             ),
@@ -451,7 +569,13 @@ class IdaLauncher:
             f"-PassThru {working_dir_arg}{redirect_args}{window_style}; "
             "$p.Id"
         )
-        result = self._powershell(ps)
+        try:
+            result = self._powershell(ps, timeout_sec=_launch_handshake_timeout_sec())
+        except subprocess.TimeoutExpired:
+            # The watchdog only releases the WSL manager from a stuck
+            # PowerShell wrapper.  It does not address or terminate the IDA
+            # child; the launch token/session heartbeat remains authoritative.
+            return None
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "failed to launch IDA")
         stdout = result.stdout.strip()
@@ -466,6 +590,7 @@ class IdaLauncher:
         metadata: dict[str, Any],
         manager_url: str,
         existing_idb: bool,
+        architecture: dict[str, Any],
     ) -> PendingLaunch:
         launch_token = f"launch-{uuid.uuid4().hex[:12]}"
         port = self._reserve_headless_port()
@@ -477,6 +602,9 @@ class IdaLauncher:
         headless_mode = (os.getenv("IDA_HEADLESS_MODE", "idat").strip() or "idat").lower()
         use_gui_hidden = headless_mode in {"gui", "gui-hidden", "ida", "auto"}
         idat_log_path = to_windows_path(str(self.wsl_temp / f"{launch_token}.idat.log"))
+        architecture_script = None
+        if _architecture_needs_script(architecture):
+            architecture_script = self._write_architecture_script(launch_token, architecture)
         bootstrap_path = self._write_headless_bootstrap(
             port=port,
             launch_token=launch_token,
@@ -484,8 +612,9 @@ class IdaLauncher:
             background=True,
             persist=not use_gui_hidden,
             bootstrap_root=bootstrap_root,
+            architecture_script=architecture_script,
         )
-        args: list[str] = []
+        args: list[str] = _architecture_args(architecture)
         if not existing_idb:
             args.append("-A")
         if not use_gui_hidden and not existing_idb:
@@ -519,11 +648,15 @@ class IdaLauncher:
             stdout_path=stdout_log_path,
             stderr_path=stderr_log_path,
         )
+        if pid is None:
+            metadata["launcher_handshake_timed_out"] = True
+            metadata["launcher_handshake_timeout_sec"] = _launch_handshake_timeout_sec()
         metadata["stdout_log_path"] = to_wsl_path(stdout_log_path)
         metadata["stderr_log_path"] = to_wsl_path(stderr_log_path)
         metadata["idat_log_path"] = to_wsl_path(idat_log_path)
         metadata["headless_mode"] = "gui-hidden" if use_gui_hidden else "idat"
         metadata["opened_existing_idb"] = existing_idb
+        metadata["architecture"] = _architecture_metadata(architecture)
         metadata["connect_host"] = endpoint_host
         metadata["connect_host_candidates"] = connect_hosts
         metadata["bootstrap_root"] = to_wsl_path(bootstrap_root)
@@ -538,7 +671,25 @@ class IdaLauncher:
             metadata=metadata,
         )
 
-    def launch_headless(self, binary_path: str, manager_url: str, *, allow_existing_idb: bool = True) -> PendingLaunch:
+    def launch_headless(
+        self,
+        binary_path: str,
+        manager_url: str,
+        *,
+        allow_existing_idb: bool = True,
+        processor: str | None = None,
+        compiler: str | None = None,
+        bitness: int | None = None,
+        thumb_mode: bool | None = None,
+        thumb_address: int | str | None = None,
+    ) -> PendingLaunch:
+        architecture = _architecture_options(
+            processor=processor,
+            compiler=compiler,
+            bitness=bitness,
+            thumb_mode=thumb_mode,
+            thumb_address=thumb_address,
+        )
         binary_windows, display_path, metadata = self._prepare_binary_path(
             binary_path,
             always_stage=True,
@@ -556,12 +707,30 @@ class IdaLauncher:
                 metadata=metadata,
                 manager_url=manager_url,
                 existing_idb=existing_idb,
+                architecture=architecture,
             )
         except Exception:
             self._cleanup_launch_staging(metadata)
             raise
 
-    def launch_headless_idb(self, idb_path: str, manager_url: str) -> PendingLaunch:
+    def launch_headless_idb(
+        self,
+        idb_path: str,
+        manager_url: str,
+        *,
+        processor: str | None = None,
+        compiler: str | None = None,
+        bitness: int | None = None,
+        thumb_mode: bool | None = None,
+        thumb_address: int | str | None = None,
+    ) -> PendingLaunch:
+        architecture = _architecture_options(
+            processor=processor,
+            compiler=compiler,
+            bitness=bitness,
+            thumb_mode=thumb_mode,
+            thumb_address=thumb_address,
+        )
         idb_windows, display_path, metadata = self._prepare_idb_path(idb_path, always_stage=True)
         try:
             return self._launch_headless_open_path(
@@ -571,6 +740,7 @@ class IdaLauncher:
                 metadata=metadata,
                 manager_url=manager_url,
                 existing_idb=True,
+                architecture=architecture,
             )
         except Exception:
             self._cleanup_launch_staging(metadata)
@@ -638,12 +808,35 @@ class IdaLauncher:
                 continue
         return terminated
 
-    def launch_gui(self, binary_path: str, *, allow_existing_idb: bool = True) -> PendingLaunch:
+    def launch_gui(
+        self,
+        binary_path: str,
+        *,
+        allow_existing_idb: bool = True,
+        processor: str | None = None,
+        compiler: str | None = None,
+        bitness: int | None = None,
+        thumb_mode: bool | None = None,
+        thumb_address: int | str | None = None,
+    ) -> PendingLaunch:
+        architecture = _architecture_options(
+            processor=processor,
+            compiler=compiler,
+            bitness=bitness,
+            thumb_mode=thumb_mode,
+            thumb_address=thumb_address,
+        )
         binary_windows, display_path, metadata = self._prepare_binary_path(binary_path, allow_existing_idb=allow_existing_idb)
+        launch_token = f"gui-{uuid.uuid4().hex[:12]}"
         try:
-            pid = self._start_process(self.ida_gui, [binary_windows], hidden=False)
+            args = _architecture_args(architecture)
+            if _architecture_needs_script(architecture):
+                args.append(f"-S{self._write_architecture_script(launch_token, architecture)}")
+            args.append(binary_windows)
+            metadata["architecture"] = _architecture_metadata(architecture)
+            pid = self._start_process(self.ida_gui, args, hidden=False)
             return PendingLaunch(
-                launch_token=f"gui-{uuid.uuid4().hex[:12]}",
+                launch_token=launch_token,
                 binary_path=display_path,
                 idb_path=f"{binary_windows}.i64",
                 engine="gui",
@@ -655,12 +848,34 @@ class IdaLauncher:
             self._cleanup_launch_staging(metadata)
             raise
 
-    def launch_gui_idb(self, idb_path: str) -> PendingLaunch:
+    def launch_gui_idb(
+        self,
+        idb_path: str,
+        *,
+        processor: str | None = None,
+        compiler: str | None = None,
+        bitness: int | None = None,
+        thumb_mode: bool | None = None,
+        thumb_address: int | str | None = None,
+    ) -> PendingLaunch:
+        architecture = _architecture_options(
+            processor=processor,
+            compiler=compiler,
+            bitness=bitness,
+            thumb_mode=thumb_mode,
+            thumb_address=thumb_address,
+        )
         idb_windows, display_path, metadata = self._prepare_idb_path(idb_path)
+        launch_token = f"gui-{uuid.uuid4().hex[:12]}"
         try:
-            pid = self._start_process(self.ida_gui, [idb_windows], hidden=False)
+            args = _architecture_args(architecture)
+            if _architecture_needs_script(architecture):
+                args.append(f"-S{self._write_architecture_script(launch_token, architecture)}")
+            args.append(idb_windows)
+            metadata["architecture"] = _architecture_metadata(architecture)
+            pid = self._start_process(self.ida_gui, args, hidden=False)
             return PendingLaunch(
-                launch_token=f"gui-{uuid.uuid4().hex[:12]}",
+                launch_token=launch_token,
                 binary_path=display_path,
                 idb_path=idb_windows,
                 engine="gui",

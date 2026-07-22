@@ -14,5 +14,10 @@ build/
 *.tmp
 *.bak
 
+# Local IDA analysis outputs; source code lives in the repository.
+*_headless-*.i64
+ida_live_exports/
+idb/
+
 .DS_Store
 Thumbs.db
