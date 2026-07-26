@@ -279,10 +279,9 @@ class SessionRegistry:
         finally:
             with self._lock:
                 current = self._sessions.get(session_id)
-                if current is None:
-                    return
-                current.active_ops = max(0, int(current.active_ops) - 1)
-                current.last_seen = utc_now()
+                if current is not None:
+                    current.active_ops = max(0, int(current.active_ops) - 1)
+                    current.last_seen = utc_now()
 
     @contextmanager
     def acquire_write_lock(self, session_id: str):

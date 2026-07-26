@@ -14,6 +14,7 @@ class NativeToolServer:
     def __init__(self) -> None:
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._tool_lock = threading.Lock()
         self._running = False
 
     def start(self, host: str, port: int) -> None:
@@ -22,11 +23,14 @@ class NativeToolServer:
         class Handler(BaseHTTPRequestHandler):
             def _json(self, status: int, payload: dict[str, Any]) -> None:
                 body = json.dumps(payload).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                    pass
 
             def do_GET(self) -> None:
                 if self.path == "/healthz":
@@ -71,11 +75,16 @@ class NativeToolServer:
 
                 tool_name = str(payload.get("tool_name") or "")
                 arguments = payload.get("arguments")
+                if not server._tool_lock.acquire(blocking=False):
+                    self._json(409, {"ok": False, "error": "backend_busy"})
+                    return
                 try:
                     result = call_tool(tool_name, arguments)
                 except Exception as exc:
                     self._json(500, {"ok": False, "error": str(exc)})
                     return
+                finally:
+                    server._tool_lock.release()
                 self._json(200, {"ok": True, "result": result})
 
             def log_message(self, format: str, *args) -> None:

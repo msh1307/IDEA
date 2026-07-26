@@ -20,6 +20,7 @@ from .pathing import normalize_path, to_windows_path, to_wsl_path
 
 DEFAULT_IDA_INSTALL = r"C:\Program Files\IDA Professional 9.3"
 DEFAULT_WINDOWS_USER = "USER"
+STAGE_METADATA_NAME = ".ida-hybrid-session.json"
 
 
 def _architecture_options(
@@ -159,6 +160,13 @@ def _default_wsl_temp(windows_temp: str) -> str:
     return to_wsl_path(windows_temp)
 
 
+def _default_stage_root(wsl_temp: Path) -> Path:
+    env = os.getenv("IDA_MCP_STAGE_ROOT", "").strip()
+    if not env:
+        return wsl_temp / "staged"
+    return Path(normalize_path(env).wsl_path)
+
+
 def pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("0.0.0.0", 0))
@@ -174,11 +182,49 @@ class IdaLauncher:
         self.plugin_root = _default_plugin_root()
         self.wsl_temp = Path(_default_wsl_temp(_default_windows_temp()))
         self.wsl_temp.mkdir(parents=True, exist_ok=True)
-        self.stage_root = self.wsl_temp / "staged"
+        self.stage_root = _default_stage_root(self.wsl_temp)
         self.stage_root.mkdir(parents=True, exist_ok=True)
         self.overlay_root = self.wsl_temp / "overlay"
         self.overlay_root.mkdir(parents=True, exist_ok=True)
         self.cleanup_stale_temp()
+
+    def _stage_roots(self) -> list[Path]:
+        roots = [self.stage_root, self.wsl_temp / "staged"]
+        return list(dict.fromkeys(root.resolve() for root in roots))
+
+    def is_managed_staged_dir(self, path: Path) -> bool:
+        resolved = path.resolve()
+        if not re.fullmatch(r"[0-9a-f]{12}", resolved.name, re.IGNORECASE):
+            return False
+        return any(resolved.parent == root for root in self._stage_roots())
+
+    def _write_stage_metadata(self, staged_dir: Path, metadata: dict[str, Any]) -> None:
+        path = staged_dir / STAGE_METADATA_NAME
+        temp = staged_dir / f"{STAGE_METADATA_NAME}.tmp"
+        temp.write_text(json.dumps(metadata, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        temp.chmod(0o600)
+        os.replace(temp, path)
+
+    def recover_staged_metadata(self, idb_path: str) -> dict[str, Any]:
+        try:
+            staged_idb = Path(normalize_path(idb_path).wsl_path)
+        except (TypeError, ValueError):
+            return {}
+        staged_dir = staged_idb.parent
+        if not self.is_managed_staged_dir(staged_dir):
+            return {}
+        try:
+            payload = json.loads((staged_dir / STAGE_METADATA_NAME).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict) or not (
+            payload.get("source_wsl_path") or payload.get("source_idb_wsl_path")
+        ):
+            return {}
+        metadata = dict(payload)
+        metadata["staged_dir"] = str(staged_dir)
+        metadata["staged_idb_path"] = str(staged_idb)
+        return metadata
 
     def cleanup_stale_temp(self, max_age_sec: int | None = None) -> dict[str, Any]:
         """Remove only old manager-generated staging/log entries.
@@ -215,16 +261,17 @@ class IdaLauncher:
                 removed_files += 1
             except OSError as exc:
                 errors.append(f"{path}: {exc}")
-        try:
-            staged_entries = list(self.stage_root.iterdir())
-        except OSError as exc:
-            staged_entries = []
-            errors.append(f"{self.stage_root}: {exc}")
-        for path in staged_entries:
-            if not path.is_dir() or not re.fullmatch(r"[0-9a-f]{12}", path.name, re.IGNORECASE):
-                continue
+        staged_entries: list[Path] = []
+        for root in self._stage_roots():
             try:
-                if path.stat().st_mtime >= cutoff:
+                staged_entries.extend(root.iterdir())
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                errors.append(f"{root}: {exc}")
+        for path in staged_entries:
+            try:
+                if not path.is_dir() or not self.is_managed_staged_dir(path) or path.stat().st_mtime >= cutoff:
                     continue
                 if self.cleanup_staged_dir(str(path)):
                     removed_dirs += 1
@@ -335,6 +382,7 @@ class IdaLauncher:
                 "staging_root": str(self.overlay_root),
                 "staged_package_exists": (self.overlay_root / "idea_ida_backend").is_dir(),
             },
+            "session_stage_root": str(self.stage_root),
             "notes": notes,
         }
 
@@ -483,6 +531,11 @@ class IdaLauncher:
             "staged_from_existing_idb": allow_existing_idb and source_idb_exists,
         }
         metadata.update(source_metadata)
+        try:
+            self._write_stage_metadata(staged_dir, metadata)
+        except Exception:
+            shutil.rmtree(staged_dir, ignore_errors=True)
+            raise
         return to_windows_path(str(staged_path)), display_path, metadata
 
     def _prepare_idb_path(
@@ -530,6 +583,11 @@ class IdaLauncher:
             "staged_idb_path": str(staged_idb),
         }
         metadata.update(source_metadata)
+        try:
+            self._write_stage_metadata(staged_dir, metadata)
+        except Exception:
+            shutil.rmtree(staged_dir, ignore_errors=True)
+            raise
         return to_windows_path(str(staged_idb)), normalized.input_path, metadata
 
     def _start_process(
@@ -942,6 +1000,8 @@ class IdaLauncher:
         if not staged_dir:
             return False
         path = Path(staged_dir)
+        if not self.is_managed_staged_dir(path):
+            raise ValueError(f"Refusing to remove a directory outside managed staging roots: {path}")
         if not path.exists():
             return False
         def _retry_readonly(func, target, exc_info):

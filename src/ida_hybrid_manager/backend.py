@@ -17,6 +17,10 @@ class BackendUnavailableError(BackendError):
     pass
 
 
+class BackendTimeoutError(BackendError):
+    pass
+
+
 class BackendToolError(BackendError):
     pass
 
@@ -98,7 +102,13 @@ async def call_backend_tool(
                 response = json.loads(body) if body else {}
             except Exception:
                 response = {"ok": False, "error": str(exc)}
-        except (error.URLError, TimeoutError, OSError) as exc:
+        except TimeoutError as exc:
+            raise BackendTimeoutError(f"Backend tool {name} exceeded {timeout_sec:g}s") from exc
+        except error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise BackendTimeoutError(f"Backend tool {name} exceeded {timeout_sec:g}s") from exc
+            raise BackendUnavailableError(str(exc)) from exc
+        except OSError as exc:
             raise BackendUnavailableError(str(exc)) from exc
         if not response.get("ok"):
             raise BackendToolError(response.get("error") or f"native backend call failed: {name}")
@@ -140,6 +150,10 @@ async def call_backend_tool_any(
     for endpoint in endpoints:
         try:
             return await call_backend_tool(endpoint, name, arguments, timeout_sec=timeout_sec)
+        except BackendTimeoutError:
+            # A timed-out IDA call may still be finishing on IDA's main
+            # thread. Trying another host alias would submit it twice.
+            raise
         except BackendToolError:
             raise
         except Exception as exc:

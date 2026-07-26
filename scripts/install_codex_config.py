@@ -113,23 +113,25 @@ def discover_windows_user() -> str:
     return "USER"
 
 
-def render_env_inline_table(host: str, ida_install_root: str) -> str:
-    return "{ " + ", ".join(
-        [
-            f"IDA_MCP_CONNECT_HOST = {_toml_basic_string(host)}",
-            f"IDA_INSTALL_ROOT = {_toml_literal_string(ida_install_root)}",
-        ]
-    ) + " }"
+def render_env_inline_table(host: str, ida_install_root: str, stage_root: str = "", profile: str = "lite") -> str:
+    values = [
+        f"IDA_MCP_CONNECT_HOST = {_toml_basic_string(host)}",
+        f"IDA_INSTALL_ROOT = {_toml_literal_string(ida_install_root)}",
+        f"IDA_MCP_PROFILE = {_toml_basic_string(profile)}",
+    ]
+    if stage_root:
+        values.append(f"IDA_MCP_STAGE_ROOT = {_toml_literal_string(stage_root)}")
+    return "{ " + ", ".join(values) + " }"
 
 
-def render_wsl_server_block(repo_root: Path, host: str, ida_install_root: str) -> str:
+def render_wsl_server_block(repo_root: Path, host: str, ida_install_root: str, stage_root: str = "", profile: str = "lite") -> str:
     return "\n".join(
         [
             f"[{SECTION_NAME}]",
             f'command = "{repo_root}/.venv/bin/python"',
             'args = ["-m", "ida_hybrid_manager.server", "--transport", "stdio"]',
             f'cwd = "{repo_root}"',
-            f"env = {render_env_inline_table(host, ida_install_root)}",
+            f"env = {render_env_inline_table(host, ida_install_root, stage_root, profile)}",
             "startup_timeout_sec = 90.0",
             "tool_timeout_sec = 120.0",
             "",
@@ -137,7 +139,7 @@ def render_wsl_server_block(repo_root: Path, host: str, ida_install_root: str) -
     )
 
 
-def render_windows_server_block(repo_root: Path, host: str, ida_install_root: str) -> str:
+def render_windows_server_block(repo_root: Path, host: str, ida_install_root: str, stage_root: str = "", profile: str = "lite") -> str:
     distro = os.getenv("IDA_WSL_DISTRO", "Ubuntu-24.04").strip() or "Ubuntu-24.04"
     args = [
         "-d",
@@ -147,12 +149,11 @@ def render_windows_server_block(repo_root: Path, host: str, ida_install_root: st
         "env",
         f"IDA_MCP_CONNECT_HOST={host}",
         f"IDA_INSTALL_ROOT={ida_install_root}",
-        "./.venv/bin/python",
-        "-m",
-        "ida_hybrid_manager.server",
-        "--transport",
-        "stdio",
+        f"IDA_MCP_PROFILE={profile}",
     ]
+    if stage_root:
+        args.append(f"IDA_MCP_STAGE_ROOT={stage_root}")
+    args.extend(["./.venv/bin/python", "-m", "ida_hybrid_manager.server", "--transport", "stdio"])
     rendered_args = "[" + ", ".join(_toml_basic_string(arg) for arg in args) + "]"
     return "\n".join(
         [
@@ -189,10 +190,14 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     host = discover_windows_host()
     ida_install_root = discover_ida_install_root()
+    stage_root = os.getenv("IDA_MCP_STAGE_ROOT", "").strip()
+    profile = os.getenv("IDA_MCP_PROFILE", "lite").strip().lower() or "lite"
+    if profile not in {"full", "lite"}:
+        raise ValueError("IDA_MCP_PROFILE must be full or lite")
     windows_user = discover_windows_user()
     targets = [
-        (Path.home() / ".codex" / "config.toml", render_wsl_server_block(repo_root, host, ida_install_root)),
-        (Path(f"/mnt/c/Users/{windows_user}/.codex/config.toml"), render_windows_server_block(repo_root, host, ida_install_root)),
+        (Path.home() / ".codex" / "config.toml", render_wsl_server_block(repo_root, host, ida_install_root, stage_root, profile)),
+        (Path(f"/mnt/c/Users/{windows_user}/.codex/config.toml"), render_windows_server_block(repo_root, host, ida_install_root, stage_root, profile)),
     ]
 
     print(f"detected Windows host: {host}")

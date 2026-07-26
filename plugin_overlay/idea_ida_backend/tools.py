@@ -11,11 +11,13 @@ from typing import Any, Callable
 
 import ida_auto
 import ida_bytes
+import ida_dbg
 import ida_frame
 import ida_funcs
 import ida_hexrays
 import ida_ida
 import ida_idaapi
+import ida_idd
 import ida_kernwin
 import ida_lines
 import ida_loader
@@ -278,6 +280,40 @@ def _detail_is_full(arguments: dict[str, Any] | None, default: str = "slim") -> 
 
 def _pick_fields(entry: dict[str, Any], fields: list[str]) -> dict[str, Any]:
     return {field: entry[field] for field in fields if field in entry}
+
+
+def _address_cursor(arguments: dict[str, Any], offset: int) -> tuple[Any, int]:
+    raw = arguments.get("cursor", arguments.get("start"))
+    if isinstance(raw, dict) and "next" in raw:
+        raw = raw.get("next")
+    if isinstance(raw, dict):
+        return raw.get("ea"), max(0, int(raw.get("skip", 0)))
+    return raw, 0 if raw not in (None, "") else offset
+
+
+def _next_address_cursor(ea: int, skip: int = 0) -> dict[str, Any]:
+    state: dict[str, Any] = {"ea": _hex(ea)}
+    if skip:
+        state["skip"] = skip
+    return {"next": state}
+
+
+def _index_cursor(arguments: dict[str, Any], offset: int) -> tuple[int, int]:
+    raw = arguments.get("cursor")
+    if isinstance(raw, dict) and "next" in raw:
+        raw = raw.get("next")
+    if isinstance(raw, dict):
+        return max(0, int(raw.get("index", 0))), max(0, int(raw.get("skip", 0)))
+    if raw not in (None, ""):
+        return max(0, int(raw)), 0
+    return 0, offset
+
+
+def _next_index_cursor(index: int, skip: int = 0) -> dict[str, Any]:
+    state: dict[str, Any] = {"index": max(0, int(index))}
+    if skip:
+        state["skip"] = skip
+    return {"next": state}
 
 
 _AUTO_PAD_RE = re.compile(r"^__pad_[0-9A-Fa-f]+(?:_[0-9A-Fa-f]+)?$")
@@ -1658,6 +1694,334 @@ def get_metadata(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
+_REPLAY_PAGE_SIZE = 0x1000
+
+
+def _replay_architecture() -> dict[str, Any]:
+    procname = str(getattr(ida_ida, "inf_get_procname", lambda: "")() or "").strip().lower()
+    bits = 64 if ida_ida.inf_is_64bit() else 32
+    if "aarch64" in procname or "arm64" in procname or (procname.startswith("arm") and bits == 64):
+        name = "arm64"
+    elif procname.startswith("arm"):
+        name = "arm"
+    elif "ppc" in procname or "powerpc" in procname:
+        name = "ppc"
+    elif procname in {"metapc", "x86", "x86-16", "x86-32", "x86-64", "i386", "i686", "amd64"} or procname.startswith("x86"):
+        name = "x86"
+    else:
+        name = "unsupported"
+    try:
+        big_endian = bool(ida_ida.inf_is_be())
+    except Exception:
+        big_endian = False
+    return {
+        "name": name,
+        "bits": bits,
+        "endian": "big" if big_endian else "little",
+        "processor": procname,
+    }
+
+
+def _replay_default_abi(architecture: dict[str, Any]) -> str:
+    if architecture.get("name") != "x86":
+        return "default"
+    try:
+        file_type = str(idaapi.get_file_type_name() or "").lower()
+    except Exception:
+        file_type = ""
+    windows = "pe" in file_type or "portable executable" in file_type
+    if architecture.get("bits") == 64:
+        return "win64" if windows else "sysv64"
+    return "win32" if windows else "sysv"
+
+
+def _replay_debug_state() -> tuple[bool, int | None, dict[str, int], int | None]:
+    try:
+        debugger = ida_idd.get_dbg()
+        ip = ida_dbg.get_ip_val()
+        if debugger is None or ip is None:
+            return False, None, {}, None
+        process_state = getattr(ida_dbg, "get_process_state", None)
+        suspended_state = getattr(ida_dbg, "DSTATE_SUSP", None)
+        if callable(process_state) and suspended_state is not None:
+            try:
+                if int(process_state()) != int(suspended_state):
+                    return False, None, {}, None
+            except Exception:
+                return False, None, {}, None
+        if int(ip) == int(getattr(idaapi, "BADADDR", -1)):
+            return False, None, {}, None
+        thread_id = ida_dbg.get_current_thread()
+        values = ida_dbg.get_reg_vals(thread_id)
+        registers: dict[str, int] = {}
+        for index, value in enumerate(values):
+            try:
+                info = debugger.regs(index)
+                parsed = value.pyval(info.dtype)
+                if isinstance(parsed, int):
+                    registers[str(info.name).upper()] = int(parsed)
+            except Exception:
+                continue
+        return True, int(ip), registers, int(thread_id)
+    except Exception:
+        return False, None, {}, None
+
+
+def _replay_wait_debug_state(timeout_ms: int = 5000, target_ip: int | None = None) -> tuple[bool, int | None, dict[str, int], int | None]:
+    deadline = time.monotonic() + max(0.1, min(int(timeout_ms), 30_000) / 1000.0)
+    wait_for_event = getattr(idaapi, "wait_for_next_event", None)
+    flags = int(getattr(idaapi, "WFNE_SUSP", 0)) | int(getattr(idaapi, "WFNE_CONT", 0))
+    while True:
+        state = _replay_debug_state()
+        if state[0] and (target_ip is None or state[1] == target_ip):
+            return state
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return (False, None, {}, None) if target_ip is not None else state
+        wait_ms = max(1, min(int(remaining * 1000), 100))
+        try:
+            if callable(wait_for_event) and flags:
+                wait_for_event(flags, wait_ms)
+            else:
+                time.sleep(wait_ms / 1000.0)
+        except Exception:
+            time.sleep(wait_ms / 1000.0)
+
+
+def _replay_read_page(page: int, *, live: bool) -> bytes | None:
+    if live:
+        try:
+            data = idaapi.dbg_read_memory(page, _REPLAY_PAGE_SIZE)
+            if data and len(data) == _REPLAY_PAGE_SIZE:
+                return bytes(data)
+        except Exception:
+            pass
+        return None
+    try:
+        data = ida_bytes.get_bytes(page, _REPLAY_PAGE_SIZE)
+        return bytes(data) if data and len(data) == _REPLAY_PAGE_SIZE else None
+    except Exception:
+        return None
+
+
+def _replay_collect_functions(func, depth: int, limit: int, head_limit: int) -> tuple[list[Any], int, bool]:
+    selected = [func]
+    seen = {int(func.start_ea)}
+    frontier = [func]
+    scanned = 0
+    for _ in range(max(0, depth)):
+        next_frontier: list[Any] = []
+        for current in frontier:
+            try:
+                heads = idautils.Heads(current.start_ea, current.end_ea)
+            except Exception:
+                heads = []
+            for head in heads:
+                if scanned >= head_limit:
+                    return selected, scanned, True
+                scanned += 1
+                try:
+                    targets = idautils.CodeRefsFrom(head, 0)
+                except Exception:
+                    targets = []
+                for target in targets:
+                    callee = idaapi.get_func(target)
+                    if callee is None or int(callee.start_ea) in seen:
+                        continue
+                    seen.add(int(callee.start_ea))
+                    selected.append(callee)
+                    next_frontier.append(callee)
+                    if len(selected) >= limit:
+                        return selected, scanned, False
+        frontier = next_frontier
+        if not frontier:
+            break
+    return selected, scanned, False
+
+
+@idasync
+def capture_function_context(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Capture a bounded function execution seed from IDB or a stopped debugger."""
+    arguments = arguments or {}
+    entry = _resolve_target_ea(arguments)
+    func = idaapi.get_func(entry)
+    if func is None:
+        raise ValueError(f"No function found at {_hex(entry)}")
+    requested_mode = str(arguments.get("mode") or "auto").strip().lower()
+    if requested_mode not in {"auto", "live", "static"}:
+        raise ValueError("mode must be auto, live, or static")
+    live, current_ip, registers, thread_id = _replay_debug_state()
+    debug_wait_ms = int(arguments.get("debug_wait_ms", 5000))
+    if not live and requested_mode != "static" and bool(arguments.get("start_process", False)):
+        if idaapi.start_process("", "", "") != 1:
+            raise RuntimeError("Unable to start the IDA debugger process")
+        live, current_ip, registers, thread_id = _replay_wait_debug_state(debug_wait_ms)
+        if not live:
+            raise RuntimeError("Debugger process did not reach a stopped state")
+    if requested_mode == "live" and not live:
+        raise RuntimeError("A stopped IDA debugger is required for mode=live")
+    if live and requested_mode != "static" and bool(arguments.get("run_to", True)) and current_ip != entry:
+        if not idaapi.run_to(entry):
+            if requested_mode == "live":
+                raise RuntimeError(f"Unable to run debugger to {_hex(entry)}")
+            live = False
+            registers = {}
+            thread_id = None
+        else:
+            live, current_ip, registers, thread_id = _replay_wait_debug_state(debug_wait_ms, target_ip=entry)
+            if not live or current_ip != entry:
+                raise RuntimeError(f"Debugger did not stop at {_hex(entry)}")
+    if requested_mode == "live" and not live:
+        raise RuntimeError("Debugger is not stopped")
+    mode = "live" if live and requested_mode != "static" else "static"
+    if mode == "static":
+        registers = {
+            str(name).upper(): _parse_int_like(value, f"register {name}")
+            for name, value in (arguments.get("registers") or {}).items()
+        } if isinstance(arguments.get("registers"), dict) else {}
+
+    architecture = _replay_architecture()
+    if architecture["name"] == "arm":
+        try:
+            architecture["mode"] = "thumb" if int(idc.get_sreg(entry, "T")) == 1 else "arm"
+        except Exception:
+            architecture["mode"] = "arm"
+    max_capture_bytes = max(0x1000, min(int(arguments.get("max_capture_bytes", 8 * 1024 * 1024)), 16 * 1024 * 1024))
+    callee_depth = max(0, min(int(arguments.get("callee_depth", 1)), 3))
+    function_limit = max(1, min(int(arguments.get("function_limit", 16)), 64))
+    head_limit = max(1, min(int(arguments.get("head_limit", 100_000)), 1_000_000))
+    regions_only = bool(arguments.get("regions_only", False))
+    if regions_only:
+        selected, call_heads_scanned, call_scan_truncated = [func], 0, False
+    else:
+        selected, call_heads_scanned, call_scan_truncated = _replay_collect_functions(
+            func,
+            callee_depth,
+            function_limit,
+            head_limit,
+        )
+    memory: list[dict[str, Any]] = []
+    seen_pages: set[int] = set()
+    missing: list[str] = []
+    missing_pages: set[int] = set()
+    captured_bytes = 0
+    capture_truncated = False
+
+    def capture_range(start: int, end: int, label: str, perm: str) -> None:
+        nonlocal captured_bytes, capture_truncated
+        first = start & ~(_REPLAY_PAGE_SIZE - 1)
+        last = (max(start, end) + _REPLAY_PAGE_SIZE - 1) & ~(_REPLAY_PAGE_SIZE - 1)
+        for page in range(first, last, _REPLAY_PAGE_SIZE):
+            if page in seen_pages:
+                continue
+            if captured_bytes + _REPLAY_PAGE_SIZE > max_capture_bytes:
+                capture_truncated = True
+                if page not in missing_pages:
+                    missing_pages.add(page)
+                    if len(missing) < 256:
+                        missing.append(f"0x{page:X}")
+                return
+            data = _replay_read_page(page, live=mode == "live")
+            if data is None:
+                if page not in missing_pages:
+                    missing_pages.add(page)
+                    if len(missing) < 256:
+                        missing.append(f"0x{page:X}")
+                continue
+            seen_pages.add(page)
+            captured_bytes += len(data)
+            memory.append({"start": _hex(page), "data": data.hex(), "perm": perm, "label": label})
+
+    if not regions_only:
+        for selected_func in selected:
+            capture_range(int(selected_func.start_ea), int(selected_func.end_ea), "code", "rx")
+
+    requested_regions = arguments.get("regions")
+    if isinstance(requested_regions, list):
+        for region in requested_regions[:256]:
+            if not isinstance(region, dict):
+                continue
+            try:
+                region_start = _parse_ea(region.get("addr", region.get("start")))
+                region_size = max(1, min(int(region.get("size", 0)), max_capture_bytes))
+            except (TypeError, ValueError):
+                continue
+            capture_range(
+                region_start,
+                region_start + region_size,
+                str(region.get("label") or "requested"),
+                str(region.get("perm") or "rw"),
+            )
+
+    stack_pointer = None
+    for name in ("RSP", "ESP", "SP", "R1"):
+        if name in registers:
+            stack_pointer = int(registers[name])
+            break
+    if not regions_only and mode == "live" and stack_pointer is not None:
+        stack_before = max(0, int(arguments.get("stack_before", 0x4000)))
+        stack_after = max(0, int(arguments.get("stack_after", 0x8000)))
+        capture_range(stack_pointer - stack_before, stack_pointer + stack_after, "stack", "rw")
+
+    data_heads_scanned = 0
+    if not regions_only and captured_bytes < max_capture_bytes:
+        for selected_func in selected:
+            try:
+                heads = idautils.Heads(selected_func.start_ea, selected_func.end_ea)
+                for head in heads:
+                    if data_heads_scanned >= head_limit or captured_bytes >= max_capture_bytes:
+                        capture_truncated = True
+                        break
+                    data_heads_scanned += 1
+                    for target in idautils.DataRefsFrom(head):
+                        if _is_mapped_ea(target):
+                            capture_range(int(target), int(target) + _REPLAY_PAGE_SIZE, "data", "rw")
+                if data_heads_scanned >= head_limit or captured_bytes >= max_capture_bytes:
+                    break
+            except Exception:
+                continue
+
+    if current_ip is not None and mode == "live":
+        pc_name = "RIP" if architecture["name"] == "x86" and architecture["bits"] == 64 else "EIP" if architecture["name"] == "x86" else "PC"
+        registers.setdefault(pc_name, int(current_ip))
+    return {
+        "ok": True,
+        "source": mode,
+        "entry": _hex(entry),
+        "function": {"start": _hex(int(func.start_ea)), "end": _hex(int(func.end_ea)), "name": _name_at(func.start_ea)},
+        "architecture": architecture,
+        "abi": str(arguments.get("abi") or _replay_default_abi(architecture)),
+        "registers": registers,
+        "thread_id": thread_id,
+        "memory": memory,
+        "captured_bytes": captured_bytes,
+        "missing_pages": missing,
+        "regions": [
+            {
+                "start": item["start"],
+                "size": len(bytes.fromhex(item["data"])),
+                "label": item.get("label", ""),
+                "perm": item.get("perm", ""),
+            }
+            for item in memory
+        ],
+        "callee_count": len(selected),
+        "truncated": capture_truncated or call_scan_truncated,
+        "limits": {
+            "max_capture_bytes": max_capture_bytes,
+            "callee_depth": callee_depth,
+            "function_limit": function_limit,
+            "head_limit": head_limit,
+        },
+        "scan": {
+            "call_heads": call_heads_scanned,
+            "data_heads": data_heads_scanned,
+            "truncated": call_scan_truncated or data_heads_scanned >= head_limit,
+        },
+        "replay_warning": "External calls and OS state are not restored; missing pages are reported." if missing else "External calls and OS state are not restored.",
+    }
+
+
 @idasync
 def inspect(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
@@ -1716,13 +2080,24 @@ def list_segments(arguments: dict[str, Any] | None = None) -> list[dict[str, Any
 def list_globals(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
     offset = max(0, int(arguments.get("offset", 0)))
-    count = max(0, int(arguments.get("count", 100)))
+    count = max(1, min(int(arguments.get("count", 100) or 100), 10000))
+    scan_limit = max(1, min(int(arguments.get("scan_limit", 10000)), 100000))
     filt = str(arguments.get("filter", "") or "").lower()
-    items = []
-    for ea, name in idautils.Names():
+    index, skip_remaining = _index_cursor(arguments, offset)
+    size = ida_name.get_nlist_size()
+    items: list[dict[str, Any]] = []
+    scanned = 0
+    while index < size and scanned < scan_limit and len(items) < count:
+        ea = ida_name.get_nlist_ea(index)
+        name = ida_name.get_nlist_name(index) or ""
+        index += 1
+        scanned += 1
         if not name or idaapi.get_func(ea) is not None:
             continue
         if filt and filt not in name.lower() and filt not in _hex(ea).lower():
+            continue
+        if skip_remaining:
+            skip_remaining -= 1
             continue
         items.append(
             {
@@ -1733,9 +2108,17 @@ def list_globals(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
                 "size": ida_bytes.get_item_size(ea),
             }
         )
-    total = len(items)
-    sliced = items[offset:] if count == 0 else items[offset : offset + count]
-    return {"items": sliced, "offset": offset, "count": count, "total": total}
+    complete = index >= size
+    return {
+        "items": items,
+        "offset": offset,
+        "count": len(items),
+        "total": None,
+        "total_is_exact": False,
+        "truncated": not complete,
+        "cursor": {"done": True} if complete else _next_index_cursor(index, skip_remaining),
+        "scan_limit": scan_limit,
+    }
 
 
 @idasync
@@ -1928,12 +2311,10 @@ def _segment_analysis_tail(seg) -> dict[str, Any]:
 
     last_function_start = None
     last_function_end = None
-    for function_ea in idautils.Functions(start_ea, end_ea):
-        func = ida_funcs.get_func(function_ea)
-        if func is None:
-            continue
-        last_function_start = int(func.start_ea)
-        last_function_end = min(end_ea, int(func.end_ea))
+    last_func = ida_funcs.get_prev_func(end_ea)
+    if last_func is not None and int(last_func.start_ea) >= start_ea:
+        last_function_start = int(last_func.start_ea)
+        last_function_end = min(end_ea, int(last_func.end_ea))
 
     permissions = int(getattr(seg, "perm", 0))
     executable = bool(permissions & int(getattr(ida_segment, "SEGPERM_EXEC", 0)))
@@ -2075,7 +2456,7 @@ def _analysis_status_payload(*, include_coverage: bool = False) -> dict[str, Any
         "current": current,
         "pending_queue_count": len(pending_queues),
         "pending_queues": pending_queues,
-        "function_total": sum(1 for _ in idautils.Functions()),
+        "function_total": int(ida_funcs.get_func_qty()),
     }
     if include_coverage:
         payload["executable_segments"] = _executable_segment_analysis_tails()
@@ -2167,37 +2548,48 @@ def wait_for_autoanalysis(arguments: dict[str, Any] | None = None) -> dict[str, 
 def list_functions(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
     offset = max(0, int(arguments.get("offset", 0)))
-    count = max(0, int(arguments.get("count", 100)))
+    count = max(1, min(int(arguments.get("count", 100) or 100), 10000))
+    scan_limit = max(1, min(int(arguments.get("scan_limit", 10000)), 100000))
     filt = str(arguments.get("filter", "") or "").lower()
     include_extern = bool(arguments.get("include_extern", False))
     include_thunks = bool(arguments.get("include_thunks", False))
-    functions = []
-    for ea in idautils.Functions():
+    raw_cursor, skip_remaining = _address_cursor(arguments, offset)
+    start_ea = _parse_ea(raw_cursor) if raw_cursor not in (None, "") else ida_ida.inf_get_min_ea()
+    max_ea = ida_ida.inf_get_max_ea()
+    functions: list[dict[str, Any]] = []
+    scanned = 0
+    next_ea = ida_idaapi.BADADDR
+    for ea in idautils.Functions(start_ea, max_ea):
         func = idaapi.get_func(ea)
         if func is None:
             continue
+        following = ida_funcs.get_next_func(int(func.start_ea))
+        next_ea = int(following.start_ea) if following is not None else ida_idaapi.BADADDR
+        scanned += 1
         item = _function_summary(func)
-        if not include_extern and item["segment"].lower() == "extern":
-            continue
         flags = idc.get_func_flags(func.start_ea)
-        if not include_thunks and flags != -1 and (flags & idc.FUNC_THUNK):
-            continue
-        if filt and filt not in item["name"].lower() and filt not in item["address"].lower():
-            continue
-        functions.append(item)
-    functions.sort(key=lambda item: (item["segment"].lower() == "extern", item["address"]))
-    total = len(functions)
-    if count == 0:
-        sliced = functions[offset:]
-    else:
-        sliced = functions[offset : offset + count]
+        matched = include_extern or item["segment"].lower() != "extern"
+        matched = matched and (include_thunks or flags == -1 or not (flags & idc.FUNC_THUNK))
+        matched = matched and (not filt or filt in item["name"].lower() or filt in item["address"].lower())
+        if matched:
+            if skip_remaining:
+                skip_remaining -= 1
+            else:
+                functions.append(item)
+        if scanned >= scan_limit or len(functions) >= count:
+            break
+    complete = next_ea == ida_idaapi.BADADDR
     return {
-        "items": sliced,
+        "items": functions,
         "offset": offset,
-        "count": count,
-        "total": total,
+        "count": len(functions),
+        "total": int(ida_funcs.get_func_qty()) if include_extern and include_thunks and not filt else None,
+        "total_is_exact": bool(include_extern and include_thunks and not filt),
         "include_extern": include_extern,
         "include_thunks": include_thunks,
+        "truncated": not complete,
+        "cursor": {"done": True} if complete else _next_address_cursor(next_ea, skip_remaining),
+        "scan_limit": scan_limit,
     }
 
 
@@ -3107,27 +3499,46 @@ def list_strings(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
     full = _detail_is_full(arguments)
     offset = max(0, int(arguments.get("offset", 0)))
-    count = max(0, int(arguments.get("count", 100)))
+    count = max(1, min(int(arguments.get("count", 100) or 100), 10000))
+    scan_limit = max(1, min(int(arguments.get("scan_limit", 10000)), 100000))
     filt = str(arguments.get("filter", "") or "").lower()
-    strings = idautils.Strings()
-    items = []
-    for string in strings:
-        value = str(string)
-        if filt and filt not in value.lower():
-            continue
-        item = {
-            "address": _hex(string.ea),
-            "length": int(string.length),
-            "type": int(string.strtype),
-            "value": value,
-        }
-        items.append(item if full else _pick_fields(item, ["address", "value"]))
-    total = len(items)
-    if count == 0:
-        sliced = items[offset:]
-    else:
-        sliced = items[offset : offset + count]
-    return {"items": sliced, "offset": offset, "count": len(sliced), "total": total}
+    raw_cursor, skip_remaining = _address_cursor(arguments, offset)
+    current = _parse_ea(raw_cursor) if raw_cursor not in (None, "") else ida_ida.inf_get_min_ea()
+    max_ea = ida_ida.inf_get_max_ea()
+    items: list[dict[str, Any]] = []
+    scanned = 0
+    while current != ida_idaapi.BADADDR and current < max_ea and scanned < scan_limit and len(items) < count:
+        next_ea = ida_bytes.next_head(current, max_ea)
+        scanned += 1
+        flags = ida_bytes.get_flags(current)
+        if ida_bytes.is_strlit(flags):
+            strtype = idc.get_str_type(current)
+            raw = idc.get_strlit_contents(current, -1, strtype)
+            value = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw or "")
+            if value and (not filt or filt in value.lower()):
+                if skip_remaining:
+                    skip_remaining -= 1
+                else:
+                    item = {
+                        "address": _hex(current),
+                        "length": len(value),
+                        "type": int(strtype),
+                        "value": value,
+                    }
+                    items.append(item if full else _pick_fields(item, ["address", "value"]))
+        if next_ea == ida_idaapi.BADADDR or next_ea <= current:
+            current = ida_idaapi.BADADDR
+            break
+        current = next_ea
+    complete = current == ida_idaapi.BADADDR or current >= max_ea
+    return {
+        "items": items,
+        "offset": offset,
+        "count": len(items),
+        "truncated": not complete,
+        "cursor": {"done": True} if complete else _next_address_cursor(current, skip_remaining),
+        "scan_limit": scan_limit,
+    }
 
 
 @idasync
@@ -3141,38 +3552,53 @@ def find_bytes(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         raise ValueError("patterns must be a string or non-empty list of strings")
     limit = max(1, min(int(arguments.get("limit", 100)), 10000))
     offset = max(0, int(arguments.get("offset", 0)))
+    scan_limit = max(1, min(int(arguments.get("scan_limit", 8 * 1024 * 1024)), 256 * 1024 * 1024))
+    raw_cursor, initial_skip = _address_cursor(arguments, offset)
     min_ea = ida_ida.inf_get_min_ea()
     max_ea = ida_ida.inf_get_max_ea()
+    start_ea = _parse_ea(raw_cursor) if raw_cursor not in (None, "") else min_ea
+    window_end = min(max_ea, start_ea + scan_limit)
     results: list[dict[str, Any]] = []
 
-    for pattern in patterns:
+    for pattern in patterns[:256]:
         pattern_text = str(pattern or "").strip()
         if not pattern_text:
             results.append({"pattern": pattern, "matches": [], "count": 0, "truncated": False, "error": "Empty pattern"})
             continue
         try:
             searcher = _make_byte_searcher(pattern_text)
+            pattern_width = max(1, len(pattern_text.split()))
+            search_end = min(max_ea, window_end + pattern_width - 1)
             matches = []
-            skipped = 0
-            more = False
-            ea = min_ea
-            while ea != ida_idaapi.BADADDR:
-                ea = searcher(ea, max_ea)
-                if ea == ida_idaapi.BADADDR:
+            skip_remaining = initial_skip
+            next_cursor = window_end
+            ea = start_ea
+            while ea != ida_idaapi.BADADDR and ea < window_end:
+                ea = searcher(ea, search_end)
+                if ea == ida_idaapi.BADADDR or ea >= window_end:
                     break
-                if skipped < offset:
-                    skipped += 1
+                if skip_remaining:
+                    skip_remaining -= 1
                 else:
                     item = {"address": _hex(ea), "segment": _segment_name(ea), "name": _name_at(ea)}
                     matches.append(item if full else _pick_fields(item, ["address"]))
                     if len(matches) >= limit:
-                        next_ea = searcher(ea + 1, max_ea)
-                        more = next_ea != ida_idaapi.BADADDR
+                        next_cursor = ea + 1
                         break
                 ea += 1
-            results.append({"pattern": pattern_text, "matches": matches, "count": len(matches), "truncated": more})
+            complete = next_cursor >= max_ea
+            results.append({
+                "pattern": pattern_text,
+                "matches": matches,
+                "count": len(matches),
+                "truncated": not complete,
+                "cursor": {"done": True} if complete else _next_address_cursor(next_cursor, skip_remaining),
+                "scan_limit": scan_limit,
+            })
         except Exception as exc:
             results.append({"pattern": pattern_text, "matches": [], "count": 0, "truncated": False, "error": str(exc)})
+    if len(patterns) > 256:
+        results.append({"matches": [], "count": 0, "truncated": True, "error": "At most 256 patterns are accepted per call"})
     return results
 
 
@@ -3190,12 +3616,34 @@ def find_text(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         raise ValueError("kinds must be a string or non-empty list")
     limit = max(1, min(int(arguments.get("limit", 100)), 10000))
     offset = max(0, int(arguments.get("offset", 0)))
+    scan_limit = max(1, min(int(arguments.get("scan_limit", 10000)), 100000))
     query_lower = query.lower()
     normalized_kinds = {str(kind).strip().lower() for kind in kinds}
+    supported_kinds = {"strings", "names", "comments", "disasm"}
+    unknown_kinds = sorted(normalized_kinds - supported_kinds)
+    if unknown_kinds:
+        raise ValueError(f"Unsupported text search kinds: {', '.join(unknown_kinds)}")
+
+    raw_cursor = arguments.get("cursor")
+    cursor_supplied = raw_cursor not in (None, "", {})
+    if isinstance(raw_cursor, dict) and isinstance(raw_cursor.get("next"), dict):
+        raw_cursor = raw_cursor["next"]
+    if isinstance(raw_cursor, int):
+        offset = max(0, raw_cursor)
+        raw_cursor = {}
+        cursor_supplied = False
+    state = dict(raw_cursor) if isinstance(raw_cursor, dict) else {}
+    done = {str(kind) for kind in state.get("done", []) if str(kind) in supported_kinds}
+    skip = max(0, int(state.get("skip", 0 if cursor_supplied else offset)))
     matches: list[dict[str, Any]] = []
     summary: dict[str, int] = {}
 
     def append_match(kind: str, ea: int, text: str, *, extra: dict[str, Any] | None = None) -> None:
+        nonlocal skip
+        summary[kind] = summary.get(kind, 0) + 1
+        if skip:
+            skip -= 1
+            return
         entry = {
             "kind": kind,
             "address": _hex(ea),
@@ -3205,58 +3653,79 @@ def find_text(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         }
         if extra:
             entry.update(extra)
-        summary[kind] = summary.get(kind, 0) + 1
         matches.append(entry if full else _pick_fields(entry, ["kind", "address", "text"]))
 
-    if "strings" in normalized_kinds:
-        for string in idautils.Strings():
-            value = str(string)
-            if query_lower in value.lower():
-                append_match("string", string.ea, value, extra={"length": int(string.length), "strtype": int(string.strtype)})
+    min_ea = ida_ida.inf_get_min_ea()
+    max_ea = ida_ida.inf_get_max_ea()
 
-    if "names" in normalized_kinds:
-        for ea, name in idautils.Names():
+    def scan_heads(kind: str) -> None:
+        current = _parse_ea(state.get(kind, min_ea))
+        scanned = 0
+        while current != ida_idaapi.BADADDR and current < max_ea and scanned < scan_limit and len(matches) < limit:
+            next_ea = ida_bytes.next_head(current, max_ea)
+            state[kind] = _hex(next_ea) if next_ea != ida_idaapi.BADADDR and next_ea > current else ""
+            if kind == "strings" and ida_bytes.is_strlit(ida_bytes.get_flags(current)):
+                strtype = idc.get_str_type(current)
+                raw = idc.get_strlit_contents(current, -1, strtype)
+                value = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw or "")
+                if value and query_lower in value.lower():
+                    append_match("string", current, value, extra={"length": len(value), "strtype": int(strtype)})
+            elif kind == "comments":
+                regular = idc.get_cmt(current, 0) or ""
+                repeatable = idc.get_cmt(current, 1) or ""
+                if regular and query_lower in regular.lower():
+                    append_match("comment", current, regular, extra={"repeatable": False})
+                if repeatable and query_lower in repeatable.lower():
+                    append_match("comment", current, repeatable, extra={"repeatable": True})
+            elif kind == "disasm":
+                line = ida_lines.tag_remove(ida_lines.generate_disasm_line(current, 0) or "")
+                if line and query_lower in line.lower():
+                    append_match("disasm", current, line)
+            scanned += 1
+            if next_ea == ida_idaapi.BADADDR or next_ea <= current:
+                done.add(kind)
+                state.pop(kind, None)
+                break
+            current = next_ea
+        if current == ida_idaapi.BADADDR or current >= max_ea:
+            done.add(kind)
+            state.pop(kind, None)
+
+    for kind in ("strings", "names", "comments", "disasm"):
+        if kind not in normalized_kinds or kind in done or len(matches) >= limit:
+            continue
+        if kind in {"strings", "comments", "disasm"}:
+            scan_heads(kind)
+            continue
+        index = max(0, int(state.get("names", 0)))
+        end = min(ida_name.get_nlist_size(), index + scan_limit)
+        while index < end and len(matches) < limit:
+            ea = ida_name.get_nlist_ea(index)
+            name = ida_name.get_nlist_name(index) or ""
+            index += 1
+            state["names"] = index
             if query_lower in name.lower():
                 append_match("name", ea, name)
+        if index >= ida_name.get_nlist_size():
+            done.add("names")
+            state.pop("names", None)
 
-    if "comments" in normalized_kinds:
-        max_ea = ida_ida.inf_get_max_ea()
-        current = ida_ida.inf_get_min_ea()
-        while current != ida_idaapi.BADADDR and current < max_ea:
-            regular = idc.get_cmt(current, 0) or ""
-            repeatable = idc.get_cmt(current, 1) or ""
-            if regular and query_lower in regular.lower():
-                append_match("comment", current, regular, extra={"repeatable": False})
-            if repeatable and query_lower in repeatable.lower():
-                append_match("comment", current, repeatable, extra={"repeatable": True})
-            next_ea = ida_bytes.next_head(current, max_ea)
-            if next_ea == ida_idaapi.BADADDR or next_ea <= current:
-                break
-            current = next_ea
-
-    if "disasm" in normalized_kinds:
-        max_ea = ida_ida.inf_get_max_ea()
-        current = ida_ida.inf_get_min_ea()
-        while current != ida_idaapi.BADADDR and current < max_ea:
-            line = ida_lines.tag_remove(ida_lines.generate_disasm_line(current, 0) or "")
-            if line and query_lower in line.lower():
-                append_match("disasm", current, line)
-            next_ea = ida_bytes.next_head(current, max_ea)
-            if next_ea == ida_idaapi.BADADDR or next_ea <= current:
-                break
-            current = next_ea
-
-    total = len(matches)
-    sliced = matches[offset : offset + limit]
+    complete = normalized_kinds <= done
+    next_cursor = {key: value for key, value in state.items() if key in normalized_kinds}
+    next_cursor["done"] = sorted(done & normalized_kinds)
+    if skip:
+        next_cursor["skip"] = skip
     return {
         "query": query,
         "kinds": sorted(normalized_kinds),
         "summary": summary,
-        "items": sliced,
+        "summary_complete": complete,
+        "items": matches,
         "offset": offset,
-        "count": len(sliced),
-        "total": total,
-        "truncated": offset + len(sliced) < total,
+        "count": len(matches),
+        "truncated": not complete,
+        "cursor": {"done": True} if complete else {"next": next_cursor},
+        "scan_limit": scan_limit,
     }
 
 
@@ -3269,36 +3738,47 @@ def find_regex(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         raise ValueError("pattern is required")
     limit = max(1, min(int(arguments.get("limit", 30)), 500))
     offset = max(0, int(arguments.get("offset", 0)))
+    scan_limit = max(1, min(int(arguments.get("scan_limit", 10000)), 100000))
+    raw_cursor, skip_remaining = _address_cursor(arguments, offset)
     regex = re.compile(pattern, re.IGNORECASE)
 
     matches = []
-    skipped = 0
-    more = False
-    for string in idautils.Strings():
-        value = str(string)
-        if not regex.search(value):
-            continue
-        if skipped < offset:
-            skipped += 1
-            continue
-        if len(matches) >= limit:
-            more = True
+    scanned = 0
+    current = _parse_ea(raw_cursor) if raw_cursor not in (None, "") else ida_ida.inf_get_min_ea()
+    max_ea = ida_ida.inf_get_max_ea()
+    while current != ida_idaapi.BADADDR and current < max_ea and scanned < scan_limit and len(matches) < limit:
+        next_ea = ida_bytes.next_head(current, max_ea)
+        scanned += 1
+        if ida_bytes.is_strlit(ida_bytes.get_flags(current)):
+            strtype = idc.get_str_type(current)
+            raw = idc.get_strlit_contents(current, -1, strtype)
+            value = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw or "")
+            if value and regex.search(value):
+                if skip_remaining:
+                    skip_remaining -= 1
+                else:
+                    item = {
+                        "address": _hex(current),
+                        "string": value,
+                        "segment": _segment_name(current),
+                        "name": _name_at(current),
+                        "length": len(value),
+                        "strtype": int(strtype),
+                    }
+                    matches.append(item if full else _pick_fields(item, ["address", "string"]))
+        if next_ea == ida_idaapi.BADADDR or next_ea <= current:
+            current = ida_idaapi.BADADDR
             break
-        item = {
-            "address": _hex(string.ea),
-            "string": value,
-            "segment": _segment_name(string.ea),
-            "name": _name_at(string.ea),
-            "length": int(string.length),
-            "strtype": int(string.strtype),
-        }
-        matches.append(item if full else _pick_fields(item, ["address", "string"]))
+        current = next_ea
+    complete = current == ida_idaapi.BADADDR or current >= max_ea
     return {
         "pattern": pattern,
         "count": len(matches),
         "n": len(matches),
         "matches": matches,
-        "cursor": {"next": offset + limit} if more else {"done": True},
+        "truncated": not complete,
+        "cursor": {"done": True} if complete else _next_address_cursor(current, skip_remaining),
+        "scan_limit": scan_limit,
     }
 
 
@@ -3313,6 +3793,8 @@ def find_immediates(arguments: dict[str, Any] | None = None) -> list[dict[str, A
         raise ValueError("values must be an int/string or non-empty list")
     limit = max(1, min(int(arguments.get("limit", 100)), 10000))
     offset = max(0, int(arguments.get("offset", 0)))
+    scan_limit = max(1, min(int(arguments.get("scan_limit", 10000)), 100000))
+    raw_cursor, initial_skip = _address_cursor(arguments, offset)
     results: list[dict[str, Any]] = []
     exec_segments = []
     for seg_ea in idautils.Segments():
@@ -3327,15 +3809,20 @@ def find_immediates(arguments: dict[str, Any] | None = None) -> list[dict[str, A
         if not isinstance(value, int):
             raise ValueError(f"Unsupported immediate value: {raw_value!r}")
         matches = []
-        skipped = 0
-        more = False
+        skip_remaining = initial_skip
+        scanned = 0
+        complete = True
+        next_cursor = None
         seen: set[int] = set()
         for seg in exec_segments:
-            current = seg.start_ea
-            while current != ida_idaapi.BADADDR and current < seg.end_ea:
+            current = max(seg.start_ea, _parse_ea(raw_cursor)) if raw_cursor not in (None, "") else seg.start_ea
+            if current >= seg.end_ea:
+                continue
+            current = ida_bytes.next_head(current - 1, seg.end_ea) if current > seg.start_ea else current
+            while current != ida_idaapi.BADADDR and current < seg.end_ea and scanned < scan_limit:
+                next_cursor = current
                 insn = _decode_insn_at(current)
                 if insn is not None:
-                    matched = False
                     for op in insn.ops:
                         if op.type == ida_ua.o_void:
                             break
@@ -3344,12 +3831,11 @@ def find_immediates(arguments: dict[str, Any] | None = None) -> list[dict[str, A
                         if int(op.value) != value:
                             continue
                         if current in seen:
-                            matched = True
                             break
                         seen.add(current)
                         line = ida_lines.tag_remove(ida_lines.generate_disasm_line(current, 0) or "")
-                        if skipped < offset:
-                            skipped += 1
+                        if skip_remaining:
+                            skip_remaining -= 1
                         else:
                             item = {
                                 "address": _hex(current),
@@ -3358,21 +3844,29 @@ def find_immediates(arguments: dict[str, Any] | None = None) -> list[dict[str, A
                                 "function": ida_funcs.get_func_name(current) or "",
                             }
                             matches.append(item if full else _pick_fields(item, ["address", "text"]))
-                            if len(matches) >= limit:
-                                more = True
-                                matched = True
-                                break
-                        matched = True
-                        break
-                    if more:
                         break
                 next_ea = ida_bytes.next_head(current, seg.end_ea)
+                scanned += 1
                 if next_ea == ida_idaapi.BADADDR or next_ea <= current:
+                    next_cursor = seg.end_ea
                     break
                 current = next_ea
-            if more:
+                next_cursor = current
+                if len(matches) >= limit:
+                    break
+            if scanned >= scan_limit or len(matches) >= limit:
+                complete = False
                 break
-        results.append({"value": value, "matches": matches, "count": len(matches), "truncated": more})
+        results.append(
+            {
+                "value": value,
+                "matches": matches,
+                "count": len(matches),
+                "truncated": not complete,
+                "cursor": {"done": True} if complete else _next_address_cursor(next_cursor, skip_remaining),
+                "scan_limit": scan_limit,
+            }
+        )
     return results
 
 
@@ -3387,6 +3881,8 @@ def find_insns(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         raise ValueError("sequences must be a string or non-empty list of strings")
     limit = max(1, min(int(arguments.get("limit", 100)), 10000))
     offset = max(0, int(arguments.get("offset", 0)))
+    scan_limit = max(1, min(int(arguments.get("scan_limit", 10000)), 100000))
+    raw_cursor, initial_skip = _address_cursor(arguments, offset)
     results: list[dict[str, Any]] = []
 
     prepared_sequences = []
@@ -3397,21 +3893,15 @@ def find_insns(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
             continue
         prepared_sequences.append((str(sequence), parts))
 
-    all_heads = []
     max_ea = ida_ida.inf_get_max_ea()
-    current = ida_ida.inf_get_min_ea()
-    while current != ida_idaapi.BADADDR and current < max_ea:
-        all_heads.append(current)
-        next_ea = ida_bytes.next_head(current, max_ea)
-        if next_ea == ida_idaapi.BADADDR or next_ea <= current:
-            break
-        current = next_ea
 
     for sequence_text, parts in prepared_sequences:
         matches = []
-        skipped = 0
-        more = False
-        for head in all_heads:
+        skip_remaining = initial_skip
+        scanned = 0
+        complete = True
+        head = _parse_ea(raw_cursor) if raw_cursor not in (None, "") else ida_ida.inf_get_min_ea()
+        while head != ida_idaapi.BADADDR and head < max_ea and scanned < scan_limit:
             cursor = head
             matched_lines: list[str] = []
             found = True
@@ -3426,22 +3916,42 @@ def find_insns(arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
                     cursor = next_ea
                 else:
                     cursor = next_ea
-            if not found:
-                continue
-            if skipped < offset:
-                skipped += 1
-                continue
-            item = {
-                "address": _hex(head),
-                "segment": _segment_name(head),
-                "function": ida_funcs.get_func_name(head) or "",
-                "lines": matched_lines,
-            }
-            matches.append(item if full else _pick_fields(item, ["address", "lines"]))
-            if len(matches) >= limit:
-                more = True
+            if found:
+                if skip_remaining:
+                    skip_remaining -= 1
+                else:
+                    item = {
+                        "address": _hex(head),
+                        "segment": _segment_name(head),
+                        "function": ida_funcs.get_func_name(head) or "",
+                        "lines": matched_lines,
+                    }
+                    matches.append(item if full else _pick_fields(item, ["address", "lines"]))
+                    if len(matches) >= limit:
+                        next_head = ida_bytes.next_head(head, max_ea)
+                        if next_head == ida_idaapi.BADADDR or next_head <= head:
+                            complete = True
+                        else:
+                            complete = False
+                            head = next_head
+                        break
+            next_head = ida_bytes.next_head(head, max_ea)
+            scanned += 1
+            if next_head == ida_idaapi.BADADDR or next_head <= head:
                 break
-        results.append({"sequence": sequence_text, "matches": matches, "count": len(matches), "truncated": more})
+            head = next_head
+        if scanned >= scan_limit:
+            complete = False
+        results.append(
+            {
+                "sequence": sequence_text,
+                "matches": matches,
+                "count": len(matches),
+                "truncated": not complete,
+                "cursor": {"done": True} if complete else _next_address_cursor(head, skip_remaining),
+                "scan_limit": scan_limit,
+            }
+        )
     return results
 
 
@@ -5147,13 +5657,14 @@ def save_database(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 
 TOOL_DEFINITIONS = [
     {"name": "get_metadata", "description": "Return basic database metadata."},
+    {"name": "capture_function_context", "description": "Capture bounded code, data, stack, and stopped-debugger registers for replay."},
     {"name": "inspect", "description": "High-level address inspection with optional decompile/disasm payloads."},
     {"name": "analysis_status", "description": "Return IDA autoanalysis phase, queue/address progress, function count, and optional executable-segment tail coverage."},
     {"name": "wait_for_autoanalysis", "description": "Advance autoanalysis until complete, timeout, or max_work_sec slice; returns phase/address progress and final segment-tail coverage."},
     {"name": "list_segments", "description": "List segments and ranges."},
-    {"name": "list_globals", "description": "List named globals with pagination."},
+    {"name": "list_globals", "description": "List a bounded named-global page; continue with cursor.next."},
     {"name": "imports", "description": "List imports with pagination."},
-    {"name": "list_functions", "description": "List functions with pagination."},
+    {"name": "list_functions", "description": "List a bounded function page; continue with cursor.next."},
     {"name": "lookup_funcs", "description": "Lookup functions by name, VA, or RVA. Bare hex values are checked as VA and image-base-relative RVA."},
     {"name": "get_function", "description": "Return function metadata for an address."},
     {"name": "get_enclosing_function", "description": "Return the function containing the queried address."},
@@ -5167,12 +5678,12 @@ TOOL_DEFINITIONS = [
     {"name": "callees", "description": "Return direct callees for one or more functions."},
     {"name": "basic_blocks", "description": "Return CFG basic blocks for one or more functions."},
     {"name": "xrefs_to_field", "description": "Return cross-references to a named struct field."},
-    {"name": "list_strings", "description": "List strings in the database."},
-    {"name": "find_bytes", "description": "Search byte patterns with wildcard support."},
-    {"name": "find_text", "description": "Search strings, names, comments, or disassembly text."},
-    {"name": "find_regex", "description": "Search string literals with a case-insensitive regex."},
-    {"name": "find_immediates", "description": "Search executable instructions for immediate operand values."},
-    {"name": "find_insns", "description": "Search for instruction text sequences."},
+    {"name": "list_strings", "description": "List bounded IDB-defined strings; continue with cursor.next."},
+    {"name": "find_bytes", "description": "Search a bounded address slice for wildcard byte patterns; continue with cursor.next."},
+    {"name": "find_text", "description": "Search bounded strings, names, comments, or disassembly; continue with cursor.next."},
+    {"name": "find_regex", "description": "Regex-search bounded IDB-defined strings; continue with cursor.next."},
+    {"name": "find_immediates", "description": "Search a bounded instruction slice for immediates; continue with cursor.next."},
+    {"name": "find_insns", "description": "Search a bounded instruction slice for text sequences; continue with cursor.next."},
     {"name": "search", "description": "High-level search API for text/regex/bytes/immediates/instructions."},
     {"name": "inspect_addr", "description": "Inspect an address and return code/data/function context."},
     {"name": "jump", "description": "Resolve an address/RVA/symbol and return decompile, disassembly, function, or address context without modifying the database."},
@@ -5232,6 +5743,7 @@ TOOL_DEFINITIONS = [
 
 TOOL_HANDLERS: dict[str, Callable[[dict[str, Any] | None], Any]] = {
     "get_metadata": get_metadata,
+    "capture_function_context": capture_function_context,
     "inspect": inspect,
     "analysis_status": analysis_status,
     "wait_for_autoanalysis": wait_for_autoanalysis,

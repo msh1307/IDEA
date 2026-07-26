@@ -51,7 +51,7 @@ What runs now:
 - Codex/agents connect through the normal MCP `stdio` entrypoint
 - the `stdio` client auto-reuses the daemon, or starts it if missing
 - the generated Codex config now launches the stdio entrypoint directly, without a shell wrapper
-- For a smaller model-facing tool catalog, set `IDA_MCP_PROFILE=lite` before launching Codex. The default `full` profile remains available for compatibility.
+- The config installer uses `IDA_MCP_PROFILE=lite` to keep the model-facing catalog small; set `IDA_MCP_PROFILE=full` only when direct top-level compatibility tools are needed.
 
 ## Test
 
@@ -79,11 +79,18 @@ Useful tools:
 - `list_alive_sessions`
 - `call_session_tool`
 - `list_session_tools(names_only=true)` → `describe_session_tool` → `call_session_tool` is the low-context discovery path.
-- Results larger than the inline budget are retained losslessly as artifacts; use `read_artifact(artifact_id, field, pattern, start_line, line_count)` for bounded or grep-like reads.
+- Results larger than the inline budget are retained as artifacts up to `IDA_MCP_ARTIFACT_MAX_BYTES`; use `read_artifact(artifact_id, field, pattern, start_line, line_count)` for bounded or grep-like reads. Larger results fail compactly and should be written directly with `write_session_tool_output` or an export path.
 - `IDA_MCP_MAX_INLINE_BYTES` (default 32768) and `IDA_MCP_MAX_ARTIFACT_READ_BYTES` (default 16384) tune result/read budgets.
 - Temporary result artifacts are cleaned opportunistically after `IDA_MCP_ARTIFACT_TTL_SEC` (default 1800s) and capped by `IDA_MCP_ARTIFACT_MAX_BYTES` (default 256MB). Writes are atomic, so a WSL/daemon interruption leaves at most a short-lived temp file; debug logs rotate at `IDA_MCP_LOG_MAX_BYTES` (default 8MB).
+- `replay_function` captures a stopped live-debugger function seed (or a bounded static seed) and runs it in an isolated Unicorn worker. Reuse its `snapshot_id` with `memory_patches` to test alternate inputs; if execution faults on an uncaptured page, add that page in `regions` with `refresh=true`. Use `read_replay_memory` for bounded snapshot reads. Snapshot page permissions are enforced, so unmapped and read/write/execute protection faults are reported. Replay never writes the IDA process or IDB.
+- Replay breakpoints are declarative and worker-local: `breakpoints=[{"at":"0x...","action":"inspect|skip","size":2,"capture_registers":["RAX"],"capture_memory":[{"addr":"0x...","size":64}],"set_registers":{"RAX":"0"},"writes":[...]}]` inspects before, or skips, a chosen instruction. `readback=[{"addr":"0x...","size":256}]` returns final worker memory. Legacy `hooks`/`inspect` fields remain accepted; invalid or failed hooks stop replay instead of silently changing state.
+- Replay snapshots are stored under `IDA_MCP_REPLAY_DIR` (default `/tmp/ida-hybrid-manager-replay`) with atomic writes, stale-temp cleanup, TTL/total-size eviction via `IDA_MCP_REPLAY_TTL_SEC` (default 1800s) and `IDA_MCP_REPLAY_MAX_BYTES` (default 256MB); results include `fault`, `missing_pages`, and compact trace/write summaries rather than the full snapshot.
+- `discard_replay_snapshot` removes one snapshot immediately without closing the IDA debugger session. Reuse the same `session_id` for many isolated replay workers; use `close_session` or the backend `dbg_exit` tool only when the actual debugger process should terminate.
+- Typical loop: call `replay_function(addr, mode="live")`; if `stop_reason="memory_fault"`, call it again with the returned `snapshot_id`, `regions=[{"addr": fault.addr, "size": 4096}]`, and `refresh=true`; inspect with `read_replay_memory`, then retry using `memory_patches=[{"addr": ..., "data": ...}]`.
 - Legacy plugin download output is memory-only and bounded by `IDA_MCP_OUTPUT_CACHE_TTL_SEC` (default 1800s), `IDA_MCP_OUTPUT_CACHE_MAX_SIZE` (default 100), and `IDA_MCP_OUTPUT_CACHE_MAX_BYTES` (default 64MB).
 - Manager-generated Windows temp logs and orphaned staging directories older than `IDA_MCP_TEMP_TTL_SEC` (default 7 days) are cleaned on launcher startup; user IDBs, exports, and the plugin overlay are not touched.
+- `IDA_MCP_STAGE_ROOT` moves only per-session binary/IDB staging to an explicit Windows or WSL path (for example `E:\ida-hybrid-staging` or `/mnt/e/ida-hybrid-staging`); logs and the plugin overlay remain under the normal Windows temp root.
+- Text, instruction, and immediate searches scan bounded source slices and return `cursor.next`; pass that cursor back to continue. Text search covers IDB-defined strings without rebuilding IDA's global String-window candidate list.
 - A daemon build mismatch is not forced through while an existing IDA owner PID cannot be verified/terminated; this preserves the live registry instead of orphaning the database process.
 - `read_artifact`
 - `write_session_tool_output`

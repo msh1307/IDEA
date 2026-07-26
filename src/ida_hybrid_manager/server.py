@@ -33,12 +33,13 @@ from mcp.server.session import ServerSession
 from mcp.shared.message import SessionMessage
 from mcp.shared.session import RequestResponder
 
-from .backend import BackendToolError, BackendUnavailableError, call_backend_tool_any, list_backend_tools_any
+from .backend import BackendTimeoutError, BackendToolError, BackendUnavailableError, call_backend_tool_any, list_backend_tools_any
 from .launch import IdaLauncher
 from .manager_api import ManagerApiServer
 from .models import PendingLaunch, utc_now
 from .pathing import normalize_path
 from .registry import SessionRegistry
+from .replay import replay_snapshot
 
 
 DAEMON_HOST = "127.0.0.1"
@@ -64,6 +65,10 @@ MCP_ARTIFACT_TTL_SEC = _env_int("IDA_MCP_ARTIFACT_TTL_SEC", 30 * 60, minimum=60)
 MCP_ARTIFACT_MAX_BYTES = _env_int("IDA_MCP_ARTIFACT_MAX_BYTES", 256 * 1024 * 1024, minimum=1024 * 1024)
 MCP_ARTIFACT_CLEANUP_INTERVAL_SEC = _env_int("IDA_MCP_ARTIFACT_CLEANUP_INTERVAL_SEC", 60, minimum=1)
 MCP_ARTIFACT_TMP_TTL_SEC = max(60, min(MCP_ARTIFACT_TTL_SEC, 5 * 60))
+REPLAY_SNAPSHOT_DIR = Path(os.getenv("IDA_MCP_REPLAY_DIR", "/tmp/ida-hybrid-manager-replay")).expanduser()
+REPLAY_SNAPSHOT_TTL_SEC = _env_int("IDA_MCP_REPLAY_TTL_SEC", 30 * 60, minimum=60)
+REPLAY_SNAPSHOT_MAX_BYTES = _env_int("IDA_MCP_REPLAY_MAX_BYTES", 256 * 1024 * 1024, minimum=1024 * 1024)
+_replay_snapshot_lock = threading.RLock()
 MCP_LOG_MAX_BYTES = _env_int("IDA_MCP_LOG_MAX_BYTES", 8 * 1024 * 1024, minimum=64 * 1024)
 _artifact_cleanup_lock = threading.RLock()
 _artifact_cleanup_last_at = 0.0
@@ -75,6 +80,7 @@ DAEMON_BUILD_FILES = (
     Path(__file__).with_name("models.py"),
     Path(__file__).with_name("backend.py"),
     Path(__file__).with_name("manager_api.py"),
+    Path(__file__).with_name("replay.py"),
     # Headless IDA processes load this bundled overlay. Include the package
     # itself in the token so backend edits force a daemon compatibility check;
     # already-running IDA processes still need a normal IDA restart to reload
@@ -132,6 +138,7 @@ MUTATING_BACKEND_TOOLS = {
 ANALYSIS_DEPENDENT_BACKEND_TOOLS = MUTATING_BACKEND_TOOLS | {
     "basic_blocks",
     "callees",
+    "capture_function_context",
     "decompile",
     "diagnose_function",
     "disasm_function",
@@ -186,6 +193,9 @@ LITE_MCP_TOOLS = {
     "call_session_tool",
     "read_artifact",
     "write_session_tool_output",
+    "replay_function",
+    "read_replay_memory",
+    "discard_replay_snapshot",
 }
 _DISCOVERED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {}
 
@@ -331,9 +341,12 @@ def _wait_for_queued_autoanalysis(
     operation: str,
     operation_id: str,
 ) -> dict[str, Any]:
-    """Wait on heartbeat state, without putting a fixed RPC deadline on IDA."""
+    """Advance autoanalysis in bounded backend work slices until it completes."""
     started = time.monotonic()
     last_status: dict[str, Any] = {}
+    next_backend_probe = 0.0
+    backend_poll_interval = 0.5
+    backend_probe_errors = 0
     while True:
         if _session_operation_stop.is_set():
             return {
@@ -361,6 +374,33 @@ def _wait_for_queued_autoanalysis(
         cached = _cached_session_autoanalysis(record)
         if cached:
             last_status = cached
+
+        now = time.monotonic()
+        if now >= next_backend_probe:
+            next_backend_probe = now + backend_poll_interval
+            try:
+                analysis_result = _run_coroutine_sync(
+                    call_backend_tool_any(
+                        _backend_candidates(record),
+                        "wait_for_autoanalysis",
+                        {
+                            "timeout_sec": 1.0,
+                            "max_work_sec": 0.5,
+                            "max_steps": 100_000,
+                            "include_coverage": False,
+                        },
+                        timeout_sec=5.0,
+                    )
+                )
+            except Exception:
+                backend_probe_errors += 1
+            else:
+                backend_probe_errors = 0
+                status = _backend_structured_content(analysis_result)
+                if status:
+                    last_status = status
+                    _update_session_autoanalysis(record.session_id, status, source=f"{operation}_queued")
+
         if bool(last_status.get("autoanalysis_complete")):
             return {
                 "waited": True,
@@ -387,6 +427,8 @@ def _wait_for_queued_autoanalysis(
             "progress_percent": 0.0,
             "message": "Waiting for IDA heartbeat analysis status",
         }
+        if backend_probe_errors and backend_probe_errors % 3 == 1:
+            status["message"] = f"Heartbeat available; backend status probe unstable ({backend_probe_errors} failures)"
         _set_operation_progress(
             operation_id,
             operation=operation,
@@ -395,7 +437,7 @@ def _wait_for_queued_autoanalysis(
             message=str(status.get("message") or "IDA autoanalysis in progress"),
             analysis=status,
         )
-        time.sleep(1.0)
+        time.sleep(0.1)
 
 
 def _run_queued_session_operation(operation: str, payload: dict[str, Any]) -> None:
@@ -566,6 +608,7 @@ LONG_ANALYSIS_DAEMON_OPERATIONS = {
     "inspect",
     "inspect_addr",
     "jump",
+    "replay_function",
     "search",
     "write_session_tool_output",
     "xrefs",
@@ -930,6 +973,10 @@ def _mark_pending_owner(pending: PendingLaunch, client_id: str | None) -> None:
 
 
 def _on_session_registered(record) -> None:
+    if record.engine == "headless" and not record.metadata.get("staged_dir"):
+        recovered = _get_launcher().recover_staged_metadata(record.idb_path)
+        if recovered:
+            record = registry.update_managed_session(record.session_id, metadata=recovered) or record
     owner_client_id = str(record.metadata.get("owner_client_id") or "")
     if not owner_client_id:
         return
@@ -1274,6 +1321,8 @@ def _backend_tool_timeout_sec(tool_name: str) -> float:
         return EXPORT_BACKEND_TIMEOUT_SEC
     if tool_name == "save_database":
         return SAVE_BACKEND_TIMEOUT_SEC
+    if tool_name == "capture_function_context":
+        return 120.0
     return 30.0
 
 
@@ -1460,7 +1509,6 @@ def _maybe_wait_for_autoanalysis(
     last_status: dict[str, Any] = {}
     last_sample_percent = -10.0
     last_sample_phase = ""
-    consecutive_stalls = 0
     _set_operation_progress(
         progress_id,
         operation=operation,
@@ -1515,13 +1563,6 @@ def _maybe_wait_for_autoanalysis(
             )
             if bool(status.get("autoanalysis_complete")):
                 break
-            if bool(status.get("stalled")):
-                consecutive_stalls += 1
-                if consecutive_stalls >= 3:
-                    break
-            else:
-                consecutive_stalls = 0
-
         complete = bool(last_status.get("autoanalysis_complete"))
         if not complete:
             try:
@@ -1552,7 +1593,7 @@ def _maybe_wait_for_autoanalysis(
             "ok": complete,
             "autoanalysis_complete": complete,
             "timed_out": not complete and time.monotonic() >= deadline,
-            "stalled": not complete and consecutive_stalls >= 3,
+            "stalled": bool(last_status.get("stalled")),
             "timeout_sec": timeout_sec,
             "waited_sec": waited_sec,
             "function_total": int(last_status.get("function_total") or 0),
@@ -1642,7 +1683,6 @@ async def _ensure_session_autoanalysis_ready(
     deadline = started + timeout_sec
     endpoints = _backend_candidates(record)
     last_status: dict[str, Any] = {}
-    consecutive_stalls = 0
 
     try:
         probe_result = await call_backend_tool_any(
@@ -1735,13 +1775,6 @@ async def _ensure_session_autoanalysis_ready(
                 "waited_sec": round(time.monotonic() - started, 3),
                 "status": cached,
             }
-        if bool(status.get("stalled")):
-            consecutive_stalls += 1
-            if consecutive_stalls >= 3:
-                break
-        else:
-            consecutive_stalls = 0
-
     return {
         "required": True,
         "ok": False,
@@ -1752,7 +1785,7 @@ async def _ensure_session_autoanalysis_ready(
         "timeout_sec": timeout_sec,
         "waited_sec": round(time.monotonic() - started, 3),
         "timed_out": time.monotonic() >= deadline,
-        "stalled": consecutive_stalls >= 3,
+        "stalled": bool(last_status.get("stalled")),
         "status": cached or _compact_session_autoanalysis(last_status, source=f"gate_failed:{tool_name}"),
         "error": "autoanalysis_incomplete",
         "message": (
@@ -2193,12 +2226,13 @@ def _session_persistent_idb_target(record: Any) -> Path | None:
 def _session_staged_idb_path(record: Any) -> Path | None:
     staged_idb_path = str(record.metadata.get("staged_idb_path") or "").strip()
     if staged_idb_path:
-        return Path(staged_idb_path)
+        candidate = Path(staged_idb_path)
+        return candidate if _get_launcher().is_managed_staged_dir(candidate.parent) else None
     staged_binary_path = str(record.metadata.get("staged_binary_path") or "").strip()
     if not staged_binary_path:
         return None
     staged_path = Path(staged_binary_path)
-    return staged_path.with_name(f"{staged_path.name}.i64")
+    return staged_path.with_name(f"{staged_path.name}.i64") if _get_launcher().is_managed_staged_dir(staged_path.parent) else None
 
 
 def _safe_output_stem(value: str) -> str:
@@ -2229,7 +2263,6 @@ def _session_idb_status(record: Any) -> dict[str, Any]:
     source_idb_path = str(record.metadata.get("source_idb_wsl_path") or "").strip()
     source_idb_exists = bool(record.metadata.get("source_idb_exists")) or source_kind == "idb" or bool(source_idb_path)
     staged_from_existing = bool(record.metadata.get("staged_from_existing_idb"))
-    staged_idb = _session_staged_idb_path(record)
     persistent_idb = _session_persistent_idb_target(record)
     idb_path = ""
     if persistent_idb is not None:
@@ -2464,6 +2497,126 @@ def _artifact_session_id(payload: Any) -> str:
     return ""
 
 
+def _replay_snapshot_path(snapshot_id: str) -> Path:
+    normalized = str(snapshot_id or "").strip()
+    if not re.fullmatch(r"rpl_[0-9a-f]{24}", normalized):
+        raise ValueError("Invalid replay snapshot_id")
+    return REPLAY_SNAPSHOT_DIR / f"{normalized}.json"
+
+
+def _cleanup_replay_snapshots() -> None:
+    with _replay_snapshot_lock:
+        root = REPLAY_SNAPSHOT_DIR
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            return
+        cutoff = time.time() - REPLAY_SNAPSHOT_TTL_SEC
+        snapshots: list[tuple[Path, float, int]] = []
+        for path in children:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if path.is_file() and path.name.startswith(".") and path.name.endswith(".tmp"):
+                if stat.st_mtime < cutoff:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                continue
+            if not path.is_file() or not re.fullmatch(r"rpl_[0-9a-f]{24}\.json", path.name):
+                continue
+            if stat.st_mtime < cutoff:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            snapshots.append((path, stat.st_mtime, stat.st_size))
+        total = sum(size for _, _, size in snapshots)
+        for path, _mtime, size in sorted(snapshots, key=lambda item: item[1]):
+            if total <= REPLAY_SNAPSHOT_MAX_BYTES:
+                break
+            try:
+                path.unlink()
+                total -= size
+            except OSError:
+                continue
+
+
+def _save_replay_snapshot(snapshot: dict[str, Any], session_id: str, snapshot_id: str = "") -> str:
+    with _replay_snapshot_lock:
+        _cleanup_replay_snapshots()
+        normalized = str(snapshot_id or "").strip() or f"rpl_{uuid.uuid4().hex[:24]}"
+        path = _replay_snapshot_path(normalized)
+        REPLAY_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            REPLAY_SNAPSHOT_DIR.chmod(0o700)
+        except OSError:
+            pass
+        payload = {"session_id": session_id, "snapshot": snapshot}
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        if len(raw) > REPLAY_SNAPSHOT_MAX_BYTES:
+            raise ValueError(f"Replay snapshot exceeds the {REPLAY_SNAPSHOT_MAX_BYTES} byte limit")
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="wb", dir=REPLAY_SNAPSHOT_DIR, prefix=f".{normalized}.", suffix=".tmp", delete=False) as handle:
+                temp_path = Path(handle.name)
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+        _cleanup_replay_snapshots()
+        return normalized
+
+
+def _load_replay_snapshot(snapshot_id: str, session_id: str) -> tuple[str, dict[str, Any]]:
+    _cleanup_replay_snapshots()
+    path = _replay_snapshot_path(snapshot_id)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Unknown or expired replay snapshot: {snapshot_id}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unable to read replay snapshot: {snapshot_id}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("snapshot"), dict):
+        raise ValueError("Replay snapshot is invalid")
+    stored_session_id = str(payload.get("session_id") or "")
+    if stored_session_id and stored_session_id != session_id:
+        raise ValueError("Replay snapshot belongs to a different IDA session")
+    return str(snapshot_id), payload["snapshot"]
+
+
+def _merge_replay_capture(snapshot: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(snapshot)
+    existing = {str(item.get("start")): item for item in merged.get("memory") or [] if isinstance(item, dict) and item.get("start")}
+    for item in extra.get("memory") or []:
+        if isinstance(item, dict) and item.get("start"):
+            existing[str(item["start"])] = item
+    merged["memory"] = list(existing.values())
+    merged["regions"] = [
+        {
+            "start": item.get("start"),
+            "size": len(bytes.fromhex(str(item.get("data") or ""))),
+            "label": item.get("label", ""),
+            "perm": item.get("perm", ""),
+        }
+        for item in merged["memory"]
+        if isinstance(item, dict)
+    ]
+    merged["captured_bytes"] = sum(int(item.get("size") or 0) for item in merged["regions"])
+    extra_starts = {str(item.get("start")) for item in extra.get("memory") or [] if isinstance(item, dict) and item.get("start")}
+    merged["missing_pages"] = [item for item in merged.get("missing_pages") or [] if str(item) not in extra_starts]
+    return merged
+
+
 def _artifact_preview(payload: Any) -> dict[str, Any]:
     if isinstance(payload, dict):
         preview: dict[str, Any] = {}
@@ -2506,6 +2659,16 @@ def _externalize_result(payload: Any) -> tuple[Any, dict[str, Any] | None]:
         return payload, None
     if len(raw) <= MCP_INLINE_RESULT_BYTES:
         return payload, None
+    if len(raw) > MCP_ARTIFACT_MAX_BYTES:
+        return {
+            "ok": False,
+            "error": "result_exceeds_artifact_limit",
+            "truncated": True,
+            "bytes": len(raw),
+            "max_bytes": MCP_ARTIFACT_MAX_BYTES,
+            "preview": _artifact_preview(payload),
+            "hint": "Use a bounded query or write_session_tool_output/export path.",
+        }, None
 
     artifact_id = f"art_{uuid.uuid4().hex}"
     path = _artifact_id_path(artifact_id)
@@ -4204,6 +4367,22 @@ async def _local_call_session_tool(tool_name: str, arguments: Any = None, sessio
                         backend_payload,
                         timeout_sec=_backend_tool_timeout_sec(tool_name),
                     )
+                except BackendTimeoutError as exc:
+                    _daemon_debug(f"backend timeout during mutating tool session_id={latest.session_id} tool={tool_name}")
+                    touched = registry.touch_client(latest.session_id, client_id) or latest
+                    return _augment_session_meta(
+                        _tool_error(
+                            "backend_timeout",
+                            detail=str(exc),
+                            tool_name=tool_name,
+                            outcome_unknown=True,
+                            retry=False,
+                        ),
+                        touched,
+                        client_id=client_id,
+                        warning=warning,
+                        analysis_gate=analysis_gate,
+                    )
                 except BackendUnavailableError:
                     _daemon_debug(f"backend unavailable during mutating tool session_id={latest.session_id} tool={tool_name}")
                     raise
@@ -4241,9 +4420,182 @@ async def _local_call_session_tool(tool_name: str, arguments: Any = None, sessio
                     client_id=client_id,
                     analysis_gate=analysis_gate,
                 )
+            except BackendTimeoutError as exc:
+                _daemon_debug(f"backend timeout during read-only tool session_id={latest.session_id} tool={tool_name}")
+                touched = registry.touch_client(latest.session_id, client_id) or latest
+                return _augment_session_meta(
+                    _tool_error(
+                        "backend_timeout",
+                        detail=str(exc),
+                        tool_name=tool_name,
+                        retry=False,
+                    ),
+                    touched,
+                    client_id=client_id,
+                    analysis_gate=analysis_gate,
+                )
             except BackendUnavailableError:
                 _daemon_debug(f"backend unavailable during read-only tool session_id={latest.session_id} tool={tool_name}")
                 raise
+
+
+async def _local_replay_function(
+    addr: str,
+    *,
+    session_id: str = "",
+    mode: str = "auto",
+    snapshot_id: str = "",
+    args: list[Any] | None = None,
+    registers: dict[str, Any] | None = None,
+    memory_patches: list[dict[str, Any]] | None = None,
+    hooks: list[dict[str, Any]] | None = None,
+    breakpoints: list[dict[str, Any]] | None = None,
+    readback: list[dict[str, Any]] | None = None,
+    inspect: list[dict[str, Any]] | None = None,
+    regions: list[dict[str, Any]] | None = None,
+    refresh: bool = False,
+    start_process: bool = False,
+    run_to: bool = True,
+    abi: str = "",
+    max_steps: int = 20_000,
+    timeout_sec: float = 10.0,
+    trace_limit: int = 128,
+    write_limit: int = 64,
+    max_capture_bytes: int = 8 * 1024 * 1024,
+    callee_depth: int = 1,
+    stack_before: int = 0x4000,
+    stack_after: int = 0x8000,
+    client_id: str | None = None,
+) -> dict[str, Any]:
+    record = _current_or_explicit(session_id or None, client_id=client_id)
+    normalized_snapshot_id = str(snapshot_id or "").strip()
+    if normalized_snapshot_id:
+        normalized_snapshot_id, snapshot = _load_replay_snapshot(normalized_snapshot_id, record.session_id)
+        if refresh and regions:
+            refresh_mode = "live" if str(snapshot.get("source") or "").lower() == "live" else "static"
+            refreshed = await _local_call_session_tool(
+                "capture_function_context",
+                {
+                    "addr": addr,
+                    "mode": refresh_mode,
+                    "run_to": False,
+                    "regions_only": True,
+                    "regions": regions,
+                    "max_capture_bytes": max_capture_bytes,
+                },
+                session_id=record.session_id,
+                client_id=client_id,
+            )
+            refreshed_payload = _backend_structured_content(refreshed)
+            if not refreshed_payload.get("ok"):
+                return refreshed
+            with _replay_snapshot_lock:
+                _, current_snapshot = _load_replay_snapshot(normalized_snapshot_id, record.session_id)
+                snapshot = _merge_replay_capture(current_snapshot, refreshed_payload)
+                _save_replay_snapshot(snapshot, record.session_id, normalized_snapshot_id)
+    else:
+        captured = await _local_call_session_tool(
+            "capture_function_context",
+            {
+                "addr": addr,
+                "mode": mode,
+                "start_process": start_process,
+                "run_to": run_to,
+                "abi": abi,
+                "regions": regions or [],
+                "max_capture_bytes": max_capture_bytes,
+                "callee_depth": callee_depth,
+                "stack_before": stack_before,
+                "stack_after": stack_after,
+                "registers": registers or {},
+            },
+            session_id=record.session_id,
+            client_id=client_id,
+        )
+        snapshot = _backend_structured_content(captured)
+        if not snapshot.get("ok"):
+            return captured
+        normalized_snapshot_id = _save_replay_snapshot(snapshot, record.session_id)
+
+    replay_arguments = {
+        "args": args or [],
+        "registers": registers or {},
+        "memory_patches": memory_patches or [],
+        "hooks": hooks or [],
+        "breakpoints": breakpoints or [],
+        "readback": readback or [],
+        "inspect": inspect or [],
+    }
+    result = await asyncio.to_thread(
+        replay_snapshot,
+        snapshot,
+        replay_arguments,
+        max_steps=max_steps,
+        timeout_sec=timeout_sec,
+        trace_limit=trace_limit,
+        write_limit=write_limit,
+    )
+    result["snapshot_id"] = normalized_snapshot_id
+    result["capture"] = {
+        "source": snapshot.get("source"),
+        "captured_bytes": snapshot.get("captured_bytes", 0),
+        "regions": snapshot.get("regions", [])[:256],
+        "missing_pages": snapshot.get("missing_pages", [])[:256],
+        "callee_count": snapshot.get("callee_count", 0),
+        "replay_warning": snapshot.get("replay_warning", ""),
+    }
+    return _augment_session_meta(result, record, client_id=client_id)
+
+
+def _local_read_replay_memory(snapshot_id: str, addr: str, size: int, *, session_id: str = "", client_id: str | None = None) -> dict[str, Any]:
+    record = _current_or_explicit(session_id or None, client_id=client_id)
+    _snapshot_id, snapshot = _load_replay_snapshot(snapshot_id, record.session_id)
+    try:
+        start = int(str(addr).strip(), 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("addr must be a numeric address") from exc
+    size = max(1, min(int(size), 64 * 1024))
+    pages: dict[int, bytes] = {}
+    for item in snapshot.get("memory") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            page = int(str(item.get("start") or ""), 0)
+            pages[page] = bytes.fromhex(str(item.get("data") or ""))
+        except (TypeError, ValueError):
+            continue
+    chunks: list[dict[str, Any]] = []
+    missing: list[str] = []
+    current = start
+    end = start + size
+    while current < end:
+        page = current & ~0xFFF
+        page_data = pages.get(page)
+        chunk_end = min(end, page + 0x1000)
+        if page_data is None or len(page_data) < chunk_end - page:
+            missing.append(f"0x{page:X}")
+        else:
+            chunks.append({"addr": f"0x{current:X}", "data": page_data[current - page : chunk_end - page].hex()})
+        current = chunk_end
+    return {
+        "ok": not missing,
+        "snapshot_id": snapshot_id,
+        "addr": f"0x{start:X}",
+        "size": size,
+        "chunks": chunks,
+        "missing_pages": missing,
+    }
+
+
+def _local_discard_replay_snapshot(snapshot_id: str, *, session_id: str = "", client_id: str | None = None) -> dict[str, Any]:
+    record = _current_or_explicit(session_id or None, client_id=client_id)
+    with _replay_snapshot_lock:
+        normalized, _snapshot = _load_replay_snapshot(snapshot_id, record.session_id)
+        try:
+            _replay_snapshot_path(normalized).unlink()
+        except FileNotFoundError as exc:
+            raise ValueError(f"Unknown or expired replay snapshot: {normalized}") from exc
+    return _augment_session_meta({"ok": True, "snapshot_id": normalized, "discarded": True}, record, client_id=client_id)
 
 
 async def _local_write_session_tool_output(
@@ -4358,6 +4710,45 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
             kwargs["tool_name"], kwargs.get("session_id", ""), client_id=client_id
         ),
         "call_session_tool": lambda **kwargs: _local_call_session_tool(kwargs["tool_name"], kwargs.get("arguments"), kwargs.get("session_id", ""), client_id=client_id),
+        "replay_function": lambda **kwargs: _local_replay_function(
+            kwargs["addr"],
+            session_id=kwargs.get("session_id", ""),
+            mode=kwargs.get("mode", "auto"),
+            snapshot_id=kwargs.get("snapshot_id", ""),
+            args=kwargs.get("args"),
+            registers=kwargs.get("registers"),
+            memory_patches=kwargs.get("memory_patches"),
+            hooks=kwargs.get("hooks"),
+            breakpoints=kwargs.get("breakpoints"),
+            readback=kwargs.get("readback"),
+            inspect=kwargs.get("inspect"),
+            regions=kwargs.get("regions"),
+            refresh=kwargs.get("refresh", False),
+            start_process=kwargs.get("start_process", False),
+            run_to=kwargs.get("run_to", True),
+            abi=kwargs.get("abi", ""),
+            max_steps=kwargs.get("max_steps", 20_000),
+            timeout_sec=kwargs.get("timeout_sec", 10.0),
+            trace_limit=kwargs.get("trace_limit", 128),
+            write_limit=kwargs.get("write_limit", 64),
+            max_capture_bytes=kwargs.get("max_capture_bytes", 8 * 1024 * 1024),
+            callee_depth=kwargs.get("callee_depth", 1),
+            stack_before=kwargs.get("stack_before", 0x4000),
+            stack_after=kwargs.get("stack_after", 0x8000),
+            client_id=client_id,
+        ),
+        "read_replay_memory": lambda **kwargs: _local_read_replay_memory(
+            kwargs["snapshot_id"],
+            kwargs["addr"],
+            kwargs.get("size", 256),
+            session_id=kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
+        "discard_replay_snapshot": lambda **kwargs: _local_discard_replay_snapshot(
+            kwargs["snapshot_id"],
+            session_id=kwargs.get("session_id", ""),
+            client_id=client_id,
+        ),
         "inspect": lambda **kwargs: _local_call_session_tool(
             "inspect",
             _merge_detail_payload(
@@ -4727,7 +5118,8 @@ def _dispatch_operation(op_name: str, payload: dict[str, Any]) -> Any:
     with _client_lease_renewal(client_id):
         result = operation(**payload)
         if asyncio.iscoroutine(result):
-            return asyncio.run(result)
+            result = asyncio.run(result)
+        result, _artifact = _externalize_result(result)
         return result
 
 
@@ -5123,6 +5515,81 @@ async def call_session_tool(tool_name: str, arguments: Any = None, session_id: s
             {"tool_name": tool_name, "arguments": arguments, "session_id": session_id, "client_id": CLIENT_ID},
         ))
     return _mcp_result(await _local_call_session_tool(tool_name=tool_name, arguments=arguments, session_id=session_id, client_id=CLIENT_ID))
+
+
+@mcp.tool(description="Capture/replay; breakpoints={at,action=inspect|skip,size?,capture_registers?,capture_memory?,set_registers?,writes?,max_hits?}, readback={addr,size}, patches={addr,data}, regions={addr,size,perm?}.", structured_output=False)
+async def replay_function(
+    addr: str,
+    session_id: str = "",
+    mode: str = "auto",
+    snapshot_id: str = "",
+    args: list[Any] | None = None,
+    registers: dict[str, Any] | None = None,
+    memory_patches: list[dict[str, Any]] | None = None,
+    hooks: list[dict[str, Any]] | None = None,
+    breakpoints: list[dict[str, Any]] | None = None,
+    readback: list[dict[str, Any]] | None = None,
+    inspect: list[dict[str, Any]] | None = None,
+    regions: list[dict[str, Any]] | None = None,
+    refresh: bool = False,
+    start_process: bool = False,
+    run_to: bool = True,
+    abi: str = "",
+    max_steps: int = 20_000,
+    timeout_sec: float = 10.0,
+    trace_limit: int = 128,
+    write_limit: int = 64,
+    max_capture_bytes: int = 8 * 1024 * 1024,
+    callee_depth: int = 1,
+    stack_before: int = 0x4000,
+    stack_after: int = 0x8000,
+) -> mcp_types.CallToolResult:
+    payload = {
+        "addr": addr,
+        "session_id": session_id,
+        "mode": mode,
+        "snapshot_id": snapshot_id,
+        "args": args or [],
+        "registers": registers or {},
+        "memory_patches": memory_patches or [],
+        "hooks": hooks or [],
+        "breakpoints": breakpoints or [],
+        "readback": readback or [],
+        "inspect": inspect or [],
+        "regions": regions or [],
+        "refresh": refresh,
+        "start_process": start_process,
+        "run_to": run_to,
+        "abi": abi,
+        "max_steps": max_steps,
+        "timeout_sec": timeout_sec,
+        "trace_limit": trace_limit,
+        "write_limit": write_limit,
+        "max_capture_bytes": max_capture_bytes,
+        "callee_depth": callee_depth,
+        "stack_before": stack_before,
+        "stack_after": stack_after,
+        "client_id": CLIENT_ID,
+    }
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(await _daemon_request_async("replay_function", payload))
+    return _mcp_result(await _local_replay_function(**payload))
+
+
+@mcp.tool(description="Read a bounded memory range from a replay snapshot.", structured_output=False)
+def read_replay_memory(snapshot_id: str, addr: str, size: int = 256, session_id: str = "") -> mcp_types.CallToolResult:
+    payload = {"snapshot_id": snapshot_id, "addr": addr, "size": size, "session_id": session_id, "client_id": CLIENT_ID}
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(_daemon_request_sync("read_replay_memory", payload))
+    return _mcp_result(_local_read_replay_memory(**payload))
+
+
+@mcp.tool(description="Delete one replay snapshot immediately; the IDA debugger session remains open.", structured_output=False)
+def discard_replay_snapshot(snapshot_id: str, session_id: str = "") -> mcp_types.CallToolResult:
+    payload = {"snapshot_id": snapshot_id, "session_id": session_id, "client_id": CLIENT_ID}
+    if ACTIVE_BACKEND == "daemon":
+        return _mcp_result(_daemon_request_sync("discard_replay_snapshot", payload))
+    return _mcp_result(_local_discard_replay_snapshot(**payload))
 
 
 @mcp.tool(description="High-level address inspection with optional decompile/disasm payloads.", structured_output=False)
@@ -5847,6 +6314,7 @@ def main() -> None:
     parser.add_argument("--profile", default=os.getenv("IDA_MCP_PROFILE", "full"), choices=["full", "lite"], help="Model-facing MCP tool profile (default: full)")
     args = parser.parse_args()
     _cleanup_artifacts(force=True)
+    _cleanup_replay_snapshots()
 
     if args.transport == "daemon":
         ACTIVE_BACKEND = "local"
