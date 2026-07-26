@@ -454,12 +454,16 @@ class IdaLauncher:
         script_path.write_text(
             "\n".join(
                 [
+                    "import ida_ida",
                     "import ida_idaapi",
                     "import ida_segment",
                     "import idc",
                     f"architecture = {architecture!r}",
                     "bitness = architecture.get('bitness')",
                     "if bitness is not None:",
+                    "    ida_ida.inf_set_app_bitness(bitness)",
+                    "    if ida_ida.inf_get_app_bitness() != bitness:",
+                    "        raise RuntimeError(f'failed to set application bitness to {bitness}')",
                     "    for index in range(ida_segment.get_segm_qty()):",
                     "        segment = ida_segment.getnseg(index)",
                     "        if segment is not None:",

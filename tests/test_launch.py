@@ -47,6 +47,24 @@ class StageRootTests(unittest.TestCase):
                 launcher.cleanup_staged_dir(str(outside))
             self.assertTrue(outside.exists())
 
+    def test_architecture_script_sets_application_and_segment_bitness(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            launcher = IdaLauncher.__new__(IdaLauncher)
+            launcher.wsl_temp = Path(root)
+            architecture = {
+                "processor": "ARM",
+                "compiler": None,
+                "bitness": 32,
+                "thumb_mode": None,
+                "thumb_address": None,
+            }
+            with patch("ida_hybrid_manager.launch.to_windows_path", side_effect=lambda path: path):
+                script_path = launcher._write_architecture_script("token", architecture)
+            source = Path(script_path).read_text(encoding="utf-8")
+            compile(source, script_path, "exec")
+            self.assertIn("ida_ida.inf_set_app_bitness(bitness)", source)
+            self.assertIn("idc.set_segm_addressing", source)
+
 
 if __name__ == "__main__":
     unittest.main()

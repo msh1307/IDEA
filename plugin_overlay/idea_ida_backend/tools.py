@@ -80,6 +80,54 @@ def _is_mapped_ea(ea: int) -> bool:
     return ea != ida_idaapi.BADADDR and ida_segment.getseg(ea) is not None
 
 
+def _processor_name() -> str:
+    try:
+        return str(ida_ida.inf_get_procname() or "")
+    except Exception:
+        info = getattr(idaapi, "get_inf_structure", lambda: None)()
+        return str(getattr(info, "procname", "") if info is not None else "")
+
+
+def _database_bitness() -> int:
+    try:
+        bits = int(ida_ida.inf_get_app_bitness())
+        if bits in {16, 32, 64}:
+            return bits
+    except Exception:
+        pass
+    return 64 if ida_ida.inf_is_64bit() else 32
+
+
+def _segment_bitness(ea: int) -> int | None:
+    segment = ida_segment.getseg(ea)
+    if segment is None:
+        return None
+    return {0: 16, 1: 32, 2: 64}.get(int(segment.bitness))
+
+
+def _arm_bitness_issue(ea: int) -> dict[str, Any] | None:
+    processor = _processor_name().strip().lower()
+    if not (processor.startswith("arm") or "aarch64" in processor):
+        return None
+    database_bits = _database_bitness()
+    segment_bits = _segment_bitness(ea)
+    if segment_bits is None or database_bits == segment_bits:
+        return None
+    return {
+        "code": "arm_bitness_mismatch",
+        "address": _hex(ea),
+        "processor": processor,
+        "application_bitness": database_bits,
+        "segment_bitness": segment_bits,
+        "message": (
+            f"[arm_bitness_mismatch] ARM application bitness is {database_bits}, "
+            f"but the target segment at {_hex(ea)} is {segment_bits}-bit. "
+            "Hex-Rays selects the decompiler from application bitness; "
+            f"set application bitness to {segment_bits} (segment bitness alone is insufficient)."
+        ),
+    }
+
+
 def _address_query_candidates(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, int):
         numeric = value
@@ -473,6 +521,9 @@ def _decompile_cfunc(ea: int):
     if func is None:
         raise ValueError(f"No function found at {_hex(ea)}")
     start_ea = func.start_ea
+    architecture_issue = _arm_bitness_issue(start_ea)
+    if architecture_issue is not None:
+        raise RuntimeError(architecture_issue["message"])
     if not ida_hexrays.init_hexrays_plugin():
         raise RuntimeError("Hex-Rays decompiler is not available")
     cfunc = ida_hexrays.decompile(start_ea)
@@ -1674,12 +1725,6 @@ def _primitive_create(ea: int, elem_type: str) -> bool:
 @idasync
 def get_metadata(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     sha256_bytes = ida_nalt.retrieve_input_file_sha256() or b""
-    procname = ""
-    try:
-        procname = ida_ida.inf_get_procname() or ""
-    except Exception:
-        info = getattr(idaapi, "get_inf_structure", lambda: None)()
-        procname = getattr(info, "procname", "") if info is not None else ""
     return {
         "path": ida_nalt.get_input_file_path() or "",
         "module": ida_nalt.get_root_filename() or "",
@@ -1689,17 +1734,18 @@ def get_metadata(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         "min_ea": _hex(ida_ida.inf_get_min_ea()),
         "max_ea": _hex(ida_ida.inf_get_max_ea()),
         "ida_version": idaapi.get_kernel_version(),
-        "processor": procname,
-        "bitness": 64 if ida_ida.inf_is_64bit() else 32,
+        "processor": _processor_name(),
+        "bitness": _database_bitness(),
     }
 
 
 _REPLAY_PAGE_SIZE = 0x1000
 
 
-def _replay_architecture() -> dict[str, Any]:
-    procname = str(getattr(ida_ida, "inf_get_procname", lambda: "")() or "").strip().lower()
-    bits = 64 if ida_ida.inf_is_64bit() else 32
+def _replay_architecture(ea: int) -> dict[str, Any]:
+    procname = _processor_name().strip().lower()
+    database_bits = _database_bitness()
+    bits = _segment_bitness(ea) or database_bits
     if "aarch64" in procname or "arm64" in procname or (procname.startswith("arm") and bits == 64):
         name = "arm64"
     elif procname.startswith("arm"):
@@ -1714,12 +1760,15 @@ def _replay_architecture() -> dict[str, Any]:
         big_endian = bool(ida_ida.inf_is_be())
     except Exception:
         big_endian = False
-    return {
+    architecture = {
         "name": name,
         "bits": bits,
         "endian": "big" if big_endian else "little",
         "processor": procname,
     }
+    if database_bits != bits:
+        architecture["database_bits"] = database_bits
+    return architecture
 
 
 def _replay_default_abi(architecture: dict[str, Any]) -> str:
@@ -1880,7 +1929,7 @@ def capture_function_context(arguments: dict[str, Any] | None = None) -> dict[st
             for name, value in (arguments.get("registers") or {}).items()
         } if isinstance(arguments.get("registers"), dict) else {}
 
-    architecture = _replay_architecture()
+    architecture = _replay_architecture(entry)
     if architecture["name"] == "arm":
         try:
             architecture["mode"] = "thumb" if int(idc.get_sreg(entry, "T")) == 1 else "arm"
