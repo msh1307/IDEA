@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import threading
 import time
 import urllib.error
@@ -279,19 +278,6 @@ class ManagerBridge:
         add(_config_str("manager_url", DEFAULT_MANAGER_URL))
         add(DEFAULT_MANAGER_URL)
         add("http://localhost:18080")
-        try:
-            result = subprocess.run(
-                ["wsl.exe", "-d", "Ubuntu-24.04", "sh", "-lc", "hostname -I"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-            )
-            for token in result.stdout.split():
-                if token.count(".") == 3:
-                    add(f"http://{token}:18080")
-        except Exception:
-            pass
         return urls or [DEFAULT_MANAGER_URL]
 
     @idasync

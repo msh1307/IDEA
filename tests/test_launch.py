@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import tempfile
 import unittest
@@ -17,6 +18,11 @@ class StageRootTests(unittest.TestCase):
     def test_stage_root_accepts_windows_drive(self) -> None:
         with patch.dict(os.environ, {"IDA_MCP_STAGE_ROOT": r"E:\ida-stage"}):
             self.assertEqual(_default_stage_root(Path("/tmp/manager")), Path("/mnt/e/ida-stage"))
+
+    def test_stage_root_rejects_windows_drive_relative_path(self) -> None:
+        with patch.dict(os.environ, {"IDA_MCP_STAGE_ROOT": r"E:ida-stage"}):
+            with self.assertRaisesRegex(ValueError, "drive-relative"):
+                _default_stage_root(Path("/tmp/manager"))
 
     def test_recover_staged_metadata_is_root_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -64,6 +70,38 @@ class StageRootTests(unittest.TestCase):
             compile(source, script_path, "exec")
             self.assertIn("ida_ida.inf_set_app_bitness(bitness)", source)
             self.assertIn("idc.set_segm_addressing", source)
+
+    def test_start_process_returns_pid_without_waiting_for_wrapper_exit(self) -> None:
+        launcher = IdaLauncher.__new__(IdaLauncher)
+
+        class Wrapper:
+            def __init__(self) -> None:
+                self.stdout = io.StringIO("1234\n")
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        wrapper = Wrapper()
+        with patch("ida_hybrid_manager.launch.subprocess.Popen", return_value=wrapper), patch(
+            "ida_hybrid_manager.launch.select.select",
+            return_value=([wrapper.stdout], [], []),
+        ):
+            pid = launcher._start_process(r"C:\IDA\idat.exe", ["sample.i64"])
+
+        self.assertEqual(pid, 1234)
+        self.assertTrue(wrapper.terminated)
 
 
 if __name__ == "__main__":

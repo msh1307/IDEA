@@ -1279,8 +1279,23 @@ def _wait_for_session(pending: PendingLaunch, timeout_sec: float = 90.0):
                 return record
             if pending.engine == "gui" and record.engine == "gui" and record.binary_path.lower() == pending.binary_path.lower():
                 return record
+        if pending.engine == "headless" and pending.pid is not None:
+            try:
+                process_alive = _get_launcher().is_process_alive(pending.pid)
+            except Exception:
+                process_alive = True
+            if not process_alive:
+                pending.metadata["process_exited_before_register"] = True
+                pending.metadata["process_exit_checked_at"] = utc_now().isoformat()
+                return None
         time.sleep(1.0)
     return None
+
+
+def _session_wait_error(pending: PendingLaunch) -> str:
+    if pending.metadata.get("process_exited_before_register"):
+        return f"{pending.engine} IDA process exited before registering a session"
+    return f"Timed out waiting for {pending.engine} session"
 
 
 def _current_or_explicit(session_id: str | None, client_id: str | None = None):
@@ -1902,6 +1917,16 @@ def _unregister_managed_session(record, reason: str, *, step: str) -> bool:
 
 def _sweep_unreachable_sessions(probe_timeout_sec: float = 1.0, max_failures: int = 3) -> None:
     for record in registry.list_sessions(include_dead=False):
+        if record.engine == "gui":
+            if record.status == "stale" and record.owner_pid is not None:
+                try:
+                    owner_alive = _owner_pid_alive(record.owner_pid)
+                except Exception:
+                    owner_alive = True
+                if not owner_alive:
+                    registry.unregister(record.session_id, "owner_pid_exited")
+                    _client_clear_session_references(record.session_id)
+            continue
         if record.engine != "headless" or record.source != "manager_created":
             continue
         if record.status not in {"ready", "busy", "starting"}:
@@ -3358,7 +3383,7 @@ def _local_open_binary(
                 _daemon_debug(f"open_binary wait timeout launch_token={pending.launch_token}")
                 return {
                     "ok": False,
-                    "error": f"Timed out waiting for {pending.engine} session",
+                    "error": _session_wait_error(pending),
                     "pending": pending.to_dict(),
                     "environment": environment,
                 }
@@ -3423,7 +3448,7 @@ def _local_open_binary(
                     cleanup_errors = _terminate_pending_launch(pending, step="open_binary_timeout_terminate")
                     last_failure = {
                         "ok": False,
-                        "error": f"Timed out waiting for {pending.engine} session",
+                        "error": _session_wait_error(pending),
                         "pending": pending.to_dict(),
                         "environment": launcher.inspect_environment(),
                         "logs": _pending_log_summary(pending),
@@ -3715,7 +3740,7 @@ def _local_load_idb(
                 _daemon_debug(f"load_idb wait timeout launch_token={pending.launch_token}")
                 return {
                     "ok": False,
-                    "error": f"Timed out waiting for {pending.engine} session",
+                    "error": _session_wait_error(pending),
                     "pending": pending.to_dict(),
                     "environment": environment,
                 }
@@ -3778,7 +3803,7 @@ def _local_load_idb(
                     cleanup_errors = _terminate_pending_launch(pending, step="load_idb_timeout_terminate")
                     last_failure = {
                         "ok": False,
-                        "error": f"Timed out waiting for {pending.engine} session",
+                        "error": _session_wait_error(pending),
                         "pending": pending.to_dict(),
                         "environment": launcher.inspect_environment(),
                         "logs": _pending_log_summary(pending),

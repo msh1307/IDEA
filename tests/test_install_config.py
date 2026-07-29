@@ -11,6 +11,8 @@ class InstallConfigTests(unittest.TestCase):
         windows = render_windows_server_block(repo, "127.0.0.1", r"C:\IDA", r"E:\stage")
         self.assertIn('IDA_MCP_PROFILE = "lite"', wsl)
         self.assertIn('"IDA_MCP_PROFILE=lite"', windows)
+        self.assertIn("IDA_MCP_STAGE_ROOT = '/mnt/e/stage'", wsl)
+        self.assertIn('"IDA_MCP_STAGE_ROOT=/mnt/e/stage"', windows)
 
 
 if __name__ == "__main__":

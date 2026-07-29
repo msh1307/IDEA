@@ -12,6 +12,8 @@ SECTION_NAME = "mcp_servers.ida-hybrid-manager"
 SECTION_PATTERN = re.compile(
     rf"(?ms)^\[{re.escape(SECTION_NAME)}\]\n.*?(?=^\[|\Z)"
 )
+WINDOWS_DRIVE_RE = re.compile(r"^(?P<drive>[a-zA-Z]):[\\/](?P<rest>.*)$")
+WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[a-zA-Z]:")
 
 
 def _run(command: list[str]) -> str:
@@ -40,6 +42,20 @@ def _toml_basic_string(value: str) -> str:
 def _toml_literal_string(value: str) -> str:
     escaped = value.replace("'", "''")
     return f"'{escaped}'"
+
+
+def _wsl_stage_root(value: str) -> str:
+    value = value.strip()
+    match = WINDOWS_DRIVE_RE.match(value)
+    if match:
+        rest = match.group("rest").replace("\\", "/")
+        return f"/mnt/{match.group('drive').lower()}/{rest}"
+    if WINDOWS_DRIVE_PREFIX_RE.match(value):
+        raise ValueError(
+            f"IDA_MCP_STAGE_ROOT must be absolute: {value!r}; "
+            r"use E:\path or /mnt/e/path"
+        )
+    return value
 
 
 def discover_windows_host() -> str:
@@ -120,7 +136,7 @@ def render_env_inline_table(host: str, ida_install_root: str, stage_root: str = 
         f"IDA_MCP_PROFILE = {_toml_basic_string(profile)}",
     ]
     if stage_root:
-        values.append(f"IDA_MCP_STAGE_ROOT = {_toml_literal_string(stage_root)}")
+        values.append(f"IDA_MCP_STAGE_ROOT = {_toml_literal_string(_wsl_stage_root(stage_root))}")
     return "{ " + ", ".join(values) + " }"
 
 
@@ -152,7 +168,7 @@ def render_windows_server_block(repo_root: Path, host: str, ida_install_root: st
         f"IDA_MCP_PROFILE={profile}",
     ]
     if stage_root:
-        args.append(f"IDA_MCP_STAGE_ROOT={stage_root}")
+        args.append(f"IDA_MCP_STAGE_ROOT={_wsl_stage_root(stage_root)}")
     args.extend(["./.venv/bin/python", "-m", "ida_hybrid_manager.server", "--transport", "stdio"])
     rendered_args = "[" + ", ".join(_toml_basic_string(arg) for arg in args) + "]"
     return "\n".join(

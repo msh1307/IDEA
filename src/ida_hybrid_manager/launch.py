@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import stat
 import shutil
 import socket
@@ -631,17 +632,44 @@ class IdaLauncher:
             f"-PassThru {working_dir_arg}{redirect_args}{window_style}; "
             "$p.Id"
         )
+        wrapper = subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-Command", ps],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        output: list[str] = []
         try:
-            result = self._powershell(ps, timeout_sec=_launch_handshake_timeout_sec())
-        except subprocess.TimeoutExpired:
-            # The watchdog only releases the WSL manager from a stuck
-            # PowerShell wrapper.  It does not address or terminate the IDA
-            # child; the launch token/session heartbeat remains authoritative.
+            deadline = time.monotonic() + _launch_handshake_timeout_sec()
+            while time.monotonic() < deadline and wrapper.stdout is not None:
+                ready, _, _ = select.select([wrapper.stdout], [], [], max(0.0, deadline - time.monotonic()))
+                if not ready:
+                    break
+                line = wrapper.stdout.readline()
+                if not line:
+                    break
+                output.append(line.strip())
+                if output[-1].isdigit():
+                    return int(output[-1])
+            if wrapper.poll() not in {None, 0}:
+                raise RuntimeError("\n".join(output) or "failed to launch IDA")
             return None
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "failed to launch IDA")
-        stdout = result.stdout.strip()
-        return int(stdout) if stdout.isdigit() else None
+        finally:
+            # WSL interop keeps the PowerShell relay alive while the detached
+            # Windows child owns inherited handles. The PID line is the launch
+            # handshake; stopping only that relay does not stop the IDA child.
+            if wrapper.poll() is None:
+                wrapper.terminate()
+                try:
+                    wrapper.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    wrapper.kill()
+                    wrapper.wait()
+            if wrapper.stdout is not None:
+                wrapper.stdout.close()
 
     def _launch_headless_open_path(
         self,
