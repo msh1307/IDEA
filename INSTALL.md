@@ -24,6 +24,8 @@ uses the directory containing `config.json`.
 
 Windows dependencies are refreshed only when `pyproject.toml` changes. If WSL
 interop is unavailable, the native launcher completes that refresh before use.
+The installer also configures user-scoped Claude Code on WSL and Windows and
+Claude Desktop while preserving unrelated Claude settings and MCP servers.
 
 ## 2. Windows IDA plugin
 

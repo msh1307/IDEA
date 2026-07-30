@@ -72,6 +72,7 @@ IDA_MANAGER_CONFIG="$CONFIG_WINDOWS" \
   IDA_MCP_PROFILE="$PROFILE" \
   IDA_WINDOWS_USER="$WINDOWS_USER" \
   python scripts/install_codex_config.py
+python -m scripts.install_claude_config --config "$CONFIG_WINDOWS"
 
 echo "Installed ida-hybrid-manager into $ROOT/.venv"
 echo "Installed Windows fallback into $WINDOWS_FALLBACK_ROOT"

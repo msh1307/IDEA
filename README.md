@@ -22,6 +22,8 @@ The installer keeps the single source of truth at
 works without `--root`, defaulting the root beside `config.json`.
 Windows dependencies are refreshed only when `pyproject.toml` changes; a failed
 WSL interop call is completed locally before the native fallback starts.
+The same install also updates user-scoped Claude Code on WSL and Windows plus
+Claude Desktop, replacing the legacy `ida-pro-mcp` entry only.
 
 Windows PowerShell:
 
