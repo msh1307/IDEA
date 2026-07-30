@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Hybrid IDA session manager for GUI-attached and manager-owned sessions"
 requires-python = ">=3.12"
 dependencies = [
-  "mcp",
+  "mcp>=1.28,<2",
   "unicorn>=2.1,<3",
 ]
 

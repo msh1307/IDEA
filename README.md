@@ -10,8 +10,8 @@ cd IDEA
 ./scripts/install_wsl.sh
 ```
 
-This creates `.venv`, installs the manager in editable mode, and updates the
-Codex MCP config for the current WSL user plus the detected Windows user.
+This creates the WSL `.venv` plus a Windows-native fallback under Local AppData,
+then updates the Codex MCP config for the current WSL user plus the detected Windows user.
 The installer now auto-detects both the Windows host IP and the IDA install root
 and writes them into the generated MCP entry.
 
@@ -52,6 +52,8 @@ What runs now:
 - the `stdio` client auto-reuses the daemon, or starts it if missing
 - the generated Codex config now launches the stdio entrypoint directly, without a shell wrapper
 - The config installer uses `IDA_MCP_PROFILE=lite` to keep the model-facing catalog small; set `IDA_MCP_PROFILE=full` only when direct top-level compatibility tools are needed.
+- The Windows Codex entry uses WSL when the configured distro is already running. If WSL is off, it uses the Windows-native fallback without starting WSL. Both paths share the same manager, registry, replay, and MCP implementation; only host process/path handling differs.
+- The Windows fallback accepts Windows paths and keeps temp/staging data on Windows. Set `IDA_WINDOWS_FALLBACK_ROOT` and `IDA_MCP_STAGE_ROOT` before install to move them, for example to `/mnt/e/ida-hybrid-manager-native` and `/mnt/e/ida-hybrid-manager-staging`.
 
 ## Test
 

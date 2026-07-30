@@ -8,10 +8,14 @@ cd IDEA
 ./scripts/install_wsl.sh
 ```
 
-This creates `.venv` and installs the manager in editable mode.
+This creates the WSL `.venv` and a Windows-native fallback under Local AppData.
 It also updates the Codex MCP config for the current WSL user and the detected
 Windows user at `.codex/config.toml`.
 The detected Windows host IP and IDA install root are written into the generated MCP entry.
+The Windows entry selects the already-running WSL distro, otherwise it runs the
+native fallback without starting WSL. Set `IDA_WINDOWS_FALLBACK_ROOT` and
+`IDA_MCP_STAGE_ROOT` before install to place the fallback and staging roots on
+another drive.
 
 ## 2. Windows IDA plugin
 
@@ -90,7 +94,7 @@ From WSL:
 - The first native raw tool set covers decompile/disasm/xrefs/strings/data inspection/typed reads/comments/types/structs/arrays.
 - Use `inspect_environment` from the MCP server to check IDA paths, GUI plugin install state, and headless bootstrap availability.
 - If your Codex or local MCP config already pins the correct Windows host path, keep using that. The code still keeps fallback probes because WSL networking is inconsistent across systems.
-- The shared daemon uses a fixed port and a lock file at `/tmp/ida-hybrid-manager-daemon.lock`.
+- The shared daemon uses a fixed port and a lock file under the current host's temp directory.
 - The shared daemon health check now includes a build token derived from the daemon-side source files, so changing manager code forces daemon replacement automatically.
 - The installer now tries to auto-detect the installed IDA root and writes `IDA_INSTALL_ROOT` into the MCP config. Override with `IDA_INSTALL_ROOT` if needed.
 - Codex MCP configs are not hot-reloaded. Restart Codex after `config.toml` changes.

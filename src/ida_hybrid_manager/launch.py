@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import select
 import stat
 import shutil
 import socket
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .host import HOST
 from .models import PendingLaunch
 from .networking import candidate_windows_hosts, discover_windows_host
 from .pathing import normalize_path, to_windows_path, to_wsl_path
@@ -154,17 +154,19 @@ def _default_windows_temp() -> str:
     return rf"C:\Users\{_windows_username()}\AppData\Local\Temp\ida-hybrid-manager"
 
 
-def _default_wsl_temp(windows_temp: str) -> str:
+def _default_temp_root(windows_temp: str) -> str:
     env = os.getenv("IDA_WSL_TEMP", "").strip()
     if env:
         return env
+    if HOST.native_windows:
+        return windows_temp
     return to_wsl_path(windows_temp)
 
 
-def _default_stage_root(wsl_temp: Path) -> Path:
+def _default_stage_root(temp_root: Path) -> Path:
     env = os.getenv("IDA_MCP_STAGE_ROOT", "").strip()
     if not env:
-        return wsl_temp / "staged"
+        return temp_root / "staged"
     return Path(normalize_path(env).wsl_path)
 
 
@@ -181,16 +183,16 @@ class IdaLauncher:
         self.ida_headless = rf"{ida_install}\idat.exe"
         self.repo_root = Path(__file__).resolve().parents[2]
         self.plugin_root = _default_plugin_root()
-        self.wsl_temp = Path(_default_wsl_temp(_default_windows_temp()))
-        self.wsl_temp.mkdir(parents=True, exist_ok=True)
-        self.stage_root = _default_stage_root(self.wsl_temp)
+        self.temp_root = Path(_default_temp_root(_default_windows_temp()))
+        self.temp_root.mkdir(parents=True, exist_ok=True)
+        self.stage_root = _default_stage_root(self.temp_root)
         self.stage_root.mkdir(parents=True, exist_ok=True)
-        self.overlay_root = self.wsl_temp / "overlay"
+        self.overlay_root = self.temp_root / "overlay"
         self.overlay_root.mkdir(parents=True, exist_ok=True)
         self.cleanup_stale_temp()
 
     def _stage_roots(self) -> list[Path]:
-        roots = [self.stage_root, self.wsl_temp / "staged"]
+        roots = [self.stage_root, self.temp_root / "staged"]
         return list(dict.fromkeys(root.resolve() for root in roots))
 
     def is_managed_staged_dir(self, path: Path) -> bool:
@@ -247,7 +249,7 @@ class IdaLauncher:
         file_prefixes = ("headless-", "headless-launch-", "architecture-", "launch-")
         file_suffixes = (".py", ".log", ".stdout.log", ".stderr.log", ".idat.log")
         try:
-            entries = list(self.wsl_temp.iterdir())
+            entries = list(self.temp_root.iterdir())
         except OSError as exc:
             return {"removed_files": 0, "removed_dirs": 0, "errors": [str(exc)]}
         for path in entries:
@@ -291,35 +293,14 @@ class IdaLauncher:
         )
 
     def _reserve_headless_port(self) -> int:
-        # The WSL manager still owns the launch lifecycle. This PowerShell probe
-        # only asks Windows for a bindable port for the current on-demand launch.
-        result = self._powershell(
-            "& { "
-            "$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, 0); "
-            "$listener.Start(); "
-            "$port = $listener.LocalEndpoint.Port; "
-            "$listener.Stop(); "
-            "Write-Output $port "
-            "}"
-        )
-        if result.returncode == 0:
-            stdout = result.stdout.strip()
-            if stdout.isdigit():
-                return int(stdout)
-        return pick_free_port()
+        return HOST.reserve_windows_port()
 
     def _resolve_connect_hosts(self) -> list[str]:
         hosts = candidate_windows_hosts()
         return hosts or [discover_windows_host() or "127.0.0.1"]
 
     def _windows_path_exists(self, path: str) -> bool:
-        escaped = path.replace("'", "''")
-        result = self._powershell(
-            f"if (Test-Path -LiteralPath '{escaped}') {{ '1' }} else {{ '0' }}"
-        )
-        if result.returncode != 0:
-            return False
-        return result.stdout.strip() == "1"
+        return HOST.windows_path_exists(path)
 
     def _stage_bundled_headless_backend(self) -> tuple[str, str]:
         source_root = self.repo_root / "plugin_overlay" / "idea_ida_backend"
@@ -398,8 +379,8 @@ class IdaLauncher:
         bootstrap_root: str,
         architecture_script: str | None,
     ) -> str:
-        script_path = self.wsl_temp / f"headless-{launch_token}.py"
-        log_path = self.wsl_temp / f"headless-{launch_token}.log"
+        script_path = self.temp_root / f"headless-{launch_token}.py"
+        log_path = self.temp_root / f"headless-{launch_token}.log"
         script_path.write_text(
             "\n".join(
                 [
@@ -451,7 +432,7 @@ class IdaLauncher:
         return to_windows_path(str(script_path))
 
     def _write_architecture_script(self, launch_token: str, architecture: dict[str, Any]) -> str:
-        script_path = self.wsl_temp / f"architecture-{launch_token}.py"
+        script_path = self.temp_root / f"architecture-{launch_token}.py"
         script_path.write_text(
             "\n".join(
                 [
@@ -606,70 +587,16 @@ class IdaLauncher:
         stderr_path: str | None = None,
         working_directory: str | None = None,
     ) -> int | None:
-        def ps_quote(value: str) -> str:
-            return "'" + str(value).replace("'", "''") + "'"
-
-        escaped_args = []
-        for arg in arguments:
-            escaped_args.append(ps_quote(arg))
-        quoted_args = ", ".join(escaped_args)
-        window_style = "-WindowStyle Hidden" if hidden else ""
-        working_dir = working_directory or executable.rsplit("\\", 1)[0]
-        working_dir_arg = f"-WorkingDirectory {ps_quote(working_dir)} " if working_dir else ""
-        redirect_args = ""
-        if stdout_path:
-            redirect_args += f"-RedirectStandardOutput {ps_quote(stdout_path)} "
-        if stderr_path:
-            redirect_args += f"-RedirectStandardError {ps_quote(stderr_path)} "
-        env_prefix = ""
-        if env:
-            for key, value in env.items():
-                escaped_value = value.replace("'", "''")
-                env_prefix += f"$env:{key} = '{escaped_value}'; "
-        ps = (
-            f"{env_prefix}"
-            f"$p = Start-Process -FilePath {ps_quote(executable)} -ArgumentList @({quoted_args}) "
-            f"-PassThru {working_dir_arg}{redirect_args}{window_style}; "
-            "$p.Id"
+        return HOST.start_windows_process(
+            executable,
+            arguments,
+            hidden=hidden,
+            env=env,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            working_directory=working_directory,
+            handshake_timeout_sec=_launch_handshake_timeout_sec(),
         )
-        wrapper = subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-Command", ps],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-        )
-        output: list[str] = []
-        try:
-            deadline = time.monotonic() + _launch_handshake_timeout_sec()
-            while time.monotonic() < deadline and wrapper.stdout is not None:
-                ready, _, _ = select.select([wrapper.stdout], [], [], max(0.0, deadline - time.monotonic()))
-                if not ready:
-                    break
-                line = wrapper.stdout.readline()
-                if not line:
-                    break
-                output.append(line.strip())
-                if output[-1].isdigit():
-                    return int(output[-1])
-            if wrapper.poll() not in {None, 0}:
-                raise RuntimeError("\n".join(output) or "failed to launch IDA")
-            return None
-        finally:
-            # WSL interop keeps the PowerShell relay alive while the detached
-            # Windows child owns inherited handles. The PID line is the launch
-            # handshake; stopping only that relay does not stop the IDA child.
-            if wrapper.poll() is None:
-                wrapper.terminate()
-                try:
-                    wrapper.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    wrapper.kill()
-                    wrapper.wait()
-            if wrapper.stdout is not None:
-                wrapper.stdout.close()
 
     def _launch_headless_open_path(
         self,
@@ -687,11 +614,11 @@ class IdaLauncher:
         connect_hosts = self._resolve_connect_hosts()
         endpoint_host = connect_hosts[0]
         bootstrap_root, bootstrap_source = self._stage_bundled_headless_backend()
-        stdout_log_path = to_windows_path(str(self.wsl_temp / f"{launch_token}.stdout.log"))
-        stderr_log_path = to_windows_path(str(self.wsl_temp / f"{launch_token}.stderr.log"))
+        stdout_log_path = to_windows_path(str(self.temp_root / f"{launch_token}.stdout.log"))
+        stderr_log_path = to_windows_path(str(self.temp_root / f"{launch_token}.stderr.log"))
         headless_mode = (os.getenv("IDA_HEADLESS_MODE", "idat").strip() or "idat").lower()
         use_gui_hidden = headless_mode in {"gui", "gui-hidden", "ida", "auto"}
-        idat_log_path = to_windows_path(str(self.wsl_temp / f"{launch_token}.idat.log"))
+        idat_log_path = to_windows_path(str(self.temp_root / f"{launch_token}.idat.log"))
         architecture_script = None
         if _architecture_needs_script(architecture):
             architecture_script = self._write_architecture_script(launch_token, architecture)

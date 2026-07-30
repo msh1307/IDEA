@@ -4,6 +4,8 @@ import os
 import subprocess
 from urllib.parse import urlsplit, urlunsplit
 
+from .host import HOST
+
 
 def _split_hosts(value: str) -> list[str]:
     hosts: list[str] = []
@@ -25,9 +27,15 @@ def candidate_windows_hosts(*, include_loopback: bool = True) -> list[str]:
         seen.add(candidate)
         hosts.append(candidate)
 
+    if HOST.native_windows:
+        add("127.0.0.1")
+
     env = os.getenv("IDA_MCP_CONNECT_HOST", "").strip()
     for host in _split_hosts(env):
         add(host)
+
+    if HOST.native_windows:
+        return hosts
 
     commands = [
         ["sh", "-lc", "ip route show default | awk '/default/ {print $3; exit}'"],

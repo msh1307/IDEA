@@ -58,6 +58,15 @@ def _wsl_stage_root(value: str) -> str:
     return value
 
 
+def _windows_stage_root(value: str) -> str:
+    value = value.strip()
+    match = re.match(r"^/mnt/(?P<drive>[a-zA-Z])/(?P<rest>.*)$", value)
+    if match:
+        rest = match.group("rest").replace("/", "\\")
+        return f"{match.group('drive').upper()}:\\{rest}"
+    return value
+
+
 def discover_windows_host() -> str:
     env = os.getenv("IDA_MCP_CONNECT_HOST", "").strip()
     if env:
@@ -183,6 +192,44 @@ def render_windows_server_block(repo_root: Path, host: str, ida_install_root: st
     )
 
 
+def render_windows_fallback_block(
+    fallback_root: str,
+    repo_root: Path,
+    ida_install_root: str,
+    stage_root: str = "",
+    profile: str = "lite",
+) -> str:
+    distro = os.getenv("IDA_WSL_DISTRO", "Ubuntu-24.04").strip() or "Ubuntu-24.04"
+    args = [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        fallback_root.rstrip("\\/") + r"\run_manager_fallback.ps1",
+        "-Distro",
+        distro,
+        "-WslRepo",
+        str(repo_root),
+        "-IdaInstallRoot",
+        ida_install_root,
+        "-Profile",
+        profile,
+    ]
+    if stage_root:
+        args.extend(["-StageRoot", _windows_stage_root(stage_root)])
+    rendered_args = "[" + ", ".join(_toml_basic_string(arg) for arg in args) + "]"
+    return "\n".join(
+        [
+            f"[{SECTION_NAME}]",
+            'command = "powershell.exe"',
+            f"args = {rendered_args}",
+            "startup_timeout_sec = 90.0",
+            "tool_timeout_sec = 120.0",
+            "",
+        ]
+    )
+
+
 def upsert_config(path: Path, block: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     original = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -211,9 +258,20 @@ def main() -> int:
     if profile not in {"full", "lite"}:
         raise ValueError("IDA_MCP_PROFILE must be full or lite")
     windows_user = discover_windows_user()
+    fallback_root = os.getenv("IDA_WINDOWS_FALLBACK_ROOT", "").strip()
+    if fallback_root:
+        windows_block = render_windows_fallback_block(
+            fallback_root,
+            repo_root,
+            ida_install_root,
+            stage_root,
+            profile,
+        )
+    else:
+        windows_block = render_windows_server_block(repo_root, host, ida_install_root, stage_root, profile)
     targets = [
         (Path.home() / ".codex" / "config.toml", render_wsl_server_block(repo_root, host, ida_install_root, stage_root, profile)),
-        (Path(f"/mnt/c/Users/{windows_user}/.codex/config.toml"), render_windows_server_block(repo_root, host, ida_install_root, stage_root, profile)),
+        (Path(f"/mnt/c/Users/{windows_user}/.codex/config.toml"), windows_block),
     ]
 
     print(f"detected Windows host: {host}")

@@ -27,7 +27,7 @@ class StageRootTests(unittest.TestCase):
     def test_recover_staged_metadata_is_root_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             launcher = IdaLauncher.__new__(IdaLauncher)
-            launcher.wsl_temp = Path(root) / "temp"
+            launcher.temp_root = Path(root) / "temp"
             launcher.stage_root = Path(root) / "stage"
             staged = launcher.stage_root / "0123456789ab"
             staged.mkdir(parents=True)
@@ -45,7 +45,7 @@ class StageRootTests(unittest.TestCase):
     def test_cleanup_refuses_unmanaged_directory(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             launcher = IdaLauncher.__new__(IdaLauncher)
-            launcher.wsl_temp = Path(root) / "temp"
+            launcher.temp_root = Path(root) / "temp"
             launcher.stage_root = Path(root) / "stage"
             outside = Path(root) / "0123456789ab"
             outside.mkdir()
@@ -56,7 +56,7 @@ class StageRootTests(unittest.TestCase):
     def test_architecture_script_sets_application_and_segment_bitness(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             launcher = IdaLauncher.__new__(IdaLauncher)
-            launcher.wsl_temp = Path(root)
+            launcher.temp_root = Path(root)
             architecture = {
                 "processor": "ARM",
                 "compiler": None,
@@ -94,8 +94,8 @@ class StageRootTests(unittest.TestCase):
                 self.returncode = -9
 
         wrapper = Wrapper()
-        with patch("ida_hybrid_manager.launch.subprocess.Popen", return_value=wrapper), patch(
-            "ida_hybrid_manager.launch.select.select",
+        with patch("ida_hybrid_manager.host.subprocess.Popen", return_value=wrapper), patch(
+            "ida_hybrid_manager.host.select.select",
             return_value=([wrapper.stdout], [], []),
         ):
             pid = launcher._start_process(r"C:\IDA\idat.exe", ["sample.i64"])

@@ -6,6 +6,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from .host import HOST
 from .registry import SessionRegistry
 
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
@@ -58,6 +59,7 @@ class ManagerApiServer:
                             "service": "ida-hybrid-manager",
                             "daemon_api_version": self.server.manager_api_version,
                             "build_token": self.server.manager_build_token,
+                            "host_platform": HOST.platform,
                         },
                     )
                     return

@@ -4,6 +4,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from .host import HOST
+
 
 WINDOWS_DRIVE_RE = re.compile(r"^(?P<drive>[a-zA-Z]):[\\/](?P<rest>.*)$")
 WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[a-zA-Z]:")
@@ -42,6 +44,8 @@ def to_windows_path(path: str) -> str:
 
 def to_wsl_path(path: str) -> str:
     path = _validated_path(path)
+    if HOST.native_windows:
+        return to_windows_path(path)
     match = WSL_DRIVE_RE.match(path)
     if match:
         return f"/mnt/{match.group('drive').lower()}/{match.group('rest')}"
@@ -54,6 +58,9 @@ def to_wsl_path(path: str) -> str:
 
 def normalize_path(path: str) -> NormalizedPath:
     path = _validated_path(path)
+    if HOST.native_windows:
+        windows_path = os.path.realpath(to_windows_path(path))
+        return NormalizedPath(input_path=path, windows_path=windows_path, wsl_path=windows_path)
     if not WINDOWS_DRIVE_RE.match(path):
         resolved = os.path.realpath(path)
         if resolved:

@@ -5,7 +5,6 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, contextmanager
 from datetime import datetime
-import fcntl
 import hashlib
 from io import TextIOWrapper
 import json
@@ -34,6 +33,7 @@ from mcp.shared.message import SessionMessage
 from mcp.shared.session import RequestResponder
 
 from .backend import BackendTimeoutError, BackendToolError, BackendUnavailableError, call_backend_tool_any, list_backend_tools_any
+from .host import HOST
 from .launch import IdaLauncher
 from .manager_api import ManagerApiServer
 from .models import PendingLaunch, utc_now
@@ -46,10 +46,12 @@ DAEMON_HOST = "127.0.0.1"
 DAEMON_PORT = 18080
 DAEMON_API_VERSION = 5
 DAEMON_URL = f"http://{DAEMON_HOST}:{DAEMON_PORT}"
-DAEMON_LOCK_PATH = Path("/tmp/ida-hybrid-manager-daemon.lock")
-DAEMON_LOG_PATH = Path("/tmp/ida-hybrid-manager-daemon.log")
-STDIO_DEBUG_PATH = Path("/tmp/ida-hybrid-manager-stdio.log")
-MCP_ARTIFACT_DIR = Path(os.getenv("IDA_MCP_ARTIFACT_DIR", "/tmp/ida-hybrid-manager-artifacts")).expanduser()
+DAEMON_LOCK_PATH = HOST.runtime_temp_dir / "ida-hybrid-manager-daemon.lock"
+DAEMON_LOG_PATH = HOST.runtime_temp_dir / "ida-hybrid-manager-daemon.log"
+STDIO_DEBUG_PATH = HOST.runtime_temp_dir / "ida-hybrid-manager-stdio.log"
+MCP_ARTIFACT_DIR = Path(
+    os.getenv("IDA_MCP_ARTIFACT_DIR", str(HOST.runtime_temp_dir / "ida-hybrid-manager-artifacts"))
+).expanduser()
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -65,7 +67,9 @@ MCP_ARTIFACT_TTL_SEC = _env_int("IDA_MCP_ARTIFACT_TTL_SEC", 30 * 60, minimum=60)
 MCP_ARTIFACT_MAX_BYTES = _env_int("IDA_MCP_ARTIFACT_MAX_BYTES", 256 * 1024 * 1024, minimum=1024 * 1024)
 MCP_ARTIFACT_CLEANUP_INTERVAL_SEC = _env_int("IDA_MCP_ARTIFACT_CLEANUP_INTERVAL_SEC", 60, minimum=1)
 MCP_ARTIFACT_TMP_TTL_SEC = max(60, min(MCP_ARTIFACT_TTL_SEC, 5 * 60))
-REPLAY_SNAPSHOT_DIR = Path(os.getenv("IDA_MCP_REPLAY_DIR", "/tmp/ida-hybrid-manager-replay")).expanduser()
+REPLAY_SNAPSHOT_DIR = Path(
+    os.getenv("IDA_MCP_REPLAY_DIR", str(HOST.runtime_temp_dir / "ida-hybrid-manager-replay"))
+).expanduser()
 REPLAY_SNAPSHOT_TTL_SEC = _env_int("IDA_MCP_REPLAY_TTL_SEC", 30 * 60, minimum=60)
 REPLAY_SNAPSHOT_MAX_BYTES = _env_int("IDA_MCP_REPLAY_MAX_BYTES", 256 * 1024 * 1024, minimum=1024 * 1024)
 _replay_snapshot_lock = threading.RLock()
@@ -2979,46 +2983,15 @@ def _daemon_healthz_ok(timeout_sec: float = 2.0) -> bool:
 
 
 def _listener_pid_for_port(port: int) -> int | None:
-    try:
-        output = subprocess.check_output(["ss", "-ltnp"], text=True, stderr=subprocess.DEVNULL)
-    except Exception:
-        return None
-    for line in output.splitlines():
-        if f":{port} " not in line and not line.rstrip().endswith(f":{port}"):
-            continue
-        if "users:((" not in line:
-            continue
-        try:
-            pid_part = line.split('pid=', 1)[1]
-            pid_text = pid_part.split(',', 1)[0].split(')', 1)[0].strip()
-            if pid_text.isdigit():
-                return int(pid_text)
-        except Exception:
-            continue
-    return None
+    return HOST.listener_pid(port)
 
 
 def _process_command(pid: int) -> str:
-    try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "ignore").strip()
-    except Exception:
-        return ""
+    return HOST.process_command(pid)
 
 
 def _terminate_local_process(pid: int) -> None:
-    try:
-        os.kill(pid, 15)
-    except ProcessLookupError:
-        return
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if not Path(f"/proc/{pid}").exists():
-            return
-        time.sleep(0.1)
-    try:
-        os.kill(pid, 9)
-    except ProcessLookupError:
-        return
+    HOST.terminate_local_process(pid)
 
 
 def _cleanup_incompatible_daemon_sessions() -> bool:
@@ -3071,14 +3044,11 @@ def _spawn_daemon() -> subprocess.Popen[Any]:
     env = os.environ.copy()
     DAEMON_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with DAEMON_LOG_PATH.open("ab") as log_file:
-        return subprocess.Popen(
+        return HOST.spawn_daemon(
             [sys.executable, "-m", "ida_hybrid_manager.server", "--transport", "daemon"],
-            cwd=str(Path(__file__).resolve().parents[2]),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+            Path(__file__).resolve().parents[2],
+            log_file,
+            env,
         )
 
 
@@ -3088,8 +3058,7 @@ def _ensure_shared_daemon(timeout_sec: float = 20.0) -> None:
     DAEMON_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     spawned: subprocess.Popen[Any] | None = None
     with DAEMON_LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
+        with HOST.daemon_lock(lock_file):
             if not _daemon_healthz_ok():
                 _replace_incompatible_daemon()
                 spawned = _spawn_daemon()
@@ -3102,8 +3071,6 @@ def _ensure_shared_daemon(timeout_sec: float = 20.0) -> None:
                     lock_file.flush()
                     return
                 time.sleep(0.5)
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     if spawned is not None and spawned.poll() is None:
         _terminate_local_process(spawned.pid)
     raise RuntimeError(f"Timed out waiting for ida-hybrid-manager daemon at {DAEMON_URL}")
