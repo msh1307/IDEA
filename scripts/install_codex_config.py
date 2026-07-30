@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -17,17 +18,21 @@ WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[a-zA-Z]:")
 
 
 def _run(command: list[str]) -> str:
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-        encoding="utf-8",
-        errors="ignore",
-    )
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
+    attempts = 3 if command[0].lower().endswith(".exe") else 1
+    for _attempt in range(attempts):
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        if _attempt < 2:
+            time.sleep(1)
+    return ""
 
 
 def _toml_basic_string(value: str) -> str:
@@ -138,7 +143,15 @@ def discover_windows_user() -> str:
     return "USER"
 
 
-def render_env_inline_table(host: str, ida_install_root: str, stage_root: str = "", profile: str = "lite") -> str:
+def render_env_inline_table(
+    host: str,
+    ida_install_root: str,
+    stage_root: str = "",
+    profile: str = "lite",
+    windows_temp: str = "",
+    artifact_root: str = "",
+    replay_root: str = "",
+) -> str:
     values = [
         f"IDA_MCP_CONNECT_HOST = {_toml_basic_string(host)}",
         f"IDA_INSTALL_ROOT = {_toml_literal_string(ida_install_root)}",
@@ -146,17 +159,32 @@ def render_env_inline_table(host: str, ida_install_root: str, stage_root: str = 
     ]
     if stage_root:
         values.append(f"IDA_MCP_STAGE_ROOT = {_toml_literal_string(_wsl_stage_root(stage_root))}")
+    if windows_temp:
+        values.append(f"IDA_WSL_TEMP = {_toml_literal_string(_wsl_stage_root(windows_temp))}")
+    if artifact_root:
+        values.append(f"IDA_MCP_ARTIFACT_DIR = {_toml_literal_string(_wsl_stage_root(artifact_root))}")
+    if replay_root:
+        values.append(f"IDA_MCP_REPLAY_DIR = {_toml_literal_string(_wsl_stage_root(replay_root))}")
     return "{ " + ", ".join(values) + " }"
 
 
-def render_wsl_server_block(repo_root: Path, host: str, ida_install_root: str, stage_root: str = "", profile: str = "lite") -> str:
+def render_wsl_server_block(
+    repo_root: Path,
+    host: str,
+    ida_install_root: str,
+    stage_root: str = "",
+    profile: str = "lite",
+    windows_temp: str = "",
+    artifact_root: str = "",
+    replay_root: str = "",
+) -> str:
     return "\n".join(
         [
             f"[{SECTION_NAME}]",
             f'command = "{repo_root}/.venv/bin/python"',
             'args = ["-m", "ida_hybrid_manager.server", "--transport", "stdio"]',
             f'cwd = "{repo_root}"',
-            f"env = {render_env_inline_table(host, ida_install_root, stage_root, profile)}",
+            f"env = {render_env_inline_table(host, ida_install_root, stage_root, profile, windows_temp, artifact_root, replay_root)}",
             "startup_timeout_sec = 90.0",
             "tool_timeout_sec = 120.0",
             "",
@@ -164,7 +192,16 @@ def render_wsl_server_block(repo_root: Path, host: str, ida_install_root: str, s
     )
 
 
-def render_windows_server_block(repo_root: Path, host: str, ida_install_root: str, stage_root: str = "", profile: str = "lite") -> str:
+def render_windows_server_block(
+    repo_root: Path,
+    host: str,
+    ida_install_root: str,
+    stage_root: str = "",
+    profile: str = "lite",
+    windows_temp: str = "",
+    artifact_root: str = "",
+    replay_root: str = "",
+) -> str:
     distro = os.getenv("IDA_WSL_DISTRO", "Ubuntu-24.04").strip() or "Ubuntu-24.04"
     args = [
         "-d",
@@ -178,6 +215,12 @@ def render_windows_server_block(repo_root: Path, host: str, ida_install_root: st
     ]
     if stage_root:
         args.append(f"IDA_MCP_STAGE_ROOT={_wsl_stage_root(stage_root)}")
+    if windows_temp:
+        args.append(f"IDA_WSL_TEMP={_wsl_stage_root(windows_temp)}")
+    if artifact_root:
+        args.append(f"IDA_MCP_ARTIFACT_DIR={_wsl_stage_root(artifact_root)}")
+    if replay_root:
+        args.append(f"IDA_MCP_REPLAY_DIR={_wsl_stage_root(replay_root)}")
     args.extend(["./.venv/bin/python", "-m", "ida_hybrid_manager.server", "--transport", "stdio"])
     rendered_args = "[" + ", ".join(_toml_basic_string(arg) for arg in args) + "]"
     return "\n".join(
@@ -198,6 +241,7 @@ def render_windows_fallback_block(
     ida_install_root: str,
     stage_root: str = "",
     profile: str = "lite",
+    install_config: str = "",
 ) -> str:
     distro = os.getenv("IDA_WSL_DISTRO", "Ubuntu-24.04").strip() or "Ubuntu-24.04"
     fallback_root = _windows_path(fallback_root)
@@ -207,17 +251,24 @@ def render_windows_fallback_block(
         "Bypass",
         "-File",
         fallback_root.rstrip("\\/") + r"\run_manager_fallback.ps1",
-        "-Distro",
-        distro,
-        "-WslRepo",
-        str(repo_root),
-        "-IdaInstallRoot",
-        ida_install_root,
-        "-Profile",
-        profile,
     ]
-    if stage_root:
-        args.extend(["-StageRoot", _windows_path(stage_root)])
+    if install_config:
+        args.extend(["-Config", _windows_path(install_config)])
+    else:
+        args.extend(
+            [
+                "-Distro",
+                distro,
+                "-WslRepo",
+                str(repo_root),
+                "-IdaInstallRoot",
+                ida_install_root,
+                "-Profile",
+                profile,
+            ]
+        )
+        if stage_root:
+            args.extend(["-StageRoot", _windows_path(stage_root)])
     rendered_args = "[" + ", ".join(_toml_basic_string(arg) for arg in args) + "]"
     return "\n".join(
         [
@@ -255,6 +306,10 @@ def main() -> int:
     host = discover_windows_host()
     ida_install_root = discover_ida_install_root()
     stage_root = os.getenv("IDA_MCP_STAGE_ROOT", "").strip()
+    windows_temp = os.getenv("IDA_WINDOWS_TEMP", "").strip()
+    artifact_root = os.getenv("IDA_MCP_ARTIFACT_DIR", "").strip()
+    replay_root = os.getenv("IDA_MCP_REPLAY_DIR", "").strip()
+    install_config = os.getenv("IDA_MANAGER_CONFIG", "").strip()
     profile = os.getenv("IDA_MCP_PROFILE", "lite").strip().lower() or "lite"
     if profile not in {"full", "lite"}:
         raise ValueError("IDA_MCP_PROFILE must be full or lite")
@@ -267,11 +322,19 @@ def main() -> int:
             ida_install_root,
             stage_root,
             profile,
+            install_config,
         )
     else:
-        windows_block = render_windows_server_block(repo_root, host, ida_install_root, stage_root, profile)
+        windows_block = render_windows_server_block(
+            repo_root, host, ida_install_root, stage_root, profile, windows_temp, artifact_root, replay_root
+        )
     targets = [
-        (Path.home() / ".codex" / "config.toml", render_wsl_server_block(repo_root, host, ida_install_root, stage_root, profile)),
+        (
+            Path.home() / ".codex" / "config.toml",
+            render_wsl_server_block(
+                repo_root, host, ida_install_root, stage_root, profile, windows_temp, artifact_root, replay_root
+            ),
+        ),
         (Path(f"/mnt/c/Users/{windows_user}/.codex/config.toml"), windows_block),
     ]
 

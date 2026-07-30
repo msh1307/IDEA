@@ -5,17 +5,22 @@
 ```bash
 git clone <repo-url>
 cd IDEA
-./scripts/install_wsl.sh
+./scripts/install_wsl.sh --root 'E:\ida-hybrid-manager'
 ```
 
-This creates the WSL `.venv` and a Windows-native fallback under Local AppData.
+This creates the WSL `.venv` and a Windows-native fallback under the selected root.
 It also updates the Codex MCP config for the current WSL user and the detected
 Windows user at `.codex/config.toml`.
 The detected Windows host IP and IDA install root are written into the generated MCP entry.
 The Windows entry selects the already-running WSL distro, otherwise it runs the
-native fallback without starting WSL. Set `IDA_WINDOWS_FALLBACK_ROOT` and
-`IDA_MCP_STAGE_ROOT` before install to place the fallback and staging roots on
-another drive.
+native fallback without starting WSL.
+
+The installer stores one config at
+`%LOCALAPPDATA%\ida-hybrid-manager\config.json`. The selected root and other
+settings are reused by later installer runs; `native`, `staging`, `temp`,
+`artifacts`, and `replay` are derived below it. `IDA_MANAGER_ROOT` remains
+available for non-interactive overrides. Omitting `--root` on the first install
+uses the directory containing `config.json`.
 
 ## 2. Windows IDA plugin
 

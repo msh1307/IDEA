@@ -7,13 +7,19 @@ WSL:
 ```bash
 git clone <repo-url>
 cd IDEA
-./scripts/install_wsl.sh
+./scripts/install_wsl.sh --root /mnt/e/ida-hybrid-manager
 ```
 
-This creates the WSL `.venv` plus a Windows-native fallback under Local AppData,
+This creates the WSL `.venv` plus a Windows-native fallback under the selected root,
 then updates the Codex MCP config for the current WSL user plus the detected Windows user.
 The installer now auto-detects both the Windows host IP and the IDA install root
 and writes them into the generated MCP entry.
+
+After that, `git pull && ./scripts/install_wsl.sh` reinstalls to the same paths.
+The installer keeps the single source of truth at
+`%LOCALAPPDATA%\ida-hybrid-manager\config.json` and derives `native`, `staging`,
+`temp`, `artifacts`, and `replay` below the selected root. The first install also
+works without `--root`, defaulting the root beside `config.json`.
 
 Windows PowerShell:
 
@@ -53,7 +59,7 @@ What runs now:
 - the generated Codex config now launches the stdio entrypoint directly, without a shell wrapper
 - The config installer uses `IDA_MCP_PROFILE=lite` to keep the model-facing catalog small; set `IDA_MCP_PROFILE=full` only when direct top-level compatibility tools are needed.
 - The Windows Codex entry uses WSL when the configured distro is already running. If WSL is off, it uses the Windows-native fallback without starting WSL. Both paths share the same manager, registry, replay, and MCP implementation; only host process/path handling differs.
-- The Windows fallback accepts Windows paths and keeps temp/staging data on Windows. Set `IDA_WINDOWS_FALLBACK_ROOT` and `IDA_MCP_STAGE_ROOT` before install to move them, for example to `/mnt/e/ida-hybrid-manager-native` and `/mnt/e/ida-hybrid-manager-staging`.
+- The Windows fallback accepts Windows paths and keeps its managed data below the configured Windows root. Use `--root` once; later installs reuse `config.json`. `IDA_MANAGER_ROOT` remains available for automation.
 
 ## Test
 

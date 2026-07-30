@@ -1,13 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+run_windows() {
+  local attempt
+  for attempt in 1 2 3; do
+    "$@" && return 0
+    ((attempt == 3)) || sleep 1
+  done
+  return 1
+}
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WINDOWS_LOCAL_APPDATA="$(
-  powershell.exe -NoProfile -Command '[Environment]::GetFolderPath("LocalApplicationData")' |
-    tr -d '\r'
-)"
-DEFAULT_FALLBACK_ROOT="$(wslpath -u "${WINDOWS_LOCAL_APPDATA}\\ida-hybrid-manager")"
-FALLBACK_ROOT="${IDA_WINDOWS_FALLBACK_ROOT:-$DEFAULT_FALLBACK_ROOT}"
+FALLBACK_ROOT="${IDA_WINDOWS_FALLBACK_ROOT:-}"
+if [[ -z "$FALLBACK_ROOT" ]]; then
+  WINDOWS_LOCAL_APPDATA="$(
+    run_windows powershell.exe -NoProfile -Command '[Environment]::GetFolderPath("LocalApplicationData")' |
+      tr -d '\r'
+  )"
+  FALLBACK_ROOT="$(wslpath -u "${WINDOWS_LOCAL_APPDATA}\\ida-hybrid-manager")"
+fi
+if [[ "$FALLBACK_ROOT" =~ ^[A-Za-z]:[\\/].* ]]; then
+  FALLBACK_ROOT="$(wslpath -u "$FALLBACK_ROOT")"
+elif [[ "$FALLBACK_ROOT" =~ ^[A-Za-z]: ]]; then
+  echo "Fallback root must be absolute: $FALLBACK_ROOT" >&2
+  exit 2
+fi
 MARKER="$FALLBACK_ROOT/.ida-hybrid-manager-native"
 
 mkdir -p "$FALLBACK_ROOT"
@@ -25,7 +42,7 @@ cp "$REPO_ROOT/pyproject.toml" \
    "$FALLBACK_ROOT/"
 
 WINDOWS_ROOT="$(wslpath -w "$FALLBACK_ROOT")"
-powershell.exe -NoProfile -ExecutionPolicy Bypass \
+run_windows powershell.exe -NoProfile -ExecutionPolicy Bypass \
   -File "${WINDOWS_ROOT}\\install_windows_fallback.ps1" \
   -FallbackRoot "$WINDOWS_ROOT" \
   -SourceRoot "$WINDOWS_ROOT" >&2
