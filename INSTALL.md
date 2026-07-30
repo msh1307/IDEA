@@ -22,6 +22,9 @@ settings are reused by later installer runs; `native`, `staging`, `temp`,
 available for non-interactive overrides. Omitting `--root` on the first install
 uses the directory containing `config.json`.
 
+Windows dependencies are refreshed only when `pyproject.toml` changes. If WSL
+interop is unavailable, the native launcher completes that refresh before use.
+
 ## 2. Windows IDA plugin
 
 Open PowerShell on Windows:

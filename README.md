@@ -20,6 +20,8 @@ The installer keeps the single source of truth at
 `%LOCALAPPDATA%\ida-hybrid-manager\config.json` and derives `native`, `staging`,
 `temp`, `artifacts`, and `replay` below the selected root. The first install also
 works without `--root`, defaulting the root beside `config.json`.
+Windows dependencies are refreshed only when `pyproject.toml` changes; a failed
+WSL interop call is completed locally before the native fallback starts.
 
 Windows PowerShell:
 

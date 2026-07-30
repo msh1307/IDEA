@@ -7,7 +7,7 @@ from scripts.install_codex_config import (
     render_windows_server_block,
     render_wsl_server_block,
 )
-from scripts.install_manager_config import _windows_path, _wsl_path
+from scripts.install_manager_config import _windows_path, _windows_user, _wsl_path
 
 
 class InstallConfigTests(unittest.TestCase):
@@ -55,6 +55,10 @@ class InstallConfigTests(unittest.TestCase):
         )
         self.assertIn("IDA_WSL_TEMP = '/mnt/e/ida-hybrid-manager/temp'", env)
         self.assertIn("IDA_MCP_ARTIFACT_DIR = '/mnt/e/ida-hybrid-manager/artifacts'", env)
+
+    def test_windows_user_is_recovered_without_windows_interop(self) -> None:
+        path = Path("/mnt/c/Users/msh/AppData/Local/ida-hybrid-manager/config.json")
+        self.assertEqual(_windows_user(path, {}), "msh")
 
 
 if __name__ == "__main__":

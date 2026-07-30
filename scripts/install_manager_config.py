@@ -10,7 +10,7 @@ import re
 import subprocess
 import time
 
-from scripts.install_codex_config import discover_ida_install_root
+from scripts.install_codex_config import discover_ida_install_root, discover_windows_user
 
 
 WINDOWS_DRIVE_RE = re.compile(r"^(?P<drive>[a-zA-Z]):[\\/](?P<rest>.*)$")
@@ -97,6 +97,17 @@ def _config_paths(repo_root: Path) -> tuple[Path, str]:
     return Path(_wsl_path(windows)), windows
 
 
+def _windows_user(config_path: Path, existing: dict) -> str:
+    configured = (os.getenv("IDA_WINDOWS_USER") or str(existing.get("windows_user") or "")).strip()
+    if configured:
+        return configured
+    parts = config_path.parts
+    for index, part in enumerate(parts[:-1]):
+        if part.lower() == "users" and index + 1 < len(parts):
+            return parts[index + 1]
+    return discover_windows_user()
+
+
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f"{path.name}.tmp")
@@ -139,6 +150,7 @@ def main() -> int:
             or str(existing.get("ida_install_root") or "")
             or discover_ida_install_root()
         ).strip(),
+        "windows_user": _windows_user(config_wsl, existing),
         "profile": profile,
     }
     _write_json(config_wsl, payload)
@@ -155,6 +167,7 @@ def main() -> int:
         payload["ida_install_root"],
         payload["wsl_distro"],
         payload["profile"],
+        payload["windows_user"],
     ):
         print(value)
     return 0

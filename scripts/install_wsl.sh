@@ -33,7 +33,7 @@ if [[ -n "$MANAGER_ROOT" ]]; then
 fi
 CONFIG_OUTPUT="$(python3 -m scripts.install_manager_config "${CONFIG_ARGS[@]}")"
 mapfile -t INSTALL_CONFIG <<<"$CONFIG_OUTPUT"
-[[ ${#INSTALL_CONFIG[@]} -eq 11 ]] || {
+[[ ${#INSTALL_CONFIG[@]} -eq 12 ]] || {
   echo "Invalid install config output" >&2
   exit 1
 }
@@ -48,6 +48,7 @@ REPLAY_WINDOWS="${INSTALL_CONFIG[7]}"
 IDA_ROOT="${INSTALL_CONFIG[8]}"
 WSL_DISTRO="${INSTALL_CONFIG[9]}"
 PROFILE="${INSTALL_CONFIG[10]}"
+WINDOWS_USER="${INSTALL_CONFIG[11]}"
 
 python3 -m venv .venv
 . .venv/bin/activate
@@ -69,6 +70,7 @@ IDA_MANAGER_CONFIG="$CONFIG_WINDOWS" \
   IDA_INSTALL_ROOT="$IDA_ROOT" \
   IDA_WSL_DISTRO="$WSL_DISTRO" \
   IDA_MCP_PROFILE="$PROFILE" \
+  IDA_WINDOWS_USER="$WINDOWS_USER" \
   python scripts/install_codex_config.py
 
 echo "Installed ida-hybrid-manager into $ROOT/.venv"

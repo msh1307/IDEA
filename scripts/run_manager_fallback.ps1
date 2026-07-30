@@ -104,5 +104,16 @@ if ($ArtifactRoot) {
 if ($ReplayRoot) {
     $env:IDA_MCP_REPLAY_DIR = $ReplayRoot
 }
-& "$FallbackRoot\.venv\Scripts\python.exe" -m ida_hybrid_manager.server --transport stdio
+$venvPython = Join-Path $FallbackRoot ".venv\Scripts\python.exe"
+$dependencyMarker = Join-Path $FallbackRoot ".ida-hybrid-manager-deps.sha256"
+$dependencyHash = (Get-FileHash (Join-Path $FallbackRoot "pyproject.toml") -Algorithm SHA256).Hash.ToLowerInvariant()
+$installedHash = if (Test-Path -LiteralPath $dependencyMarker) {
+    (Get-Content -LiteralPath $dependencyMarker -Raw).Trim().ToLowerInvariant()
+} else {
+    ""
+}
+if (-not (Test-Path -LiteralPath $venvPython) -or $installedHash -ne $dependencyHash) {
+    & "$FallbackRoot\install_windows_fallback.ps1" -FallbackRoot $FallbackRoot -SourceRoot $FallbackRoot | Out-Null
+}
+& $venvPython -m ida_hybrid_manager.server --transport stdio
 exit $LASTEXITCODE

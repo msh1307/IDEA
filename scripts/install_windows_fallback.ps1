@@ -49,4 +49,8 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to install ida-hybrid-manager into the Windows fallback environment."
 }
 
+$dependencyHash = (Get-FileHash (Join-Path $FallbackRoot "pyproject.toml") -Algorithm SHA256).Hash.ToLowerInvariant()
+$dependencyMarker = Join-Path $FallbackRoot ".ida-hybrid-manager-deps.sha256"
+Set-Content -LiteralPath $dependencyMarker -Value $dependencyHash -Encoding Ascii
+
 Write-Output $FallbackRoot

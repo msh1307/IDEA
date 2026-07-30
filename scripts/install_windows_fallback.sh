@@ -42,8 +42,19 @@ cp "$REPO_ROOT/pyproject.toml" \
    "$FALLBACK_ROOT/"
 
 WINDOWS_ROOT="$(wslpath -w "$FALLBACK_ROOT")"
-run_windows powershell.exe -NoProfile -ExecutionPolicy Bypass \
-  -File "${WINDOWS_ROOT}\\install_windows_fallback.ps1" \
-  -FallbackRoot "$WINDOWS_ROOT" \
-  -SourceRoot "$WINDOWS_ROOT" >&2
+DEPENDENCY_HASH="$(sha256sum "$FALLBACK_ROOT/pyproject.toml" | awk '{print $1}')"
+DEPENDENCY_MARKER="$FALLBACK_ROOT/.ida-hybrid-manager-deps.sha256"
+INSTALLED_HASH=""
+if [[ -f "$DEPENDENCY_MARKER" ]]; then
+  INSTALLED_HASH="$(tr -d '[:space:]' <"$DEPENDENCY_MARKER")"
+fi
+VENV_PYTHON="$FALLBACK_ROOT/.venv/Scripts/python.exe"
+if [[ ! -f "$VENV_PYTHON" || "$INSTALLED_HASH" != "$DEPENDENCY_HASH" ]]; then
+  if ! run_windows powershell.exe -NoProfile -ExecutionPolicy Bypass \
+    -File "${WINDOWS_ROOT}\\install_windows_fallback.ps1" \
+    -FallbackRoot "$WINDOWS_ROOT" \
+    -SourceRoot "$WINDOWS_ROOT" >&2; then
+    echo "Windows dependency refresh deferred until the native fallback is first used." >&2
+  fi
+fi
 printf '%s\n' "$WINDOWS_ROOT"
