@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import os
 from pathlib import Path
 import select
@@ -209,9 +209,9 @@ class WindowsHostAdapter(WslHostAdapter):
         process_env = os.environ.copy()
         process_env.update(env or {})
         working_dir = working_directory or executable.rsplit("\\", 1)[0]
-        stdout_handle = open(stdout_path, "ab") if stdout_path else subprocess.DEVNULL
-        stderr_handle = open(stderr_path, "ab") if stderr_path else subprocess.DEVNULL
-        try:
+        with ExitStack() as stack:
+            stdout_handle = stack.enter_context(open(stdout_path, "ab")) if stdout_path else subprocess.DEVNULL
+            stderr_handle = stack.enter_context(open(stderr_path, "ab")) if stderr_path else subprocess.DEVNULL
             process = subprocess.Popen(
                 [executable, *arguments],
                 cwd=working_dir or None,
@@ -225,11 +225,6 @@ class WindowsHostAdapter(WslHostAdapter):
                 ),
             )
             return process.pid
-        finally:
-            if stdout_path:
-                stdout_handle.close()
-            if stderr_path:
-                stderr_handle.close()
 
     @contextmanager
     def daemon_lock(self, handle: TextIO) -> Iterator[None]:

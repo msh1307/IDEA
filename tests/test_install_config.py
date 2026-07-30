@@ -20,7 +20,7 @@ class InstallConfigTests(unittest.TestCase):
 
     def test_windows_fallback_uses_native_launcher_and_windows_stage_path(self) -> None:
         block = render_windows_fallback_block(
-            r"E:\ida-hybrid-manager-native",
+            "/mnt/e/ida-hybrid-manager-native",
             Path("/root/ida-hybrid-manager"),
             r"C:\IDA",
             "/mnt/e/stage",

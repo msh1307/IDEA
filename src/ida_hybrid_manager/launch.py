@@ -155,11 +155,11 @@ def _default_windows_temp() -> str:
 
 
 def _default_temp_root(windows_temp: str) -> str:
+    if HOST.native_windows:
+        return windows_temp
     env = os.getenv("IDA_WSL_TEMP", "").strip()
     if env:
         return env
-    if HOST.native_windows:
-        return windows_temp
     return to_wsl_path(windows_temp)
 
 

@@ -1,12 +1,18 @@
 import time
 import unittest
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from ida_hybrid_manager import server
 from ida_hybrid_manager.models import PendingLaunch, utc_now
 from ida_hybrid_manager.registry import SessionRegistry
+
+
+class DaemonBuildTokenTests(unittest.TestCase):
+    def test_build_token_covers_entire_manager_package(self) -> None:
+        self.assertIn(Path(server.__file__).resolve().parent, server.DAEMON_BUILD_FILES)
 
 
 def _stale_status() -> dict:

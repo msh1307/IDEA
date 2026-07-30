@@ -9,7 +9,7 @@ from .host import HOST
 
 WINDOWS_DRIVE_RE = re.compile(r"^(?P<drive>[a-zA-Z]):[\\/](?P<rest>.*)$")
 WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[a-zA-Z]:")
-WSL_DRIVE_RE = re.compile(r"^/mnt/(?P<drive>[a-zA-Z])/(?P<rest>.*)$")
+WSL_DRIVE_RE = re.compile(r"^/mnt/(?P<drive>[a-zA-Z])(?:/(?P<rest>.*))?$")
 
 
 @dataclass
@@ -37,7 +37,7 @@ def to_windows_path(path: str) -> str:
         return f"{match.group('drive').upper()}:\\{rest}"
     match = WSL_DRIVE_RE.match(path)
     if match:
-        rest = match.group("rest").replace("/", "\\")
+        rest = (match.group("rest") or "").replace("/", "\\")
         return f"{match.group('drive').upper()}:\\{rest}"
     return path.replace("/", "\\")
 
@@ -48,7 +48,8 @@ def to_wsl_path(path: str) -> str:
         return to_windows_path(path)
     match = WSL_DRIVE_RE.match(path)
     if match:
-        return f"/mnt/{match.group('drive').lower()}/{match.group('rest')}"
+        rest = match.group("rest") or ""
+        return f"/mnt/{match.group('drive').lower()}/{rest}"
     match = WINDOWS_DRIVE_RE.match(path)
     if match:
         rest = match.group("rest").replace("\\", "/")

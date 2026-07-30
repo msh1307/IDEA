@@ -58,11 +58,11 @@ def _wsl_stage_root(value: str) -> str:
     return value
 
 
-def _windows_stage_root(value: str) -> str:
+def _windows_path(value: str) -> str:
     value = value.strip()
-    match = re.match(r"^/mnt/(?P<drive>[a-zA-Z])/(?P<rest>.*)$", value)
+    match = re.match(r"^/mnt/(?P<drive>[a-zA-Z])(?:/(?P<rest>.*))?$", value)
     if match:
-        rest = match.group("rest").replace("/", "\\")
+        rest = (match.group("rest") or "").replace("/", "\\")
         return f"{match.group('drive').upper()}:\\{rest}"
     return value
 
@@ -200,6 +200,7 @@ def render_windows_fallback_block(
     profile: str = "lite",
 ) -> str:
     distro = os.getenv("IDA_WSL_DISTRO", "Ubuntu-24.04").strip() or "Ubuntu-24.04"
+    fallback_root = _windows_path(fallback_root)
     args = [
         "-NoProfile",
         "-ExecutionPolicy",
@@ -216,7 +217,7 @@ def render_windows_fallback_block(
         profile,
     ]
     if stage_root:
-        args.extend(["-StageRoot", _windows_stage_root(stage_root)])
+        args.extend(["-StageRoot", _windows_path(stage_root)])
     rendered_args = "[" + ", ".join(_toml_basic_string(arg) for arg in args) + "]"
     return "\n".join(
         [

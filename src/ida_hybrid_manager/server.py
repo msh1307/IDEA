@@ -78,13 +78,7 @@ _artifact_cleanup_lock = threading.RLock()
 _artifact_cleanup_last_at = 0.0
 _log_write_lock = threading.RLock()
 DAEMON_BUILD_FILES = (
-    Path(__file__).resolve(),
-    Path(__file__).with_name("launch.py"),
-    Path(__file__).with_name("registry.py"),
-    Path(__file__).with_name("models.py"),
-    Path(__file__).with_name("backend.py"),
-    Path(__file__).with_name("manager_api.py"),
-    Path(__file__).with_name("replay.py"),
+    Path(__file__).resolve().parent,
     # Headless IDA processes load this bundled overlay. Include the package
     # itself in the token so backend edits force a daemon compatibility check;
     # already-running IDA processes still need a normal IDA restart to reload
@@ -6333,6 +6327,7 @@ def main() -> None:
         registry=registry,
         host=DAEMON_HOST,
         port=DAEMON_PORT,
+        api_version=DAEMON_API_VERSION,
         build_token=DAEMON_BUILD_TOKEN,
         op_dispatcher=_dispatch_operation,
         session_registered_callback=_on_session_registered,

@@ -6,10 +6,21 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ida_hybrid_manager.launch import IdaLauncher, STAGE_METADATA_NAME, _default_stage_root
+from ida_hybrid_manager import launch
+from ida_hybrid_manager.launch import IdaLauncher, STAGE_METADATA_NAME, _default_stage_root, _default_temp_root
+from ida_hybrid_manager.pathing import to_windows_path
 
 
 class StageRootTests(unittest.TestCase):
+    def test_windows_temp_ignores_wsl_only_override(self) -> None:
+        with patch.object(launch.HOST, "native_windows", True), patch.dict(
+            os.environ, {"IDA_WSL_TEMP": "/tmp/wsl-only"}
+        ):
+            self.assertEqual(_default_temp_root(r"E:\Temp"), r"E:\Temp")
+
+    def test_windows_path_accepts_wsl_drive_root(self) -> None:
+        self.assertEqual(to_windows_path("/mnt/e"), "E:\\")
+
     def test_stage_root_defaults_under_temp(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("IDA_MCP_STAGE_ROOT", None)
